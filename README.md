@@ -1,0 +1,152 @@
+# Dure
+
+**Dure — Pool compute. Share intelligence.**
+
+Dure is an early Linux CLI and node agent for building resource-aware community LLM infrastructure. It inventories a node, classifies useful roles, creates a model deployment plan, prepares model artifacts and containers, joins a Ray cluster, and verifies GPU/Ray/vLLM readiness.
+
+This repository is an executable MVP. It is not yet a hardened public volunteer-computing platform.
+
+## What works
+
+- Ubuntu/Linux host, memory, disk, virtualization and network inventory
+- NVIDIA GPU, VRAM, driver and compute-capability detection
+- Docker/NVIDIA runtime and Ray detection
+- CPU-only utility-node classification
+- Local Qwen2.5 AWQ model recommendations
+- Three-node 24GB GPU planning for Qwen2.5-72B-AWQ
+- Automatic 80-layer partitioning into `27/27/26`
+- Persisted node lifecycle state
+- Resumable Hugging Face CLI download staging
+- Docker command execution for Ray head/workers and a vLLM API
+- Host GPU, container CUDA, Ray resource, HTTP health and served-model checks
+- Dry-run by default; mutation requires explicit flags
+
+## Install for development
+
+```bash
+cd /root/workspace/dure
+python3 -m pip install -e .
+```
+
+## Install from APT
+
+Once the signed repository has been published, users register it once and install Dure:
+
+```bash
+curl -fsSL https://OWNER.github.io/REPOSITORY/install.sh | sudo sh
+```
+
+Subsequent installs and upgrades use normal APT commands:
+
+```bash
+sudo apt install dure
+sudo apt upgrade
+```
+
+See [docs/apt-distribution.md](docs/apt-distribution.md) for signing, GitHub Pages publishing, manual repository registration, and release instructions.
+
+Then inspect the local node:
+
+```bash
+dure doctor
+dure doctor --json
+dure doctor --output camp-9.json
+```
+
+## Create a plan
+
+Export a profile on each node:
+
+```bash
+dure doctor --output camp-7.json
+dure doctor --output camp-8.json
+dure doctor --output camp-9.json
+```
+
+Create a shared deployment plan:
+
+```bash
+dure plan \
+  --profile camp-7.json \
+  --profile camp-8.json \
+  --profile camp-9.json \
+  --model qwen2.5-72b-awq \
+  --image registry.example.com/vllm@sha256:<digest> \
+  --network-interface ens3 \
+  --output qwen72b-plan.json
+```
+
+The generated plan assigns one Ray rank and one pipeline stage to each node. Every node must receive the exact same plan file.
+
+## Initialize a node
+
+Safe dry run:
+
+```bash
+dure init --plan qwen72b-plan.json
+dure status
+```
+
+Apply the plan after reviewing it:
+
+```bash
+sudo dure init \
+  --plan qwen72b-plan.json \
+  --apply \
+  --accept-model-download \
+  --pull
+```
+
+Run `--serve` only on the assigned Ray head after all workers have joined:
+
+```bash
+sudo dure init \
+  --plan qwen72b-plan.json \
+  --apply \
+  --serve
+```
+
+Verify the deployment:
+
+```bash
+dure verify --plan qwen72b-plan.json --api
+```
+
+## Safety model
+
+Dure does not install or change an NVIDIA host driver. A mismatched or unavailable driver blocks provisioning and requires administrator action.
+
+The CLI refuses to apply any image not pinned by OCI digest unless `--allow-unpinned-image` is supplied. Production plans should use an immutable OCI digest.
+
+Model downloads require `--accept-model-download`; image pulls require `--pull`; replacement of an existing stopped container requires `--replace`.
+
+Ray ports must be restricted to a trusted LAN or private overlay such as WireGuard. Do not expose the Ray GCS, dashboard, or worker ports to the public Internet.
+
+## Lifecycle
+
+```text
+DISCOVERED → PROBING → ELIGIBLE → PLANNED
+           → DOWNLOADING → STARTING → VERIFYING → READY
+                                      └────────→ WAITING_FOR_PEERS
+Any blocking error ────────────────────────────→ FAILED
+```
+
+State is stored under `$XDG_STATE_HOME/dure/state.json`, or `~/.local/state/dure/state.json` by default.
+
+## Current limitations
+
+- No central enrollment/controller API yet; profile and plan files are exchanged manually.
+- Docker is the only apply-mode container backend.
+- The MVP assigns at most one GPU per physical node.
+- Network benchmark and NCCL collective probe are not yet implemented.
+- vLLM startup is implemented but needs broader image/version compatibility testing.
+- Artifact hashes rely on a pinned Hugging Face revision; a signed model manifest is planned.
+- No credit ledger, authentication, WireGuard automation or public-node sandbox yet.
+
+These boundaries are intentional: the first milestone proves deterministic node discovery, planning, provisioning safety and readiness before adding a public control plane.
+
+## Tests
+
+```bash
+python3 -m unittest discover -v
+```
