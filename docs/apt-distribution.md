@@ -7,8 +7,11 @@ Dure is distributed as a signed Debian package repository. GitHub Pages is the d
 After the repository is published, users can bootstrap it with:
 
 ```bash
-curl -fsSL https://OWNER.github.io/REPOSITORY/install.sh | sudo sh
+curl -fsSL https://chek737.github.io/dure/install.sh | sudo sh
 ```
+
+The Dure APT signing-key fingerprint is
+`E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01`.
 
 The installer places the public signing key in `/usr/share/keyrings`, creates a deb822 source under `/etc/apt/sources.list.d`, runs `apt-get update`, and installs Dure.
 
@@ -23,12 +26,12 @@ sudo apt upgrade
 Users who do not want to run a bootstrap script can register the repository manually:
 
 ```bash
-curl -fsSL https://OWNER.github.io/REPOSITORY/dure-archive-keyring.gpg \
+curl -fsSL https://chek737.github.io/dure/dure-archive-keyring.gpg \
   | sudo tee /usr/share/keyrings/dure-archive-keyring.gpg >/dev/null
 
 sudo tee /etc/apt/sources.list.d/dure.sources >/dev/null <<'EOF'
 Types: deb
-URIs: https://OWNER.github.io/REPOSITORY
+URIs: https://chek737.github.io/dure
 Suites: stable
 Components: main
 Architectures: amd64

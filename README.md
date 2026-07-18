@@ -33,8 +33,11 @@ python3 -m pip install -e .
 Once the signed repository has been published, users register it once and install Dure:
 
 ```bash
-curl -fsSL https://OWNER.github.io/REPOSITORY/install.sh | sudo sh
+curl -fsSL https://chek737.github.io/dure/install.sh | sudo sh
 ```
+
+APT signing-key fingerprint:
+`E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01`.
 
 Subsequent installs and upgrades use normal APT commands:
 
