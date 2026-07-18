@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -13,6 +14,11 @@ from .probe import NodeProbe
 from .readiness import ReadinessVerifier
 from .runtime import read_plan, write_plan
 from .state import StateStore
+
+
+def _add_admin_connection(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--server", default=None, help="Control plane URL (or DURE_SERVER)")
+    parser.add_argument("--token", default=None, help="Admin token (or DURE_ADMIN_TOKEN)")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -49,6 +55,51 @@ def _parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="Verify an applied deployment")
     verify.add_argument("--plan", type=Path, required=True)
     verify.add_argument("--api", action="store_true")
+
+    admin = subparsers.add_parser("admin", help="Manage nodes through the central control plane")
+    _add_admin_connection(admin)
+    admin_sub = admin.add_subparsers(dest="admin_command", required=True)
+    nodes = admin_sub.add_parser("nodes")
+    nodes.add_argument("--online", action="store_true")
+    nodes.add_argument("--offline", action="store_true")
+    nodes.add_argument("--json", action="store_true")
+    node = admin_sub.add_parser("node")
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+    node_show = node_sub.add_parser("show")
+    node_show.add_argument("node_id")
+    enrollment = admin_sub.add_parser("enrollment")
+    enrollment_sub = enrollment.add_subparsers(dest="enrollment_command", required=True)
+    enrollment_create = enrollment_sub.add_parser("create")
+    enrollment_create.add_argument("--expires-in", default="1h")
+    deployment = admin_sub.add_parser("deployment")
+    deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
+    deployment_create = deployment_sub.add_parser("create")
+    deployment_create.add_argument("--profile", type=Path, action="append", required=True)
+    deployment_create.add_argument("--model", default="auto")
+    deployment_create.add_argument("--image", required=True)
+    deployment_create.add_argument("--network-interface")
+    deployment_create.add_argument("--accept-model-download", action="store_true")
+    deployment_create.add_argument("--pull", action="store_true")
+    for command in ("apply", "start", "stop", "restart"):
+        operation = admin_sub.add_parser(command)
+        operation.add_argument("deployment_id")
+        operation.add_argument("--nodes", nargs="+", required=True)
+        if command in {"apply", "start", "restart"}:
+            operation.add_argument("--serve", action="store_true")
+    admin_probe = admin_sub.add_parser("probe")
+    admin_probe.add_argument("--nodes", nargs="+", required=True)
+    admin_verify = admin_sub.add_parser("verify")
+    admin_verify.add_argument("deployment_id")
+    admin_verify.add_argument("--nodes", nargs="+", required=True)
+    admin_verify.add_argument("--api", action="store_true")
+    tasks = admin_sub.add_parser("tasks")
+    tasks.add_argument("--watch", action="store_true")
+    credential = admin_sub.add_parser("credential")
+    credential_sub = credential.add_subparsers(dest="credential_command", required=True)
+    revoke = credential_sub.add_parser("revoke")
+    revoke.add_argument("node_id")
+    rotate = credential_sub.add_parser("rotate")
+    rotate.add_argument("node_id")
 
     return parser
 
@@ -194,6 +245,91 @@ def _verify(args: argparse.Namespace) -> int:
     return 0 if all(check.ok for check in checks) else 1
 
 
+def _duration_seconds(value: str) -> int:
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    try:
+        if value[-1] in units:
+            return int(value[:-1]) * units[value[-1]]
+        return int(value)
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"invalid duration: {value}") from exc
+
+
+def _admin(args: argparse.Namespace) -> int:
+    import os
+    from .http import JSONClient
+
+    server = args.server or os.environ.get("DURE_SERVER")
+    token = args.token or os.environ.get("DURE_ADMIN_TOKEN")
+    if not server or not token:
+        raise ValueError("--server and --token (or DURE_SERVER and DURE_ADMIN_TOKEN) are required")
+    client = JSONClient(server, token)
+    if args.admin_command == "nodes":
+        values = client.request("GET", "/v1/admin/nodes")["nodes"]
+        if args.online:
+            values = [item for item in values if item["connectivity"] == "online"]
+        if args.offline:
+            values = [item for item in values if item["connectivity"] != "online"]
+        if args.json:
+            print(json.dumps(values, indent=2, sort_keys=True))
+        else:
+            for item in values:
+                print(f"{item['id']}  {item['connectivity']:7}  {item['hostname']}  {item['phase'] or '-'}")
+        return 0
+    if args.admin_command == "node":
+        value = client.request("GET", f"/v1/admin/nodes/{args.node_id}")["node"]
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 0
+    if args.admin_command == "enrollment":
+        value = client.request("POST", "/v1/admin/enrollments", {"expires_in_seconds": _duration_seconds(args.expires_in)})
+        print(value["token"])
+        print(f"Expires: {value['expires_at']}", file=sys.stderr)
+        return 0
+    if args.admin_command == "deployment":
+        profiles = _load_profiles(args.profile)
+        plan = build_plan(profiles, model_id=args.model, image=args.image, network_interface=args.network_interface)
+        if plan is None:
+            raise ValueError("no eligible GPU deployment could be planned")
+        value = client.request("POST", "/v1/admin/deployments", {
+            "plan": plan.to_dict(), "accept_model_download": args.accept_model_download, "pull_image": args.pull,
+        })
+        print(value["deployment"]["id"])
+        return 0
+    if args.admin_command in {"apply", "start", "stop", "restart", "verify", "probe"}:
+        types = {
+            "apply": "APPLY_DEPLOYMENT", "start": "START_DEPLOYMENT", "stop": "STOP_DEPLOYMENT",
+            "restart": "RESTART_DEPLOYMENT", "verify": "VERIFY", "probe": "PROBE",
+        }
+        options = {}
+        if hasattr(args, "serve"):
+            options["serve"] = args.serve
+        if hasattr(args, "api"):
+            options["api"] = args.api
+        value = client.request("POST", "/v1/admin/tasks", {
+            "node_ids": args.nodes, "type": types[args.admin_command],
+            "deployment_id": getattr(args, "deployment_id", None), "options": options,
+        })
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 0 if not value["errors"] else 1
+    if args.admin_command == "tasks":
+        while True:
+            value = client.request("GET", "/v1/admin/tasks")
+            print(json.dumps(value["tasks"], indent=2, sort_keys=True))
+            if not args.watch:
+                return 0
+            time.sleep(5)
+    if args.admin_command == "credential":
+        if args.credential_command == "rotate":
+            value = client.request("POST", f"/v1/admin/nodes/{args.node_id}/credential")
+            print(value["credential"])
+            print("Update the agent config with this credential immediately.", file=sys.stderr)
+            return 0
+        client.request("POST", f"/v1/admin/nodes/{args.node_id}/revoke")
+        print(f"Revoked node {args.node_id}")
+        return 0
+    raise ValueError("unknown admin command")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     handlers = {
@@ -202,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         "init": _init,
         "status": _status,
         "verify": _verify,
+        "admin": _admin,
     }
     try:
         return handlers[args.command](args)
@@ -212,4 +349,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

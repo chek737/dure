@@ -146,7 +146,24 @@ State is stored under `$XDG_STATE_HOME/dure/state.json`, or `~/.local/state/dure
 - Artifact hashes rely on a pinned Hugging Face revision; a signed model manifest is planned.
 - No credit ledger, authentication, WireGuard automation or public-node sandbox yet.
 
-These boundaries are intentional: the first milestone proves deterministic node discovery, planning, provisioning safety and readiness before adding a public control plane.
+These boundaries are intentional: the current milestones focus on deterministic node discovery, safe provisioning, readiness, and trusted-node control before adding a public inference gateway.
+
+## Central node management
+
+Dure includes an optional FastAPI/PostgreSQL control plane and an outbound-polling node agent.
+Run `dure-server --migrate`,
+set `DURE_DATABASE_URL` and `DURE_ADMIN_TOKEN`, then start
+`dure-server` behind a TLS reverse proxy. Create a one-time enrollment token with:
+
+```bash
+dure admin --server https://dure.example --token "$DURE_ADMIN_TOKEN" enrollment create
+sudo dure-agent enroll --server https://dure.example --token <one-time-token>
+sudo systemctl enable --now dure-agent
+```
+
+List enrolled nodes with `dure admin ... nodes`. Central tasks are restricted to probe,
+verify, apply, start, stop, and restart operations; arbitrary remote shell commands are
+not accepted. Central deployments require an OCI digest-pinned image.
 
 ## Tests
 

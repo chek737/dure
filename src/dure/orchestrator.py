@@ -17,10 +17,12 @@ class InitOrchestrator:
         *,
         runner: Runner | None = None,
         state_path: Path | None = None,
+        node_id: str | None = None,
     ) -> None:
         self.runner = runner or SubprocessRunner()
         self.store = StateStore(state_path)
         self.probe = NodeProbe(self.runner)
+        self.node_id = node_id
 
     def run(
         self,
@@ -38,6 +40,8 @@ class InitOrchestrator:
         self.store.save(state)
 
         profile = self.probe.collect()
+        if self.node_id is not None:
+            profile.node_id = self.node_id
         role, capabilities = classify_node(profile)
         state.node_id = profile.node_id
         state.role = role

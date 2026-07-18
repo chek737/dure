@@ -42,6 +42,32 @@ class ContainerRuntime:
             [self.engine, "inspect", "--format", "{{.State.Status}}", name], timeout=10
         )
 
+    def stop_deployment(self, deployment_id: str) -> CheckResult:
+        """Stop only containers carrying the exact Dure deployment label."""
+        if self.engine != "docker":
+            return CheckResult("deployment-stop", False, "Apply mode currently supports Docker only")
+        listed = self.runner.run(
+            [
+                self.engine,
+                "ps",
+                "-q",
+                "--filter",
+                f"label=dure.deployment={deployment_id}",
+            ],
+            timeout=15,
+        )
+        if not listed.ok:
+            return CheckResult("deployment-stop", False, listed.stderr or listed.stdout)
+        container_ids = [item for item in listed.stdout.splitlines() if item]
+        if not container_ids:
+            return CheckResult("deployment-stop", True, "No running Dure deployment containers")
+        stopped = self.runner.run([self.engine, "stop", "--time", "30", *container_ids], timeout=60)
+        return CheckResult(
+            "deployment-stop",
+            stopped.ok,
+            f"Stopped {len(container_ids)} Dure container(s)" if stopped.ok else stopped.stderr or stopped.stdout,
+        )
+
     def start_ray(
         self,
         profile: NodeProfile,

@@ -8,6 +8,17 @@ from .helpers import FakeRunner, profile
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_stop_filters_by_exact_dure_deployment_label(self):
+        runner = FakeRunner(
+            responses={
+                ("docker", "ps", "-q", "--filter", "label=dure.deployment=deploy-1"): (0, "abc\ndef", ""),
+                ("docker", "stop", "--time", "30", "abc", "def"): (0, "abc\ndef", ""),
+            }
+        )
+        check = ContainerRuntime(runner).stop_deployment("deploy-1")
+        self.assertTrue(check.ok)
+        self.assertNotIn(("docker", "stop", "--time", "30"), runner.calls)
+
     def test_ray_container_uses_explicit_entrypoint_and_no_shell(self):
         node = profile("camp-7", address="192.168.0.228")
         plan = build_plan(
@@ -68,4 +79,3 @@ class RuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
