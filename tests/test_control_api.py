@@ -47,6 +47,28 @@ class ControlAPITests(unittest.TestCase):
 
     def test_admin_auth_is_required(self):
         self.assertEqual(self.client.get("/v1/admin/nodes").status_code, 401)
+        self.assertEqual(self.client.get("/v1/admin/inventory").status_code, 401)
+
+    def test_inventory_returns_profiles_for_capacity_diagnosis(self):
+        joined_profile = profile("inventory-node")
+        joined = self.client.post(
+            "/v1/nodes/join",
+            json={
+                "install_id": "install-inventory-node",
+                "agent_version": "0.3.3",
+                "profile": joined_profile.to_dict(),
+            },
+        ).json()
+        self.client.post(f"/v1/admin/nodes/{joined['node_id']}/approve", headers=self.admin)
+
+        response = self.client.get("/v1/admin/inventory", headers=self.admin)
+
+        self.assertEqual(response.status_code, 200)
+        node = response.json()["nodes"][0]
+        self.assertEqual(node["id"], joined["node_id"])
+        self.assertEqual(node["agent_version"], "0.3.3")
+        self.assertEqual(node["profile"]["cpu_count"], joined_profile.cpu_count)
+        self.assertIn("profile_updated_at", node)
 
     def test_tokenless_join_heartbeats_pending_then_admin_approves(self):
         joined = self.client.post("/v1/nodes/join", json={

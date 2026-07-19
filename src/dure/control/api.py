@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from dure import __version__
 
 from .db import Base, make_engine, make_session_factory, session_dependency
-from .models import Deployment, Node, NodeProfileRecord, Task, TaskType
+from .models import Deployment, Node, NodeProfileRecord, Task, TaskType, utcnow
 from .service import (
     authenticate_node,
     approve_node,
@@ -96,6 +96,26 @@ def _task_dict(task: Task) -> dict:
         "result": task.result,
         "error": task.error,
     }
+
+
+def _node_dict(node: Node, profile: NodeProfileRecord | None = None) -> dict:
+    value = {
+        "id": node.id,
+        "display_name": node.display_name,
+        "hostname": node.hostname,
+        "agent_version": node.agent_version,
+        "approved": node.approved,
+        "connectivity": node_status(node.last_seen),
+        "last_seen": node.last_seen,
+        "phase": node.observed_phase,
+        "role": node.observed_role,
+        "deployment_id": node.observed_deployment_id,
+        "desired_state": node.desired_state,
+    }
+    if profile is not None:
+        value["profile"] = profile.profile
+        value["profile_updated_at"] = profile.updated_at
+    return value
 
 
 def create_app(*, database_url: str | None = None, admin_token: str | None = None, create_schema: bool = False) -> FastAPI:
@@ -183,15 +203,24 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.get("/v1/admin/nodes", dependencies=[Depends(admin_auth)])
     def nodes(session: Session = Depends(get_session)):
-        result = []
-        for node in session.scalars(select(Node).order_by(Node.display_name)):
-            result.append({
-                "id": node.id, "display_name": node.display_name, "hostname": node.hostname,
-                "approved": node.approved, "connectivity": node_status(node.last_seen),
-                "last_seen": node.last_seen, "phase": node.observed_phase, "role": node.observed_role,
-                "deployment_id": node.observed_deployment_id, "desired_state": node.desired_state,
-            })
-        return {"nodes": result}
+        return {
+            "nodes": [
+                _node_dict(node) for node in session.scalars(select(Node).order_by(Node.display_name))
+            ]
+        }
+
+    @app.get("/v1/admin/inventory", dependencies=[Depends(admin_auth)])
+    def inventory(session: Session = Depends(get_session)):
+        profiles = {
+            profile.node_id: profile for profile in session.scalars(select(NodeProfileRecord))
+        }
+        return {
+            "generated_at": utcnow(),
+            "nodes": [
+                _node_dict(node, profiles.get(node.id))
+                for node in session.scalars(select(Node).order_by(Node.display_name))
+            ],
+        }
 
     @app.get("/v1/admin/nodes/{node_id}", dependencies=[Depends(admin_auth)])
     def node_detail(node_id: str, session: Session = Depends(get_session)):
@@ -199,13 +228,11 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if node is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         profile = session.get(NodeProfileRecord, node_id)
-        return {"node": {
-            "id": node.id, "display_name": node.display_name, "hostname": node.hostname,
-            "approved": node.approved, "connectivity": node_status(node.last_seen),
-            "last_seen": node.last_seen, "phase": node.observed_phase, "role": node.observed_role,
-            "deployment_id": node.observed_deployment_id, "desired_state": node.desired_state,
-            "profile": profile.profile if profile else None,
-        }}
+        value = _node_dict(node, profile)
+        if profile is None:
+            value["profile"] = None
+            value["profile_updated_at"] = None
+        return {"node": value}
 
     @app.post("/v1/admin/nodes/{node_id}/revoke", dependencies=[Depends(admin_auth)])
     def node_revoke(node_id: str, session: Session = Depends(get_session)):

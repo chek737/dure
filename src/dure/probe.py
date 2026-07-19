@@ -9,7 +9,29 @@ import socket
 from pathlib import Path
 
 from .command import Runner, SubprocessRunner
-from .models import GPUProfile, NetworkProfile, NodeProfile, RuntimeProfile
+from .models import (
+    GPUProfile,
+    InstalledModelProfile,
+    NetworkProfile,
+    NodeProfile,
+    RuntimeProfile,
+    WorkloadProfile,
+)
+
+
+DEFAULT_MODEL_ROOTS = (
+    Path("/var/lib/dure/models"),
+    Path.home() / ".cache" / "huggingface" / "hub",
+)
+MAX_DISCOVERED_MODELS = 100
+LLM_RUNTIME_MARKERS = {
+    "vllm": "vllm",
+    "ollama": "ollama",
+    "text-generation-inference": "tgi",
+    "text_generation_inference": "tgi",
+    "llama.cpp": "llama.cpp",
+    "llama-cpp": "llama.cpp",
+}
 
 
 def _read_key_values(path: Path, separator: str = "=") -> dict[str, str]:
@@ -48,8 +70,14 @@ def _cpu_model(path: Path = Path("/proc/cpuinfo")) -> str:
 
 
 class NodeProbe:
-    def __init__(self, runner: Runner | None = None) -> None:
+    def __init__(
+        self,
+        runner: Runner | None = None,
+        *,
+        model_roots: tuple[Path, ...] | list[Path] | None = None,
+    ) -> None:
         self.runner = runner or SubprocessRunner()
+        self.model_roots = tuple(model_roots) if model_roots is not None else DEFAULT_MODEL_ROOTS
 
     def collect(self) -> NodeProfile:
         os_release = _read_key_values(Path("/etc/os-release"))
@@ -67,6 +95,8 @@ class NodeProbe:
         gpus = self._probe_gpus(issues)
         runtime = self._probe_runtime()
         network = self._probe_network()
+        installed_models = self._probe_models()
+        workloads = self._probe_workloads(runtime)
 
         if not gpus:
             issues.append("No CUDA-capable NVIDIA GPU detected")
@@ -95,8 +125,184 @@ class NodeProbe:
             gpus=gpus,
             network=network,
             runtime=runtime,
+            installed_models=installed_models,
+            workloads=workloads,
             issues=issues,
         )
+
+    @staticmethod
+    def _model_config(path: Path) -> dict:
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                return {}
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _model_size_mib(self, path: Path) -> int | None:
+        if not self.runner.exists("du"):
+            return None
+        result = self.runner.run(["du", "-sm", "--", str(path)], timeout=30)
+        if not result.ok:
+            return None
+        try:
+            return int(result.stdout.split()[0])
+        except (IndexError, ValueError):
+            return None
+
+    @staticmethod
+    def _quantization(config: dict) -> str | None:
+        value = config.get("quantization_config")
+        if isinstance(value, dict):
+            method = value.get("quant_method") or value.get("quantization_method")
+            return str(method) if method else None
+        return None
+
+    def _probe_dure_models(self, root: Path) -> list[InstalledModelProfile]:
+        try:
+            candidates = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name)
+        except OSError:
+            return []
+        models: list[InstalledModelProfile] = []
+        for candidate in candidates[:MAX_DISCOVERED_MODELS]:
+            config_path = candidate / "config.json"
+            config = self._model_config(config_path) if config_path.is_file() else {}
+            configured_name = config.get("_name_or_path")
+            model_id = (
+                str(configured_name)
+                if configured_name and not str(configured_name).startswith("/")
+                else candidate.name
+            )
+            models.append(
+                InstalledModelProfile(
+                    source="dure",
+                    model_id=model_id,
+                    path=str(candidate),
+                    quantization=self._quantization(config),
+                    size_mib=self._model_size_mib(candidate),
+                    complete=config_path.is_file(),
+                )
+            )
+        return models
+
+    def _probe_huggingface_models(self, root: Path) -> list[InstalledModelProfile]:
+        try:
+            repositories = sorted(
+                (item for item in root.iterdir() if item.is_dir() and item.name.startswith("models--")),
+                key=lambda item: item.name,
+            )
+        except OSError:
+            return []
+        models: list[InstalledModelProfile] = []
+        for repository in repositories[:MAX_DISCOVERED_MODELS]:
+            model_id = repository.name.removeprefix("models--").replace("--", "/")
+            snapshots_root = repository / "snapshots"
+            try:
+                snapshots = sorted(
+                    (item for item in snapshots_root.iterdir() if item.is_dir()),
+                    key=lambda item: item.stat().st_mtime,
+                    reverse=True,
+                )
+            except OSError:
+                snapshots = []
+            snapshot = snapshots[0] if snapshots else None
+            config_path = snapshot / "config.json" if snapshot else None
+            config = self._model_config(config_path) if config_path and config_path.is_file() else {}
+            models.append(
+                InstalledModelProfile(
+                    source="huggingface-cache",
+                    model_id=model_id,
+                    path=str(snapshot or repository),
+                    revision=snapshot.name if snapshot else None,
+                    quantization=self._quantization(config),
+                    size_mib=self._model_size_mib(repository),
+                    complete=bool(snapshot and config_path and config_path.is_file()),
+                )
+            )
+        return models
+
+    def _probe_ollama_models(self) -> list[InstalledModelProfile]:
+        if not self.runner.exists("ollama"):
+            return []
+        result = self.runner.run(["ollama", "list"], timeout=15)
+        if not result.ok:
+            return []
+        models: list[InstalledModelProfile] = []
+        for line in result.stdout.splitlines()[1:MAX_DISCOVERED_MODELS + 1]:
+            parts = line.split()
+            if not parts:
+                continue
+            models.append(InstalledModelProfile(source="ollama", model_id=parts[0]))
+        return models
+
+    def _probe_models(self) -> list[InstalledModelProfile]:
+        models: list[InstalledModelProfile] = []
+        for root in self.model_roots:
+            if root.name == "hub":
+                models.extend(self._probe_huggingface_models(root))
+            else:
+                models.extend(self._probe_dure_models(root))
+            if len(models) >= MAX_DISCOVERED_MODELS:
+                break
+        if len(models) < MAX_DISCOVERED_MODELS:
+            models.extend(self._probe_ollama_models())
+        unique: dict[tuple[str, str, str | None], InstalledModelProfile] = {}
+        for model in models[:MAX_DISCOVERED_MODELS]:
+            unique[(model.source, model.model_id, model.path)] = model
+        return list(unique.values())
+
+    @staticmethod
+    def _labels(value: str) -> dict[str, str]:
+        labels: dict[str, str] = {}
+        for item in value.split(","):
+            key, separator, label_value = item.partition("=")
+            if separator and key:
+                labels[key] = label_value
+        return labels
+
+    def _probe_workloads(self, runtime: RuntimeProfile) -> list[WorkloadProfile]:
+        if runtime.engine != "docker" or not runtime.engine_ready:
+            return []
+        result = self.runner.run(
+            ["docker", "ps", "--all", "--format", "{{json .}}"], timeout=15
+        )
+        if not result.ok:
+            return []
+        workloads: list[WorkloadProfile] = []
+        for line in result.stdout.splitlines()[:200]:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            labels = self._labels(str(item.get("Labels", "")))
+            name = str(item.get("Names", ""))
+            image = str(item.get("Image", ""))
+            haystack = f"{name} {image}".lower()
+            runtime_name = (
+                "ray"
+                if name.startswith("dure-ray-")
+                else next(
+                    (value for marker, value in LLM_RUNTIME_MARKERS.items() if marker in haystack),
+                    "unknown",
+                )
+            )
+            dure_managed = "dure.deployment" in labels
+            if not dure_managed and runtime_name == "unknown":
+                continue
+            workloads.append(
+                WorkloadProfile(
+                    name=name,
+                    runtime=runtime_name,
+                    image=image,
+                    status=str(item.get("Status", "unknown")),
+                    deployment_id=labels.get("dure.deployment"),
+                    generation=labels.get("dure.generation"),
+                    model_id=labels.get("dure.model"),
+                    dure_managed=dure_managed,
+                )
+            )
+        return workloads
 
     def _probe_gpus(self, issues: list[str]) -> list[GPUProfile]:
         if not self.runner.exists("nvidia-smi"):

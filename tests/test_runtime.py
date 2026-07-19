@@ -46,6 +46,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result.ok)
         run = runner.calls[-1]
         self.assertEqual(run[0:3], ("docker", "run", "-d"))
+        self.assertIn("dure.model=qwen2.5-32b-awq", run)
         entrypoint = run.index("--entrypoint")
         self.assertEqual(run[entrypoint + 1], "ray")
         image = run.index("registry.example/vllm@sha256:abc")
@@ -71,6 +72,8 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         run = runner.calls[-1]
+        self.assertIn("dure.generation=1", run)
+        self.assertIn("dure.model=qwen2.5-32b-awq", run)
         entrypoint = run.index("--entrypoint")
         self.assertEqual(run[entrypoint + 1], "vllm")
         image = run.index("registry.example/vllm@sha256:abc")

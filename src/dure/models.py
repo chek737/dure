@@ -43,6 +43,37 @@ class RuntimeProfile:
 
 
 @dataclass
+class InstalledModelProfile:
+    source: str
+    model_id: str
+    path: str | None = None
+    revision: str | None = None
+    quantization: str | None = None
+    size_mib: int | None = None
+    complete: bool = True
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "InstalledModelProfile":
+        return cls(**value)
+
+
+@dataclass
+class WorkloadProfile:
+    name: str
+    runtime: str
+    image: str
+    status: str
+    deployment_id: str | None = None
+    generation: str | None = None
+    model_id: str | None = None
+    dure_managed: bool = False
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "WorkloadProfile":
+        return cls(**value)
+
+
+@dataclass
 class NodeProfile:
     node_id: str
     hostname: str
@@ -61,6 +92,8 @@ class NodeProfile:
     gpus: list[GPUProfile]
     network: NetworkProfile
     runtime: RuntimeProfile
+    installed_models: list[InstalledModelProfile] = field(default_factory=list)
+    workloads: list[WorkloadProfile] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
 
     @property
@@ -80,6 +113,12 @@ class NodeProfile:
         data["gpus"] = [GPUProfile.from_dict(item) for item in data.get("gpus", [])]
         data["network"] = NetworkProfile.from_dict(data.get("network", {}))
         data["runtime"] = RuntimeProfile.from_dict(data.get("runtime", {}))
+        data["installed_models"] = [
+            InstalledModelProfile.from_dict(item) for item in data.get("installed_models", [])
+        ]
+        data["workloads"] = [
+            WorkloadProfile.from_dict(item) for item in data.get("workloads", [])
+        ]
         return cls(**data)
 
 
@@ -163,4 +202,3 @@ class CheckResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-

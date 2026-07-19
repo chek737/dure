@@ -101,6 +101,14 @@ def _parser() -> argparse.ArgumentParser:
     admin_verify.add_argument("--api", action="store_true")
     tasks = admin_sub.add_parser("tasks")
     tasks.add_argument("--watch", action="store_true")
+    diagnose = admin_sub.add_parser("diagnose", help="Ask local Codex to assess central inventory")
+    diagnose.add_argument("--nodes", nargs="+", help="Limit diagnosis to approved node UUIDs")
+    diagnose.add_argument("--no-refresh", action="store_true", help="Use stored profiles without PROBE tasks")
+    diagnose.add_argument("--timeout", type=float, default=180, help="Profile refresh timeout in seconds")
+    diagnose.add_argument("--codex-timeout", type=float, default=600, help="Codex execution timeout in seconds")
+    diagnose.add_argument("--model", help="Optional Codex model override")
+    diagnose.add_argument("--output", type=Path, help="Write the structured diagnosis to JSON")
+    diagnose.add_argument("--json", action="store_true", help="Print structured JSON")
     credential = admin_sub.add_parser("credential")
     credential_sub = credential.add_subparsers(dest="credential_command", required=True)
     revoke = credential_sub.add_parser("revoke")
@@ -346,6 +354,45 @@ def _admin(args: argparse.Namespace) -> int:
             if not args.watch:
                 return 0
             time.sleep(5)
+    if args.admin_command == "diagnose":
+        from .diagnostics import (
+            CodexDiagnoser,
+            refresh_node_profiles,
+            render_diagnosis,
+            select_inventory_nodes,
+        )
+
+        inventory = select_inventory_nodes(
+            client.request("GET", "/v1/admin/inventory"), args.nodes
+        )
+        refresh = None
+        if not args.no_refresh:
+            online = [
+                item["id"] for item in inventory["nodes"] if item["connectivity"] == "online"
+            ]
+            refresh = refresh_node_profiles(client, online, timeout=args.timeout)
+            inventory = select_inventory_nodes(
+                client.request("GET", "/v1/admin/inventory"), args.nodes
+            )
+        inventory["refresh"] = refresh
+        print(
+            f"Sending hardware and runtime inventory for {len(inventory['nodes'])} node(s) "
+            "to the configured Codex provider; credentials are not included.",
+            file=sys.stderr,
+        )
+        diagnosis = CodexDiagnoser().diagnose(
+            inventory, model=args.model, timeout=args.codex_timeout
+        )
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(diagnosis, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        if args.json:
+            print(json.dumps(diagnosis, indent=2, sort_keys=True))
+        else:
+            print(render_diagnosis(diagnosis))
+        return 0
     if args.admin_command == "credential":
         if args.credential_command == "rotate":
             value = client.request("POST", f"/v1/admin/nodes/{args.node_id}/credential")

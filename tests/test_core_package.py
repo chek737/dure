@@ -25,11 +25,11 @@ class CorePackageTests(unittest.TestCase):
 
     def test_node_cli_and_agent_import_without_third_party_packages(self):
         result = self._run_without_site_packages(
-            "import dure.agent, dure.cli; print(dure.__version__)"
+            "import dure.agent, dure.cli, dure.diagnostics; print(dure.__version__)"
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "0.3.2")
+        self.assertEqual(result.stdout.strip(), "0.3.3")
 
     def test_server_reports_missing_optional_dependencies(self):
         result = self._run_without_site_packages(
