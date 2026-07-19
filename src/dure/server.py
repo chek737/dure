@@ -23,11 +23,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--migrate", action="store_true", help="Apply database migrations and exit")
     parser.add_argument("--create-schema", action="store_true", help="Development only; use Alembic in production")
     args = parser.parse_args(argv)
-    if args.migrate:
-        migrate(args.database_url)
-        return 0
-    import uvicorn
-    from .control.api import create_app
+    try:
+        if args.migrate:
+            migrate(args.database_url)
+            return 0
+        import uvicorn
+        from .control.api import create_app
+    except ImportError as exc:
+        dependency = getattr(exc, "name", None) or str(exc)
+        parser.error(
+            f"control-plane dependency is missing ({dependency}); "
+            "install Dure with the server extra: python3 -m pip install 'dure[server]'"
+        )
 
     uvicorn.run(create_app(database_url=args.database_url, create_schema=args.create_schema), host=args.host, port=args.port)
     return 0

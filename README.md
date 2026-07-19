@@ -25,8 +25,12 @@ This repository is an executable MVP. It is not yet a hardened public volunteer-
 
 ```bash
 cd /root/workspace/dure
-python3 -m pip install -e .
+python3 -m pip install -e '.[test]'
 ```
+
+The signed APT package contains the dependency-free node CLI and Agent. Install the central
+Control Plane from source with `python3 -m pip install -e '.[server]'`; its modern FastAPI and
+SQLAlchemy requirements are intentionally not resolved from Ubuntu 22.04 system packages.
 
 ## Install from APT
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import enum
 import uuid
 from datetime import datetime, timezone
 
@@ -8,27 +7,11 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Tex
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+from ..task import TaskStatus, TaskType
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-class TaskType(str, enum.Enum):
-    PROBE = "PROBE"
-    VERIFY = "VERIFY"
-    APPLY_DEPLOYMENT = "APPLY_DEPLOYMENT"
-    START_DEPLOYMENT = "START_DEPLOYMENT"
-    STOP_DEPLOYMENT = "STOP_DEPLOYMENT"
-    RESTART_DEPLOYMENT = "RESTART_DEPLOYMENT"
-
-
-class TaskStatus(str, enum.Enum):
-    QUEUED = "QUEUED"
-    RUNNING = "RUNNING"
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-    CANCELED = "CANCELED"
 
 
 class Node(Base):
@@ -109,4 +92,3 @@ class AuditEvent(Base):
     outcome: Mapped[str] = mapped_column(String(40), nullable=False)
     detail: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-

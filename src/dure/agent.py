@@ -12,7 +12,6 @@ from pathlib import Path
 
 from . import __version__
 from .command import SubprocessRunner
-from .control.models import TaskType
 from .http import APIError, JSONClient
 from .models import DeploymentPlan
 from .orchestrator import InitOrchestrator
@@ -20,6 +19,7 @@ from .probe import NodeProbe
 from .readiness import ReadinessVerifier
 from .runtime import ContainerRuntime
 from .state import StateStore
+from .task import TaskType
 
 
 LOG = logging.getLogger("dure.agent")

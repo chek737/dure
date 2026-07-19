@@ -10,6 +10,10 @@ python3 -m unittest discover -v
 The unit suite uses SQLite, fake host commands, and a FastAPI test client. Keep it runnable without
 GPU hardware, Docker, PostgreSQL, or external services.
 
+The base package has no third-party Python dependency so the Ubuntu 22.04 APT node package remains
+installable. Control Plane dependencies live in the `server` extra; the `test` extra includes them
+for the complete suite.
+
 For a local controller:
 
 ```bash

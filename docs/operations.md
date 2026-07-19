@@ -2,6 +2,13 @@
 
 ## Central server
 
+Install the Control Plane extra on the central host. The APT package is intentionally the portable
+node CLI/Agent package and does not install server dependencies or the server systemd unit.
+
+```bash
+python3 -m pip install -e '.[server]'
+```
+
 Set server secrets outside the repository:
 
 ```dotenv

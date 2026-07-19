@@ -1,3 +1,10 @@
+dure (0.3.1) stable; urgency=medium
+
+  * Split the dependency-free node package from optional control-plane dependencies.
+  * Run full server tests separately from Debian core package tests.
+
+ -- Dure contributors <maintainers@example.invalid>  Sun, 19 Jul 2026 05:30:00 +0000
+
 dure (0.3.0) stable; urgency=medium
 
   * Add tokenless node join with central approval.

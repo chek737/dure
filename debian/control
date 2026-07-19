@@ -8,7 +8,8 @@ Rules-Requires-Root: no
 
 Package: dure
 Architecture: all
-Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.10), python3-alembic, python3-fastapi, python3-psycopg, python3-sqlalchemy, python3-uvicorn
+Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.10)
 Description: resource-aware community LLM node bootstrapper
- Dure inventories Linux nodes, plans model placement, provisions Ray/vLLM
- containers, and verifies GPU and distributed inference readiness.
+ Dure inventories Linux nodes, joins them to a trusted controller, plans model
+ placement, provisions Ray/vLLM containers, and verifies readiness. The central
+ server is installed separately with the Python server extra.
