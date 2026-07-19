@@ -48,6 +48,28 @@ class ControlAPITests(unittest.TestCase):
     def test_admin_auth_is_required(self):
         self.assertEqual(self.client.get("/v1/admin/nodes").status_code, 401)
 
+    def test_tokenless_join_heartbeats_pending_then_admin_approves(self):
+        joined = self.client.post("/v1/nodes/join", json={
+            "install_id": "install-open-join",
+            "agent_version": "0.3.0",
+            "profile": profile("open-node").to_dict(),
+        })
+        self.assertEqual(joined.status_code, 200)
+        self.assertEqual(joined.json()["status"], "pending")
+        node_id = joined.json()["node_id"]
+        agent_headers = {"Authorization": f"Bearer {joined.json()['credential']}"}
+        heartbeat = self.client.post(
+            "/v1/agent/heartbeat", headers=agent_headers, json={"state": {"phase": "DISCOVERED"}}
+        )
+        self.assertEqual(heartbeat.status_code, 200)
+        self.assertFalse(heartbeat.json()["approved"])
+        claim = self.client.post("/v1/agent/tasks/claim", headers=agent_headers)
+        self.assertEqual(claim.json(), {"task": None, "status": "pending"})
+        approved = self.client.post(f"/v1/admin/nodes/{node_id}/approve", headers=self.admin)
+        self.assertEqual(approved.status_code, 200)
+        nodes = self.client.get("/v1/admin/nodes", headers=self.admin).json()["nodes"]
+        self.assertTrue(nodes[0]["approved"])
+
     def test_deployment_bulk_task_claim_and_complete(self):
         enrollment = self.client.post("/v1/admin/enrollments", headers=self.admin, json={}).json()
         claimed = self.client.post("/v1/enrollments/claim", json={

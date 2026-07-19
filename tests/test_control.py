@@ -16,7 +16,9 @@ from dure.control.service import (
     create_enrollment,
     create_tasks,
     finish_task,
+    join_node,
     node_status,
+    approve_node,
     revoke_node,
     rotate_node_credential,
     save_deployment,
@@ -72,6 +74,36 @@ class ControlServiceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 claim_enrollment(session, token=token, install_id="install-expired", profile=profile("old").to_dict(), agent_version="0.2.0")
 
+    def test_tokenless_join_is_pending_until_approved(self):
+        with self.factory() as session:
+            node, credential = join_node(
+                session,
+                install_id="install-tokenless",
+                profile=profile("pending-node").to_dict(),
+                agent_version="0.3.0",
+            )
+            self.assertFalse(node.approved)
+            self.assertEqual(authenticate_node(session, credential).id, node.id)
+            _, tasks, errors = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.PROBE,
+                deployment_id=None,
+                options={},
+            )
+            self.assertFalse(tasks)
+            self.assertEqual(errors[node.id], "unknown, pending, or revoked node")
+            self.assertTrue(approve_node(session, node.id))
+            _, tasks, errors = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.PROBE,
+                deployment_id=None,
+                options={},
+            )
+            self.assertEqual(len(tasks), 1)
+            self.assertFalse(errors)
+
     def test_connectivity_thresholds(self):
         now = utcnow()
         self.assertEqual(node_status(now - timedelta(seconds=10), now), "online")
@@ -86,7 +118,7 @@ class ControlServiceTests(unittest.TestCase):
                 deployment_id=None, options={},
             )
             self.assertTrue(bulk)
-            self.assertEqual(errors, {"missing": "unknown or revoked node"})
+            self.assertEqual(errors, {"missing": "unknown, pending, or revoked node"})
             claimed = claim_task(session, node.id)
             self.assertEqual(claimed.id, tasks[0].id)
             self.assertEqual(claimed.attempts, 1)

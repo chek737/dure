@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/dure/server.env
-ExecStart=/usr/bin/dure-server --host 127.0.0.1 --port 8080
+ExecStart=/usr/bin/dure-server --host 0.0.0.0 --port 8081
 Restart=on-failure
 RestartSec=5
 User=dure

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .command import SubprocessRunner
 from .control.models import TaskType
 from .http import APIError, JSONClient
 from .models import DeploymentPlan
@@ -23,6 +24,7 @@ from .state import StateStore
 
 LOG = logging.getLogger("dure.agent")
 DEFAULT_CONFIG = Path("/etc/dure/agent.json")
+DEFAULT_CLIENT_CONFIG = Path("/etc/dure/dure-client.env")
 DEFAULT_HISTORY = Path("/var/lib/dure/agent-tasks.json")
 DEFAULT_STATE = Path("/var/lib/dure/state.json")
 
@@ -51,6 +53,93 @@ def _read_json(path: Path, default: dict | None = None) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return dict(default or {})
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def resolve_join_settings(
+    *, server: str | None = None, insecure: bool | None = None, client_config: Path = DEFAULT_CLIENT_CONFIG
+) -> tuple[str, bool]:
+    configured = _read_env_file(client_config)
+    if not configured and client_config == DEFAULT_CLIENT_CONFIG:
+        # Editable/source installs do not run Debian's conffile installation.
+        configured = _read_env_file(Path(__file__).resolve().parents[2] / "packaging" / "dure-client.env")
+    resolved_server = server or os.environ.get("DURE_SERVER") or configured.get("DURE_SERVER")
+    if not resolved_server:
+        raise ValueError(f"central server is not configured; set DURE_SERVER in {client_config}")
+    raw_insecure = os.environ.get("DURE_INSECURE", configured.get("DURE_INSECURE", "false"))
+    resolved_insecure = insecure if insecure is not None else raw_insecure.lower() in {"1", "true", "yes", "on"}
+    if not resolved_insecure and not resolved_server.startswith("https://"):
+        raise ValueError("central server must use HTTPS unless DURE_INSECURE=true")
+    return resolved_server.rstrip("/"), resolved_insecure
+
+
+def _enable_agent_service(runner=None) -> None:
+    service_runner = runner or SubprocessRunner()
+    reloaded = service_runner.run(["systemctl", "daemon-reload"], timeout=30)
+    started = service_runner.run(["systemctl", "enable", "--now", "dure-agent"], timeout=60)
+    if not reloaded.ok or not started.ok:
+        detail = started.stderr or started.stdout or reloaded.stderr or reloaded.stdout
+        raise RuntimeError(f"dure-agent could not be started: {detail}")
+
+
+def join_control_plane(
+    *,
+    server: str | None = None,
+    insecure: bool | None = None,
+    config_path: Path = DEFAULT_CONFIG,
+    client_config: Path = DEFAULT_CLIENT_CONFIG,
+    runner=None,
+    start_service: bool = True,
+) -> dict:
+    if os.geteuid() != 0:
+        raise PermissionError("dure join must run as root")
+    resolved_server, resolved_insecure = resolve_join_settings(
+        server=server, insecure=insecure, client_config=client_config
+    )
+    install = _read_json(config_path)
+    if {"node_id", "credential", "server"} <= set(install):
+        if start_service:
+            _enable_agent_service(runner)
+        return {"node_id": install["node_id"], "status": "already-joined"}
+    install_id = install.get("install_id") or secrets.token_hex(16)
+    profile = NodeProbe(runner).collect()
+    client = JSONClient(resolved_server, verify_tls=not resolved_insecure)
+    response = client.request(
+        "POST",
+        "/v1/nodes/join",
+        {"install_id": install_id, "agent_version": __version__, "profile": profile.to_dict()},
+    )
+    _atomic_json(
+        config_path,
+        {
+            "server": resolved_server,
+            "node_id": response["node_id"],
+            "credential": response["credential"],
+            "install_id": install_id,
+            "verify_tls": not resolved_insecure,
+            "state_file": str(DEFAULT_STATE),
+        },
+    )
+    if start_service:
+        try:
+            _enable_agent_service(runner)
+        except RuntimeError as exc:
+            raise RuntimeError(f"node joined, but {exc}") from exc
+    return {"node_id": response["node_id"], "status": response.get("status", "pending")}
 
 
 class TaskExecutor:
@@ -226,6 +315,11 @@ def main(argv: list[str] | None = None) -> int:
     enroll_parser.add_argument("--token", required=True)
     enroll_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     enroll_parser.add_argument("--insecure", action="store_true", help="Development only: disable TLS verification")
+    join_parser = sub.add_parser("join")
+    join_parser.add_argument("--server")
+    join_parser.add_argument("--insecure", action="store_true", default=None)
+    join_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    join_parser.add_argument("--client-config", type=Path, default=DEFAULT_CLIENT_CONFIG)
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     run_parser.add_argument("--interval", type=float, default=10)
@@ -235,6 +329,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "enroll":
             return enroll(args)
+        if args.command == "join":
+            result = join_control_plane(
+                server=args.server,
+                insecure=args.insecure,
+                config_path=args.config,
+                client_config=args.client_config,
+            )
+            print(f"Joined node {result['node_id']} ({result['status']}); waiting for central approval")
+            return 0
         config = _read_json(args.config)
         if not {"server", "node_id", "credential"} <= set(config):
             parser.error("agent is not enrolled")

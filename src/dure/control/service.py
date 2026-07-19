@@ -78,6 +78,32 @@ def claim_enrollment(
     return node, raw_credential
 
 
+def join_node(
+    session: Session, *, install_id: str, profile: dict, agent_version: str
+) -> tuple[Node, str]:
+    """Register an unauthenticated node as pending operator approval."""
+    parsed = NodeProfile.from_dict(profile)
+    if session.scalar(select(Node).where(Node.install_id == install_id)) is not None:
+        raise ValueError("installation is already joined")
+    node = Node(
+        install_id=install_id,
+        display_name=parsed.hostname,
+        hostname=parsed.hostname,
+        agent_version=agent_version,
+        approved=False,
+        last_seen=utcnow(),
+        observed_phase="DISCOVERED",
+    )
+    session.add(node)
+    session.flush()
+    session.add(NodeProfileRecord(node_id=node.id, profile=profile))
+    raw_credential = secrets.token_urlsafe(48)
+    session.add(NodeCredential(node_id=node.id, credential_hash=secret_hash(raw_credential)))
+    audit(session, f"node:{node.id}", "node.join", node.id, "pending")
+    session.commit()
+    return node, raw_credential
+
+
 def authenticate_node(session: Session, credential: str) -> Node | None:
     digest = secret_hash(credential)
     row = session.execute(
@@ -85,7 +111,17 @@ def authenticate_node(session: Session, credential: str) -> Node | None:
         .join(Node, Node.id == NodeCredential.node_id)
         .where(NodeCredential.credential_hash == digest, NodeCredential.revoked_at.is_(None))
     ).first()
-    return row[1] if row and row[1].approved else None
+    return row[1] if row else None
+
+
+def approve_node(session: Session, node_id: str) -> bool:
+    node = session.get(Node, node_id)
+    if node is None:
+        return False
+    node.approved = True
+    audit(session, "admin", "node.approve", node_id, "success")
+    session.commit()
+    return True
 
 
 def revoke_node(session: Session, node_id: str) -> bool:
@@ -216,7 +252,7 @@ def create_tasks(
     for node_id in dict.fromkeys(node_ids):
         node = session.get(Node, node_id)
         if node is None or not node.approved:
-            errors[node_id] = "unknown or revoked node"
+            errors[node_id] = "unknown, pending, or revoked node"
             continue
         if deployment is not None and node_id not in assignments:
             errors[node_id] = "node is not assigned to deployment"

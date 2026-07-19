@@ -1,3 +1,9 @@
+dure (0.3.0) stable; urgency=medium
+
+  * Add tokenless node join with central approval.
+
+ -- Dure contributors <maintainers@example.invalid>  Sat, 18 Jul 2026 13:30:00 +0000
+
 dure (0.1.0) unstable; urgency=medium
 
   * Initial MVP release.

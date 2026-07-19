@@ -1,6 +1,7 @@
 *.egg-info/
 __pycache__/
 *.py[cod]
+.env
 .pytest_cache/
 build/
 dist/
@@ -10,4 +11,3 @@ debian/debhelper-build-stamp
 debian/dure/
 debian/files
 debian/*.substvars
-

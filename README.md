@@ -48,6 +48,13 @@ sudo apt upgrade
 
 See [docs/apt-distribution.md](docs/apt-distribution.md) for signing, GitHub Pages publishing, manual repository registration, and release instructions.
 
+Additional documentation:
+
+- [Architecture](docs/architecture.md)
+- [Control-plane operations](docs/operations.md)
+- [Security model](docs/security.md)
+- [Development and release workflow](docs/development.md)
+
 Then inspect the local node:
 
 ```bash
@@ -151,19 +158,28 @@ These boundaries are intentional: the current milestones focus on deterministic 
 ## Central node management
 
 Dure includes an optional FastAPI/PostgreSQL control plane and an outbound-polling node agent.
-Run `dure-server --migrate`,
-set `DURE_DATABASE_URL` and `DURE_ADMIN_TOKEN`, then start
-`dure-server` behind a TLS reverse proxy. Create a one-time enrollment token with:
+Run `dure-server --migrate`, set `DURE_DATABASE_URL` and `DURE_ADMIN_TOKEN`, then start
+`dure-server` behind a TLS reverse proxy.
+
+The package carries the deployment's control-plane address in
+`/etc/dure/dure-client.env`. A new machine joins without a per-node token or server argument:
 
 ```bash
-dure admin --server https://dure.example --token "$DURE_ADMIN_TOKEN" enrollment create
-sudo dure-agent enroll --server https://dure.example --token <one-time-token>
-sudo systemctl enable --now dure-agent
+sudo apt install dure
+sudo dure join
 ```
 
-List enrolled nodes with `dure admin ... nodes`. Central tasks are restricted to probe,
-verify, apply, start, stop, and restart operations; arbitrary remote shell commands are
-not accepted. Central deployments require an OCI digest-pinned image.
+Joining records the machine as pending, stores its credential, and starts `dure-agent`.
+The agent may send heartbeats while pending but cannot receive work. Approve it centrally:
+
+```bash
+dure admin nodes --pending
+dure admin node approve <node-id>
+```
+
+Central tasks are restricted to probe, verify, apply, start, stop, and restart operations;
+arbitrary remote shell commands are not accepted. Central deployments require an OCI
+digest-pinned image. The one-time enrollment-token endpoint remains for compatibility.
 
 ## Tests
 

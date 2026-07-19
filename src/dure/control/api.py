@@ -15,6 +15,7 @@ from .db import Base, make_engine, make_session_factory, session_dependency
 from .models import Deployment, Node, NodeProfileRecord, Task, TaskType
 from .service import (
     authenticate_node,
+    approve_node,
     cancel_task,
     claim_enrollment,
     claim_task,
@@ -22,6 +23,7 @@ from .service import (
     create_tasks,
     extend_task,
     finish_task,
+    join_node,
     node_status,
     revoke_node,
     rotate_node_credential,
@@ -36,6 +38,12 @@ class EnrollmentCreate(BaseModel):
 
 class EnrollmentClaim(BaseModel):
     token: str
+    install_id: str = Field(min_length=8, max_length=64)
+    agent_version: str
+    profile: dict
+
+
+class NodeJoin(BaseModel):
     install_id: str = Field(min_length=8, max_length=64)
     agent_version: str
     profile: dict
@@ -132,13 +140,23 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"node_id": node.id, "credential": credential}
 
+    @app.post("/v1/nodes/join")
+    def node_join(body: NodeJoin, session: Session = Depends(get_session)):
+        try:
+            node, credential = join_node(session, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"node_id": node.id, "credential": credential, "status": "pending"}
+
     @app.post("/v1/agent/heartbeat")
     def heartbeat(body: Heartbeat, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         save_heartbeat(session, node, body.state, body.profile)
-        return {"ok": True}
+        return {"ok": True, "approved": node.approved}
 
     @app.post("/v1/agent/tasks/claim")
     def agent_claim(node: Node = Depends(node_auth), session: Session = Depends(get_session)):
+        if not node.approved:
+            return {"task": None, "status": "pending"}
         task = claim_task(session, node.id)
         return {"task": _task_dict(task) if task else None}
 
@@ -194,6 +212,12 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         if not revoke_node(session, node_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         return {"ok": True}
+
+    @app.post("/v1/admin/nodes/{node_id}/approve", dependencies=[Depends(admin_auth)])
+    def node_approve(node_id: str, session: Session = Depends(get_session)):
+        if not approve_node(session, node_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
+        return {"ok": True, "node_id": node_id, "status": "approved"}
 
     @app.post("/v1/admin/nodes/{node_id}/credential", dependencies=[Depends(admin_auth)])
     def node_credential_rotate(node_id: str, session: Session = Depends(get_session)):

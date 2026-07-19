@@ -56,17 +56,24 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--plan", type=Path, required=True)
     verify.add_argument("--api", action="store_true")
 
+    join = subparsers.add_parser("join", help="Join this machine to the configured control plane")
+    join.add_argument("--server", help="Override the packaged central server address")
+    join.add_argument("--insecure", action="store_true", default=None, help="Development only")
+
     admin = subparsers.add_parser("admin", help="Manage nodes through the central control plane")
     _add_admin_connection(admin)
     admin_sub = admin.add_subparsers(dest="admin_command", required=True)
     nodes = admin_sub.add_parser("nodes")
     nodes.add_argument("--online", action="store_true")
     nodes.add_argument("--offline", action="store_true")
+    nodes.add_argument("--pending", action="store_true")
     nodes.add_argument("--json", action="store_true")
     node = admin_sub.add_parser("node")
     node_sub = node.add_subparsers(dest="node_command", required=True)
     node_show = node_sub.add_parser("show")
     node_show.add_argument("node_id")
+    node_approve = node_sub.add_parser("approve")
+    node_approve.add_argument("node_id")
     enrollment = admin_sub.add_parser("enrollment")
     enrollment_sub = enrollment.add_subparsers(dest="enrollment_command", required=True)
     enrollment_create = enrollment_sub.add_parser("create")
@@ -245,6 +252,15 @@ def _verify(args: argparse.Namespace) -> int:
     return 0 if all(check.ok for check in checks) else 1
 
 
+def _join(args: argparse.Namespace) -> int:
+    from .agent import join_control_plane
+
+    result = join_control_plane(server=args.server, insecure=args.insecure)
+    print(f"Joined node {result['node_id']} ({result['status']})")
+    print("The agent is running and waiting for central approval.")
+    return 0
+
+
 def _duration_seconds(value: str) -> int:
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     try:
@@ -257,9 +273,14 @@ def _duration_seconds(value: str) -> int:
 
 def _admin(args: argparse.Namespace) -> int:
     import os
+    from .agent import resolve_join_settings
     from .http import JSONClient
 
-    server = args.server or os.environ.get("DURE_SERVER")
+    try:
+        configured_server, _ = resolve_join_settings()
+    except ValueError:
+        configured_server = None
+    server = args.server or os.environ.get("DURE_SERVER") or configured_server
     token = args.token or os.environ.get("DURE_ADMIN_TOKEN")
     if not server or not token:
         raise ValueError("--server and --token (or DURE_SERVER and DURE_ADMIN_TOKEN) are required")
@@ -270,13 +291,20 @@ def _admin(args: argparse.Namespace) -> int:
             values = [item for item in values if item["connectivity"] == "online"]
         if args.offline:
             values = [item for item in values if item["connectivity"] != "online"]
+        if args.pending:
+            values = [item for item in values if not item["approved"]]
         if args.json:
             print(json.dumps(values, indent=2, sort_keys=True))
         else:
             for item in values:
-                print(f"{item['id']}  {item['connectivity']:7}  {item['hostname']}  {item['phase'] or '-'}")
+                availability = item["connectivity"] if item["approved"] else "pending"
+                print(f"{item['id']}  {availability:7}  {item['hostname']}  {item['phase'] or '-'}")
         return 0
     if args.admin_command == "node":
+        if args.node_command == "approve":
+            value = client.request("POST", f"/v1/admin/nodes/{args.node_id}/approve")
+            print(f"Approved node {value['node_id']}")
+            return 0
         value = client.request("GET", f"/v1/admin/nodes/{args.node_id}")["node"]
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0
@@ -338,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         "init": _init,
         "status": _status,
         "verify": _verify,
+        "join": _join,
         "admin": _admin,
     }
     try:
