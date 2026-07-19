@@ -54,6 +54,7 @@ Additional documentation:
 - [Control-plane operations](docs/operations.md)
 - [Security model](docs/security.md)
 - [Development and release workflow](docs/development.md)
+- [Development roadmap](docs/roadmap.md)
 
 Then inspect the local node:
 
@@ -145,7 +146,8 @@ State is stored under `$XDG_STATE_HOME/dure/state.json`, or `~/.local/state/dure
 
 ## Current limitations
 
-- No central enrollment/controller API yet; profile and plan files are exchanged manually.
+- Central deployment planning still requires exported profile files; direct planning from registered
+  node profiles is not yet implemented.
 - Docker is the only apply-mode container backend.
 - The MVP assigns at most one GPU per physical node.
 - Network benchmark and NCCL collective probe are not yet implemented.
