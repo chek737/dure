@@ -134,6 +134,62 @@ class ArtifactManifestCLITests(unittest.TestCase):
         self.assertEqual(FakeJSONClient.calls, [])
 
 
+class ArtifactCacheCLITests(unittest.TestCase):
+    def setUp(self):
+        FakeJSONClient.calls = []
+        FakeJSONClient.response = {"cache": {"id": "cache-1"}, "tasks": []}
+
+    def run_cli(self, *arguments: str) -> tuple[int, dict]:
+        output = io.StringIO()
+        with patch(
+            "dure.agent.resolve_join_settings",
+            return_value=("https://packaged", False),
+        ), patch("dure.http.JSONClient", FakeJSONClient), redirect_stdout(output):
+            result = main(
+                [
+                    "admin",
+                    "--server",
+                    "https://control.example",
+                    "--token",
+                    "admin-token",
+                    "artifact-cache",
+                    *arguments,
+                ]
+            )
+        return result, json.loads(output.getvalue())
+
+    def test_list_show_and_verify_use_read_only_get_endpoints(self):
+        for arguments, path in (
+            (("list",), "/v1/admin/artifact-caches"),
+            (("show", "cache-1"), "/v1/admin/artifact-caches/cache-1"),
+            (("verify", "cache-1"), "/v1/admin/artifact-caches/cache-1/verify"),
+        ):
+            with self.subTest(arguments=arguments):
+                FakeJSONClient.calls = []
+                result, output = self.run_cli(*arguments)
+                self.assertEqual(result, 0)
+                self.assertEqual(output, FakeJSONClient.response)
+                self.assertEqual(FakeJSONClient.calls[0][2:], ("GET", path, None))
+
+    def test_quarantine_is_preview_by_default_and_apply_is_explicit(self):
+        for arguments, apply in (
+            (("quarantine", "cache-1"), False),
+            (("quarantine", "cache-1", "--apply"), True),
+        ):
+            with self.subTest(arguments=arguments):
+                FakeJSONClient.calls = []
+                result, _output = self.run_cli(*arguments)
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    FakeJSONClient.calls[0][2:],
+                    (
+                        "POST",
+                        "/v1/admin/artifact-caches/cache-1/quarantine",
+                        {"apply": apply},
+                    ),
+                )
+
+
 class DeploymentRecommendCLITests(unittest.TestCase):
     def setUp(self):
         FakeJSONClient.calls = []

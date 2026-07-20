@@ -24,6 +24,7 @@ from .models import (
     StageArtifactVariant,
     utcnow,
 )
+from .cache_lifecycle import mark_stage_variant_revoked
 from .service import (
     ArtifactManifestConflictError,
     _canonical_artifact_manifest,
@@ -1113,7 +1114,16 @@ def transition_stage_artifact_variant(
     if target_status not in {"DRAFT", "VALIDATED", "REVOKED"}:
         raise ValueError("unknown stage artifact variant status")
     same_status = target_status == variant.status
-    if same_status and target_status != "VALIDATED":
+    if same_status and target_status == "DRAFT":
+        return variant
+    if same_status and target_status == "REVOKED":
+        mark_stage_variant_revoked(
+            session,
+            artifact_set_digest=artifact_set_digest,
+            revoked_at=variant.revoked_at,
+        )
+        if commit:
+            session.commit()
         return variant
     allowed = {
         "DRAFT": {"VALIDATED", "REVOKED"},
@@ -1156,6 +1166,13 @@ def transition_stage_artifact_variant(
         variant.status = "REVOKED"
         variant.revoked_at = now
     variant.updated_at = now
+    if target_status == "REVOKED":
+        session.flush()
+        mark_stage_variant_revoked(
+            session,
+            artifact_set_digest=artifact_set_digest,
+            revoked_at=now,
+        )
     audit(
         session,
         "admin",

@@ -214,6 +214,47 @@ class BenchmarkTaskAPITests(unittest.TestCase):
         )
         self.assertEqual(generic.status_code, 400)
 
+    def test_queued_cache_quarantine_blocks_benchmark_apply(self):
+        node, release, placement, _ = self.fixture("quarantine-busy")
+        body = _request(node, release, placement)
+        prepared = self.prepare(body)
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        with self.client.app.state.session_factory() as session:
+            session.add(
+                Task(
+                    bulk_id="88888888-8888-4888-8888-888888888888",
+                    node_id=node.id,
+                    type=TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+                    payload={
+                        "node_id": node.id,
+                        "cache_kind": "FULL_SNAPSHOT",
+                        "cache_identity_digest": "sha256:" + "c" * 64,
+                    },
+                )
+            )
+            session.commit()
+
+        applied = self.apply(body["request_id"])
+
+        self.assertEqual(applied.status_code, 409, applied.text)
+        self.assertEqual(
+            applied.json()["detail"]["code"],
+            "BENCHMARK_NODE_BUSY",
+        )
+        with self.client.app.state.session_factory() as session:
+            active = list(
+                session.scalars(
+                    select(Task).where(
+                        Task.status.in_(
+                            {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+                        )
+                    )
+                )
+            )
+            self.assertEqual([task.type for task in active], [
+                TaskType.QUARANTINE_ARTIFACT_CACHE.value
+            ])
+
     def test_prepare_blocks_multinode_and_apply_blocks_changed_profile(self):
         with self.client.app.state.session_factory() as session:
             nodes = [_node(session, f"multi-{index}") for index in range(3)]

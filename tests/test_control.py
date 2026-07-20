@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.models import (
+    Deployment,
     DeploymentOperation,
     DeploymentOperationNode,
     EnrollmentToken,
@@ -173,6 +174,80 @@ class ControlServiceTests(unittest.TestCase):
             node, _ = self.enroll(session)
             with self.assertRaises(ValueError):
                 create_tasks(session, node_ids=[node.id], task_type=TaskType.PROBE, deployment_id=None, options={"command": "id"})
+
+    def test_queued_cache_quarantine_blocks_new_deployment_work(self):
+        with self.factory() as session:
+            node, deployment = self.deployment(session)
+            quarantine = Task(
+                bulk_id="77777777-7777-4777-8777-777777777777",
+                node_id=node.id,
+                type=TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+                payload={
+                    "node_id": node.id,
+                    "cache_kind": "FULL_SNAPSHOT",
+                    "cache_identity_digest": "sha256:" + "b" * 64,
+                },
+            )
+            session.add(quarantine)
+            session.commit()
+
+            with self.assertRaises(DeploymentRolloutConflictError) as raised:
+                create_tasks(
+                    session,
+                    node_ids=[node.id],
+                    task_type=TaskType.APPLY_DEPLOYMENT,
+                    deployment_id=deployment.id,
+                    options={"serve": False},
+                )
+
+            self.assertEqual(raised.exception.code, "DEPLOYMENT_NODE_TASK_ACTIVE")
+            active = list(
+                session.scalars(
+                    select(Task).where(
+                        Task.status.in_(
+                            {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+                        )
+                    )
+                )
+            )
+            self.assertEqual([task.type for task in active], [
+                TaskType.QUARANTINE_ARTIFACT_CACHE.value
+            ])
+
+    def test_queued_cache_quarantine_blocks_new_deployment_record(self):
+        with self.factory() as session:
+            node, _ = self.enroll(session)
+            plan = build_plan(
+                [profile("node-a")],
+                image="registry.example/vllm@sha256:" + "a" * 64,
+            )
+            session.add(
+                Task(
+                    bulk_id="99999999-9999-4999-8999-999999999999",
+                    node_id=node.id,
+                    type=TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+                    payload={
+                        "node_id": node.id,
+                        "cache_kind": "FULL_SNAPSHOT",
+                        "cache_identity_digest": "sha256:" + "b" * 64,
+                    },
+                )
+            )
+            session.commit()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "active artifact cache quarantine",
+            ):
+                save_deployment(
+                    session,
+                    plan.to_dict(),
+                    accept_model_download=False,
+                    pull_image=False,
+                )
+
+            session.rollback()
+            self.assertIsNone(session.get(Deployment, plan.deployment_id))
 
     def test_deployment_apply_tracks_operation_and_preserves_payload(self):
         with self.factory() as session:

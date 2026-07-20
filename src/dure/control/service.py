@@ -82,6 +82,7 @@ MODEL_RELEASE_TRANSITIONS = {
 }
 STRICT_RAY_AGENT_VERSION = (0, 3, 18)
 STAGE_ARTIFACT_AGENT_VERSION = (0, 3, 19)
+ARTIFACT_CACHE_QUARANTINE_AGENT_VERSION = (0, 3, 20)
 
 
 def _agent_supports_strict_ray(value: str) -> bool:
@@ -159,6 +160,19 @@ class ArtifactManifestConflictError(ValueError):
     pass
 
 
+class ArtifactCacheControlError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        details: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
 class BenchmarkRunNotFoundError(ValueError):
     pass
 
@@ -178,6 +192,255 @@ def aware(value: datetime | None) -> datetime | None:
     if value is not None and value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _artifact_cache_projection(session: Session, cache_id: str) -> dict:
+    """Single adapter between the API surface and cache lifecycle storage."""
+    from .cache_lifecycle import (
+        ArtifactCacheNotFoundError,
+        artifact_cache_projection,
+    )
+
+    value = artifact_cache_projection(session, cache_id=cache_id)
+    if value is None:
+        raise ArtifactCacheNotFoundError()
+    return value
+
+
+def _list_artifact_cache_projections(session: Session) -> list[dict]:
+    from .cache_lifecycle import list_artifact_cache_projections
+
+    return list_artifact_cache_projections(session)
+
+
+def _artifact_cache_reference_projection(session: Session, cache_id: str) -> dict:
+    from .cache_lifecycle import artifact_cache_reference_projection
+
+    value = artifact_cache_reference_projection(session, cache_id=cache_id)
+    if (
+        type(value) is not dict
+        or set(value)
+        != {"schema_version", "cache_id", "complete", "blocking_references"}
+        or value["schema_version"] != 1
+        or value["cache_id"] != cache_id
+        or type(value["complete"]) is not bool
+        or type(value["blocking_references"]) is not list
+        or any(type(item) is not dict for item in value["blocking_references"])
+    ):
+        raise ArtifactCacheControlError(
+            "artifact cache reference projection is unavailable",
+            code="ARTIFACT_CACHE_REFERENCES_UNKNOWN",
+        )
+    return value
+
+
+def list_artifact_caches(session: Session) -> list[dict]:
+    return _list_artifact_cache_projections(session)
+
+
+def artifact_cache_detail(session: Session, cache_id: str) -> dict:
+    return _artifact_cache_projection(session, cache_id)
+
+
+def verify_artifact_cache(session: Session, cache_id: str) -> dict:
+    """Return central evidence and blockers without creating tasks or events."""
+    cache = _artifact_cache_projection(session, cache_id)
+    references = _artifact_cache_reference_projection(session, cache_id)
+    return {
+        "cache": cache,
+        "references": references,
+        "eligible_for_quarantine": (
+            references["complete"]
+            and not references["blocking_references"]
+            and cache.get("status") not in {"MISSING", "QUARANTINED"}
+        ),
+    }
+
+
+def _validated_cache_control_projection(value: dict, cache_id: str) -> tuple[str, str, str]:
+    if type(value) is not dict or value.get("id") != cache_id:
+        raise ArtifactCacheControlError(
+            "artifact cache projection is invalid",
+            code="ARTIFACT_CACHE_PROJECTION_INVALID",
+        )
+    node_id = value.get("node_id")
+    cache_kind = value.get("cache_kind")
+    cache_identity_digest = value.get("cache_identity_digest")
+    try:
+        parsed_node_id = uuid.UUID(node_id) if type(node_id) is str else None
+    except ValueError as exc:
+        raise ArtifactCacheControlError(
+            "artifact cache projection is invalid",
+            code="ARTIFACT_CACHE_PROJECTION_INVALID",
+        ) from exc
+    if (
+        parsed_node_id is None
+        or str(parsed_node_id) != node_id
+        or parsed_node_id.version != 4
+        or cache_kind not in {"FULL_SNAPSHOT", "STAGE"}
+        or type(cache_identity_digest) is not str
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", cache_identity_digest) is None
+    ):
+        raise ArtifactCacheControlError(
+            "artifact cache projection is invalid",
+            code="ARTIFACT_CACHE_PROJECTION_INVALID",
+        )
+    return node_id, cache_kind, cache_identity_digest
+
+
+def _agent_supports_artifact_cache_quarantine(value: str) -> bool:
+    if type(value) is not str:
+        return False
+    matched = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", value)
+    return (
+        matched is not None
+        and tuple(int(part) for part in matched.groups())
+        >= ARTIFACT_CACHE_QUARANTINE_AGENT_VERSION
+    )
+
+
+def prepare_or_apply_artifact_cache_quarantine(
+    session: Session,
+    cache_id: str,
+    *,
+    apply: bool,
+) -> tuple[dict, dict, list[Task], bool]:
+    """Preview by default; queue one closed task only after explicit apply."""
+    if type(apply) is not bool:
+        raise ArtifactCacheControlError(
+            "artifact cache quarantine apply must be a strict boolean",
+            code="ARTIFACT_CACHE_QUARANTINE_REQUEST_INVALID",
+        )
+    cache = _artifact_cache_projection(session, cache_id)
+    node_id, cache_kind, cache_identity_digest = _validated_cache_control_projection(
+        cache, cache_id
+    )
+    references = _artifact_cache_reference_projection(session, cache_id)
+    if not apply:
+        return cache, references, [], False
+    try:
+        from .cache_lifecycle import request_cache_quarantine
+        from .models import NodeArtifactCache
+
+        locked_node = session.scalar(
+            select(Node)
+            .join(NodeArtifactCache, NodeArtifactCache.node_id == Node.id)
+            .where(NodeArtifactCache.id == cache_id)
+            .with_for_update(of=Node)
+            .execution_options(populate_existing=True)
+        )
+        if locked_node is None or locked_node.id != node_id:
+            raise ArtifactCacheControlError(
+                "artifact cache node is unavailable",
+                code="ARTIFACT_CACHE_NODE_UNAVAILABLE",
+            )
+        cache = _artifact_cache_projection(session, cache_id)
+        current_identity = _validated_cache_control_projection(cache, cache_id)
+        if current_identity != (node_id, cache_kind, cache_identity_digest):
+            raise ArtifactCacheControlError(
+                "artifact cache identity changed",
+                code="ARTIFACT_CACHE_PROJECTION_INVALID",
+            )
+        if cache.get("status") == "QUARANTINED":
+            return cache, _artifact_cache_reference_projection(session, cache_id), [], False
+        if cache.get("status") == "MISSING":
+            raise ArtifactCacheControlError(
+                "a missing artifact cache cannot be quarantined",
+                code="ARTIFACT_CACHE_SOURCE_MISSING",
+            )
+        active_tasks = list(
+            session.scalars(
+                select(Task)
+                .where(
+                    Task.node_id == node_id,
+                    Task.status.in_(
+                        {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+                    ),
+                )
+                .order_by(Task.created_at, Task.id)
+                .with_for_update()
+            )
+        )
+        for current in active_tasks:
+            if (
+                current.type == TaskType.QUARANTINE_ARTIFACT_CACHE.value
+                and current.payload
+                == {
+                    "node_id": node_id,
+                    "cache_kind": cache_kind,
+                    "cache_identity_digest": cache_identity_digest,
+                }
+            ):
+                return cache, _artifact_cache_reference_projection(session, cache_id), [current], False
+        references = _artifact_cache_reference_projection(session, cache_id)
+        if not references["complete"]:
+            raise ArtifactCacheControlError(
+                "artifact cache references could not be proven complete",
+                code="ARTIFACT_CACHE_REFERENCES_UNKNOWN",
+            )
+        if references["blocking_references"] or active_tasks:
+            raise ArtifactCacheControlError(
+                "artifact cache is still referenced",
+                code="ARTIFACT_CACHE_REFERENCED",
+                details={
+                    "blocking_references": references["blocking_references"],
+                    "active_task_ids": [item.id for item in active_tasks],
+                },
+            )
+        if (
+            not locked_node.approved
+            or node_status(locked_node.last_seen, utcnow()) != "online"
+        ):
+            raise ArtifactCacheControlError(
+                "artifact cache node must be approved and online",
+                code="ARTIFACT_CACHE_NODE_UNAVAILABLE",
+            )
+        if not _agent_supports_artifact_cache_quarantine(
+            locked_node.agent_version
+        ):
+            raise ArtifactCacheControlError(
+                "artifact cache quarantine requires Dure Agent 0.3.20 or newer",
+                code="ARTIFACT_CACHE_AGENT_TOO_OLD",
+            )
+        task = Task(
+            id=str(uuid.uuid4()),
+            bulk_id=str(uuid.uuid4()),
+            node_id=node_id,
+            type=TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+            payload={
+                "node_id": node_id,
+                "cache_kind": cache_kind,
+                "cache_identity_digest": cache_identity_digest,
+            },
+        )
+        session.add(task)
+        session.flush()
+        request_cache_quarantine(
+            session,
+            node_id=node_id,
+            cache_identity_digest=cache_identity_digest,
+            request_id=task.id,
+            source_task_id=task.id,
+        )
+        locked_node.desired_state = TaskType.QUARANTINE_ARTIFACT_CACHE.value
+        audit(
+            session,
+            "admin",
+            "artifact-cache.quarantine",
+            cache_id,
+            "success",
+            task_id=task.id,
+        )
+        session.commit()
+        return (
+            _artifact_cache_projection(session, cache_id),
+            _artifact_cache_reference_projection(session, cache_id),
+            [task],
+            True,
+        )
+    except Exception:
+        session.rollback()
+        raise
 
 
 def audit(session: Session, actor: str, action: str, target: str | None, outcome: str, **detail) -> None:
@@ -961,6 +1224,41 @@ def node_status(last_seen: datetime | None, now: datetime | None = None) -> str:
     return "stale"
 
 
+def _lock_deployment_creation_nodes(
+    session: Session, node_ids: list[str]
+) -> None:
+    """Serialize deployment creation with cache quarantine decisions."""
+    normalized = sorted(set(node_ids))
+    locked = list(
+        session.scalars(
+            select(Node)
+            .where(Node.id.in_(normalized))
+            .order_by(Node.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    if [node.id for node in locked] != normalized:
+        raise ValueError("deployment assignments contain an unknown node")
+    quarantine = session.execute(
+        select(Task.id, Task.node_id)
+        .where(
+            Task.node_id.in_(normalized),
+            Task.type == TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+            Task.status.in_(
+                {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+            ),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    ).one_or_none()
+    if quarantine is not None:
+        raise ValueError(
+            "deployment assignment has an active artifact cache quarantine: "
+            f"{quarantine.node_id}"
+        )
+
+
 def save_heartbeat(
     session: Session,
     node: Node,
@@ -969,20 +1267,41 @@ def save_heartbeat(
     *,
     agent_version: str | None = None,
 ) -> None:
-    node.last_seen = utcnow()
+    observed_at = utcnow()
+    locked_node = session.scalar(
+        select(Node)
+        .where(Node.id == node.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_node is None:
+        raise ValueError("node not found")
+    node = locked_node
+    node.last_seen = observed_at
     if agent_version is not None:
         node.agent_version = agent_version
     node.observed_phase = state.get("phase")
     node.observed_role = state.get("role")
     node.observed_deployment_id = state.get("deployment_id")
     if profile is not None:
-        NodeProfile.from_dict(profile)
+        parsed_profile = NodeProfile.from_dict(profile)
         record = session.get(NodeProfileRecord, node.id)
         if record is None:
             session.add(NodeProfileRecord(node_id=node.id, profile=profile))
         else:
             record.profile = profile
-            record.updated_at = utcnow()
+            record.updated_at = observed_at
+        if parsed_profile.artifact_cache_observations is not None:
+            from .cache_lifecycle import reconcile_probe_observations
+
+            reconcile_probe_observations(
+                session,
+                node_id=node.id,
+                observations=parsed_profile.artifact_cache_observations,
+                scan_complete=parsed_profile.artifact_cache_scan_complete,
+                source_id=f"heartbeat:{uuid.uuid4()}",
+                observed_at=observed_at,
+            )
     session.commit()
 
 
@@ -1027,6 +1346,10 @@ def save_deployment(
         if head is None:
             raise ValueError("deployment has no Ray head assignment")
         plan.ray_head_node_id = head.node_id
+    _lock_deployment_creation_nodes(
+        session,
+        [assignment.node_id for assignment in plan.assignments],
+    )
     existing = session.get(Deployment, plan.deployment_id)
     if existing is not None:
         raise ValueError("deployment already exists")
@@ -1883,6 +2206,7 @@ NODE_EXCLUSIVE_TASK_TYPE_VALUES = DEPLOYMENT_TASK_TYPE_VALUES | {
     TaskType.BENCHMARK.value,
     TaskType.PREPARE_MODEL.value,
     TaskType.PREPARE_IMAGE.value,
+    TaskType.QUARANTINE_ARTIFACT_CACHE.value,
 }
 
 
@@ -2048,6 +2372,10 @@ def create_tasks(
     if task_type in {TaskType.PREPARE_MODEL, TaskType.PREPARE_IMAGE}:
         raise ValueError(
             "artifact preparation tasks require the dedicated deployment prepare API"
+        )
+    if task_type == TaskType.QUARANTINE_ARTIFACT_CACHE:
+        raise ValueError(
+            "artifact cache quarantine tasks require the dedicated cache API"
         )
     _validate_task_options(task_type, options)
     try:
@@ -2378,6 +2706,112 @@ def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int =
         raise
 
 
+def _finish_artifact_cache_quarantine_task(
+    session: Session,
+    task: Task,
+    node_id: str,
+    *,
+    result: dict | None,
+    error: str | None,
+) -> bool:
+    from dure.cache_quarantine import ARTIFACT_CACHE_QUARANTINE_FAILURE_CODES
+    from .cache_lifecycle import complete_cache_quarantine
+
+    try:
+        locked_node = session.scalar(
+            select(Node).where(Node.id == node_id).with_for_update()
+        )
+        locked_task = session.scalar(
+            select(Task)
+            .where(Task.id == task.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            locked_node is None
+            or locked_task is None
+            or locked_task.node_id != node_id
+            or locked_task.type != TaskType.QUARANTINE_ARTIFACT_CACHE.value
+        ):
+            session.rollback()
+            return False
+        if locked_task.status in {
+            TaskStatus.SUCCEEDED.value,
+            TaskStatus.FAILED.value,
+        }:
+            return True
+        if locked_task.status != TaskStatus.RUNNING.value:
+            session.rollback()
+            return False
+        payload = locked_task.payload
+        expected_payload_fields = {
+            "node_id",
+            "cache_kind",
+            "cache_identity_digest",
+        }
+        if (
+            type(payload) is not dict
+            or set(payload) != expected_payload_fields
+            or payload.get("node_id") != node_id
+            or payload.get("cache_kind") not in {"FULL_SNAPSHOT", "STAGE"}
+            or type(payload.get("cache_identity_digest")) is not str
+            or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", payload["cache_identity_digest"]
+            )
+            is None
+        ):
+            raise ArtifactCacheControlError(
+                "artifact cache quarantine task payload is invalid",
+                code="ARTIFACT_CACHE_QUARANTINE_TASK_INVALID",
+            )
+        terminal_error = error
+        expected_result = {
+            "node_id": node_id,
+            "cache_kind": payload["cache_kind"],
+            "cache_identity_digest": payload["cache_identity_digest"],
+        }
+        if terminal_error is None and (
+            type(result) is not dict
+            or set(result)
+            != {
+                "node_id",
+                "cache_kind",
+                "cache_identity_digest",
+                "status",
+            }
+            or any(result.get(key) != value for key, value in expected_result.items())
+            or result.get("status")
+            not in {"QUARANTINED", "ALREADY_QUARANTINED"}
+        ):
+            terminal_error = "CACHE_QUARANTINE_EXECUTION_FAILED"
+            result = None
+        if terminal_error is not None and terminal_error not in ARTIFACT_CACHE_QUARANTINE_FAILURE_CODES:
+            terminal_error = "CACHE_QUARANTINE_EXECUTION_FAILED"
+        succeeded = terminal_error is None
+        locked_task.status = (
+            TaskStatus.SUCCEEDED.value
+            if succeeded
+            else TaskStatus.FAILED.value
+        )
+        locked_task.result = result if succeeded else None
+        locked_task.error = terminal_error
+        locked_task.lease_until = None
+        locked_node.desired_state = None
+        complete_cache_quarantine(
+            session,
+            node_id=node_id,
+            cache_identity_digest=payload["cache_identity_digest"],
+            request_id=locked_task.id,
+            succeeded=succeeded,
+            source_task_id=locked_task.id,
+        )
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
+
+
 def finish_task(session: Session, task: Task, node_id: str, *, result: dict | None, error: str | None) -> bool:
     if task.type == TaskType.BENCHMARK.value:
         return False
@@ -2408,6 +2842,14 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
             else:
                 session.rollback()
             raise
+    if task.type == TaskType.QUARANTINE_ARTIFACT_CACHE.value:
+        return _finish_artifact_cache_quarantine_task(
+            session,
+            task,
+            node_id,
+            result=result,
+            error=error,
+        )
     if task.operation_node_id is not None or task.operation_attempt is not None:
         try:
             locked_node = session.scalar(
@@ -2432,6 +2874,23 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
             session.rollback()
             raise
     try:
+        node = session.scalar(
+            select(Node).where(Node.id == node_id).with_for_update()
+        )
+        locked_task = session.scalar(
+            select(Task)
+            .where(Task.id == task.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            node is None
+            or locked_task is None
+            or locked_task.node_id != node_id
+        ):
+            session.rollback()
+            return False
+        task = locked_task
         terminal = {TaskStatus.SUCCEEDED.value, TaskStatus.FAILED.value}
         if task.status in terminal:
             return True
@@ -2457,16 +2916,14 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
         task.result = terminal_result
         task.error = terminal_error
         task.lease_until = None
-        node = session.get(Node, node_id)
-        if node is not None:
-            node.desired_state = None
+        node.desired_state = None
         if (
             not error
             and task.type == TaskType.PROBE.value
             and result
             and isinstance(result.get("profile"), dict)
         ):
-            NodeProfile.from_dict(result["profile"])
+            parsed_profile = NodeProfile.from_dict(result["profile"])
             profile_record = session.get(NodeProfileRecord, node_id)
             if profile_record is None:
                 session.add(
@@ -2475,6 +2932,17 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
             else:
                 profile_record.profile = result["profile"]
                 profile_record.updated_at = utcnow()
+            if parsed_profile.artifact_cache_observations is not None:
+                from .cache_lifecycle import reconcile_probe_observations
+
+                reconcile_probe_observations(
+                    session,
+                    node_id=node_id,
+                    observations=parsed_profile.artifact_cache_observations,
+                    scan_complete=parsed_profile.artifact_cache_scan_complete,
+                    source_id=f"probe:{task.id}",
+                    source_task_id=task.id,
+                )
         session.commit()
         return True
     except Exception:
@@ -2513,6 +2981,58 @@ def cancel_task(session: Session, task: Task) -> bool:
             if not accepted:
                 session.rollback()
                 return False
+            audit(session, "admin", "task.cancel", task.id, "success")
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
+    if identity.type == TaskType.QUARANTINE_ARTIFACT_CACHE.value:
+        from .cache_lifecycle import complete_cache_quarantine
+
+        try:
+            locked_node = session.scalar(
+                select(Node)
+                .where(Node.id == identity.node_id)
+                .with_for_update()
+            )
+            locked_task = session.scalar(
+                select(Task)
+                .where(Task.id == task.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            lease_until = aware(locked_task.lease_until) if locked_task else None
+            cancelable = locked_task is not None and (
+                locked_task.status == TaskStatus.QUEUED.value
+                or (
+                    locked_task.status == TaskStatus.RUNNING.value
+                    and (lease_until is None or lease_until < utcnow())
+                )
+            )
+            if (
+                locked_node is None
+                or locked_task is None
+                or not cancelable
+                or type(locked_task.payload) is not dict
+                or locked_task.payload.get("node_id") != identity.node_id
+                or type(locked_task.payload.get("cache_identity_digest")) is not str
+            ):
+                session.rollback()
+                return False
+            locked_task.status = TaskStatus.CANCELED.value
+            locked_task.lease_until = None
+            locked_node.desired_state = None
+            complete_cache_quarantine(
+                session,
+                node_id=identity.node_id,
+                cache_identity_digest=locked_task.payload[
+                    "cache_identity_digest"
+                ],
+                request_id=locked_task.id,
+                succeeded=False,
+                source_task_id=locked_task.id,
+            )
             audit(session, "admin", "task.cancel", task.id, "success")
             session.commit()
             return True
