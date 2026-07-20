@@ -1,3 +1,9 @@
+dure (0.3.4) stable; urgency=medium
+
+  * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 05:24:00 +0000
+
 dure (0.3.3) stable; urgency=medium
 
   * Add central hardware, installed-model, and LLM workload inventory.

@@ -5,6 +5,8 @@ import ssl
 import urllib.error
 import urllib.request
 
+from . import __version__
+
 
 class APIError(RuntimeError):
     pass
@@ -18,7 +20,10 @@ class JSONClient:
 
     def request(self, method: str, path: str, payload: dict | None = None) -> dict:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": f"Dure/{__version__}",
+        }
         if data is not None:
             headers["Content-Type"] = "application/json"
         if self.token:
