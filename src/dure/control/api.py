@@ -96,6 +96,14 @@ from .recommendation import (
     recommend_deployment,
     show_deployment_recommendation,
 )
+from .preparation import (
+    ArtifactPreparationError,
+    ArtifactPreparationNotFoundError,
+    artifact_preparation_detail,
+    get_artifact_preparation,
+    manifest_for_preparation_task,
+    prepare_deployment_artifacts,
+)
 from .rollout import (
     DeploymentRolloutError,
     DeploymentRolloutNotFoundError,
@@ -267,6 +275,20 @@ class DeploymentRollback(StrictBody):
     serve: StrictBool = False
 
 
+class DeploymentPreparationRequest(StrictBody):
+    request_id: str
+    apply: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_request_id(self):
+        try:
+            if str(uuid.UUID(self.request_id)) != self.request_id:
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("request_id must be a canonical UUID") from exc
+        return self
+
+
 class BenchmarkContextRequest(StrictBody):
     release_id: str
     placement_id: str
@@ -430,6 +452,10 @@ def _rollout_error_detail(exc: DeploymentRolloutError) -> dict:
         "message": str(exc),
         "details": exc.details,
     }
+
+
+def _preparation_error_detail(exc: ArtifactPreparationError) -> dict:
+    return exc.to_detail()
 
 
 def _task_dict(task: Task) -> dict:
@@ -678,6 +704,31 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be extended")
         return {"ok": True, "lease_until": task.lease_until}
 
+    @app.get("/v1/agent/tasks/{task_id}/artifact-manifest")
+    def agent_task_artifact_manifest(
+        task_id: str,
+        node: Node = Depends(node_auth),
+        session: Session = Depends(get_session),
+    ):
+        if not node.approved:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "PREPARATION_MANIFEST_UNAVAILABLE",
+                    "message": "preparation manifest is unavailable",
+                    "details": {},
+                },
+            )
+        try:
+            manifest = manifest_for_preparation_task(
+                session, task_id, node.id
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        return {"manifest": manifest}
+
     @app.post("/v1/agent/tasks/{task_id}/complete")
     def agent_task_complete(task_id: str, body: TaskComplete, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         task = session.get(Task, task_id)
@@ -710,7 +761,16 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 "ok": True,
                 "benchmark_run": benchmark_run_dict(run) if run else None,
             }
-        if not finish_task(session, task, node.id, result=body.result, error=None):
+        try:
+            accepted = finish_task(
+                session, task, node.id, result=body.result, error=None
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                _preparation_error_detail(exc),
+            ) from exc
+        if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be completed")
         return {"ok": True}
 
@@ -742,7 +802,16 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 "ok": True,
                 "benchmark_run": benchmark_run_dict(run) if run else None,
             }
-        if not finish_task(session, task, node.id, result=None, error=body.error):
+        try:
+            accepted = finish_task(
+                session, task, node.id, result=None, error=body.error
+            )
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _preparation_error_detail(exc),
+            ) from exc
+        if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be failed")
         return {"ok": True}
 
@@ -802,7 +871,13 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
 
     @app.post("/v1/admin/nodes/{node_id}/revoke", dependencies=[Depends(admin_auth)])
     def node_revoke(node_id: str, session: Session = Depends(get_session)):
-        if not revoke_node(session, node_id):
+        try:
+            revoked = revoke_node(session, node_id)
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        if not revoked:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
         return {"ok": True}
 
@@ -1170,6 +1245,60 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"deployment": {"id": deployment.id, "generation": deployment.generation, "plan": deployment.plan}}
 
+    @app.post(
+        "/v1/admin/deployments/{deployment_id}/prepare",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_prepare(
+        deployment_id: str,
+        body: DeploymentPreparationRequest,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            preparation, tasks, changed = prepare_deployment_artifacts(
+                session,
+                deployment_id,
+                request_id=body.request_id,
+                apply=body.apply,
+            )
+        except ArtifactPreparationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _preparation_error_detail(exc)
+            ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
+        return {
+            "preparation": artifact_preparation_detail(
+                session, preparation
+            ),
+            "tasks": [_task_dict(task) for task in tasks],
+            "changed": changed,
+        }
+
+    @app.get(
+        "/v1/admin/deployment-preparations/{preparation_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_preparation_detail(
+        preparation_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            preparation = get_artifact_preparation(
+                session, preparation_id
+            )
+        except ArtifactPreparationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, _preparation_error_detail(exc)
+            ) from exc
+        return {
+            "preparation": artifact_preparation_detail(
+                session, preparation
+            )
+        }
+
     @app.get("/v1/admin/deployments/{deployment_id}", dependencies=[Depends(admin_auth)])
     def deployment_detail(deployment_id: str, session: Session = Depends(get_session)):
         try:
@@ -1217,6 +1346,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, _rollout_error_detail(exc)
             ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
+            ) from exc
         except DeploymentRolloutError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
@@ -1240,6 +1373,10 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except DeploymentRolloutError as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
+        except ArtifactPreparationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _preparation_error_detail(exc)
             ) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc

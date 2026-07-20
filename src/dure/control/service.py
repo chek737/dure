@@ -18,6 +18,7 @@ from dure.artifact_manifest import (
     ArtifactManifestLimits,
     canonical_artifact_manifest as parse_canonical_artifact_manifest,
 )
+from dure.artifact_prepare import validate_digest_pinned_runtime_image
 from dure.models import DeploymentPlan, NodeProfile
 from dure.task import (
     MAX_BENCHMARK_CONTEXT_TOKENS,
@@ -583,13 +584,10 @@ def create_runtime_release(
     cuda_version: str,
     gpu_architectures: list[str],
 ) -> RuntimeRelease:
-    if (
-        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}", image)
-        is None
-        or "/../" in image
-        or "//" in image
-    ):
-        raise ValueError("runtime image must be OCI digest-pinned")
+    try:
+        validate_digest_pinned_runtime_image(image)
+    except ValueError:
+        raise ValueError("runtime image must be OCI digest-pinned") from None
     if not all(isinstance(item, str) for item in gpu_architectures):
         raise ValueError("unsupported GPU architecture")
     normalized_architectures = sorted(set(gpu_architectures))
@@ -882,7 +880,9 @@ def approve_node(session: Session, node_id: str) -> bool:
 
 
 def revoke_node(session: Session, node_id: str) -> bool:
-    node = session.get(Node, node_id)
+    node = session.scalar(
+        select(Node).where(Node.id == node_id).with_for_update()
+    )
     if node is None:
         return False
     node.approved = False
@@ -891,7 +891,20 @@ def revoke_node(session: Session, node_id: str) -> bool:
         select(NodeCredential).where(NodeCredential.node_id == node_id, NodeCredential.revoked_at.is_(None))
     ):
         credential.revoked_at = now
-    audit(session, "admin", "node.revoke", node_id, "success")
+    from .preparation import revoke_preparation_tasks_for_node
+
+    canceled_preparations = revoke_preparation_tasks_for_node(
+        session, node_id
+    )
+    node.desired_state = None
+    audit(
+        session,
+        "admin",
+        "node.revoke",
+        node_id,
+        "success",
+        canceled_preparation_tasks=canceled_preparations,
+    )
     session.commit()
     return True
 
@@ -1335,6 +1348,43 @@ def apply_benchmark_run(
             )
         return run, task, False
 
+    active_task = session.scalar(
+        select(Task)
+        .where(
+            Task.node_id == locked_node.id,
+            Task.type.in_(NODE_EXCLUSIVE_TASK_TYPE_VALUES),
+            Task.status.in_(
+                {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+            ),
+        )
+        .order_by(Task.created_at, Task.id)
+        .limit(1)
+    )
+    if active_task is not None:
+        raise BenchmarkRunError(
+            "benchmark coordinator node already has active work",
+            code="BENCHMARK_NODE_BUSY",
+            details={
+                "node_id": locked_node.id,
+                "task_id": active_task.id,
+                "task_type": active_task.type,
+            },
+        )
+    for operation in session.scalars(
+        select(DeploymentOperation).where(
+            DeploymentOperation.active_lineage_id.is_not(None)
+        )
+    ):
+        if locked_node.id in operation.node_ids:
+            raise BenchmarkRunError(
+                "benchmark coordinator node belongs to an active deployment operation",
+                code="BENCHMARK_NODE_BUSY",
+                details={
+                    "node_id": locked_node.id,
+                    "operation_id": operation.id,
+                },
+            )
+
     _require_single_node_benchmark(
         session,
         release_id=run.release_id,
@@ -1579,11 +1629,11 @@ def _lock_benchmark_terminal(
         .where(ModelRelease.id == release_id)
         .with_for_update()
     )
-    if release is None:
-        return None, None, None
     node = session.scalar(
         select(Node).where(Node.id == node_id).with_for_update()
     )
+    if release is None:
+        return node, None, None
     task = session.scalar(
         select(Task)
         .where(Task.id == task_id)
@@ -1782,8 +1832,15 @@ DEPLOYMENT_MUTATION_TASK_TYPES = {
     TaskType.START_DEPLOYMENT.value,
     TaskType.STOP_DEPLOYMENT.value,
     TaskType.RESTART_DEPLOYMENT.value,
+    TaskType.PREPARE_MODEL.value,
+    TaskType.PREPARE_IMAGE.value,
 }
 DEPLOYMENT_TASK_TYPE_VALUES = {item.value for item in DEPLOYMENT_TASK_TYPES}
+NODE_EXCLUSIVE_TASK_TYPE_VALUES = DEPLOYMENT_TASK_TYPE_VALUES | {
+    TaskType.BENCHMARK.value,
+    TaskType.PREPARE_MODEL.value,
+    TaskType.PREPARE_IMAGE.value,
+}
 
 
 def _validate_task_options(task_type: TaskType, options: dict) -> None:
@@ -1906,7 +1963,7 @@ def _ensure_deployment_node_scope_available(
         select(Task.id, Task.node_id)
         .where(
             Task.node_id.in_(requested),
-            Task.type.in_(DEPLOYMENT_TASK_TYPE_VALUES),
+            Task.type.in_(NODE_EXCLUSIVE_TASK_TYPE_VALUES),
             Task.status.in_(
                 {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
             ),
@@ -1945,6 +2002,10 @@ def create_tasks(
         raise ValueError(
             "BENCHMARK tasks require a prepared benchmark run and explicit apply"
         )
+    if task_type in {TaskType.PREPARE_MODEL, TaskType.PREPARE_IMAGE}:
+        raise ValueError(
+            "artifact preparation tasks require the dedicated deployment prepare API"
+        )
     _validate_task_options(task_type, options)
     try:
         bulk_id = str(uuid.uuid4())
@@ -1959,9 +2020,18 @@ def create_tasks(
         if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
             _lock_deployment_lineage_for_task_creation(session, deployment)
             _ensure_deployment_node_scope_available(session, node_ids)
+        effective_plan = deployment.plan if deployment is not None else None
+        if deployment is not None and deployment.source_recommendation_id is not None:
+            from .preparation import effective_deployment_plan
+
+            effective_plan = effective_deployment_plan(
+                session,
+                deployment,
+                require_prepared=task_type != TaskType.STOP_DEPLOYMENT,
+            )
         assignments = (
-            {item["node_id"] for item in deployment.plan["assignments"]}
-            if deployment
+            {item["node_id"] for item in effective_plan["assignments"]}
+            if effective_plan
             else set()
         )
         for node_id in dict.fromkeys(node_ids):
@@ -1975,10 +2045,18 @@ def create_tasks(
             payload = dict(options)
             if deployment is not None:
                 payload.update(
-                    plan=deployment.plan,
+                    plan=effective_plan,
                     generation=deployment.generation,
-                    accept_model_download=deployment.accept_model_download,
-                    pull_image=deployment.pull_image,
+                    accept_model_download=(
+                        deployment.accept_model_download
+                        if deployment.source_recommendation_id is None
+                        else False
+                    ),
+                    pull_image=(
+                        deployment.pull_image
+                        if deployment.source_recommendation_id is None
+                        else False
+                    ),
                 )
             task = Task(
                 bulk_id=bulk_id,
@@ -2065,11 +2143,31 @@ def claim_task(session: Session, node_id: str, lease_seconds: int = 300) -> Task
                 raise _operation_hook_conflict("expired", task.id)
             session.commit()
             return None
+        if (
+            task.status == TaskStatus.RUNNING.value
+            and task.type
+            in {TaskType.PREPARE_MODEL.value, TaskType.PREPARE_IMAGE.value}
+        ):
+            from .preparation import expire_preparation_task
+
+            if not expire_preparation_task(session, task, node_id):
+                session.rollback()
+                return None
+            session.commit()
+            return None
         task.status = TaskStatus.RUNNING.value
         task.attempts += 1
         task.lease_until = now + timedelta(seconds=lease_seconds)
         if not claim_operation_task(session, task, node_id):
             raise _operation_hook_conflict("claimed", task.id)
+        if task.type in {
+            TaskType.PREPARE_MODEL.value,
+            TaskType.PREPARE_IMAGE.value,
+        }:
+            from .preparation import claim_preparation_task
+
+            if not claim_preparation_task(session, task, node_id):
+                raise ValueError("preparation-bound task cannot be claimed")
         session.commit()
         return task
     except Exception:
@@ -2122,6 +2220,17 @@ def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int =
             ):
                 session.rollback()
                 return False
+        if locked_task.type in {
+            TaskType.PREPARE_MODEL.value,
+            TaskType.PREPARE_IMAGE.value,
+        }:
+            from .preparation import extend_preparation_task
+
+            if not node.approved or not extend_preparation_task(
+                session, locked_task, node_id
+            ):
+                session.rollback()
+                return False
         locked_task.lease_until = now + timedelta(seconds=lease_seconds)
         node.last_seen = now
         session.commit()
@@ -2136,6 +2245,31 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
         return False
     if task.node_id != node_id:
         return False
+    if task.type in {
+        TaskType.PREPARE_MODEL.value,
+        TaskType.PREPARE_IMAGE.value,
+    }:
+        from .preparation import finish_preparation_task
+
+        try:
+            accepted, _preparation = finish_preparation_task(
+                session,
+                task,
+                node_id,
+                result=result,
+                error=error,
+            )
+            if not accepted:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+        except Exception as exc:
+            if getattr(exc, "code", None) == "PREPARATION_RESULT_REJECTED":
+                session.commit()
+            else:
+                session.rollback()
+            raise
     if task.operation_node_id is not None or task.operation_attempt is not None:
         try:
             locked_node = session.scalar(
@@ -2206,6 +2340,31 @@ def cancel_task(session: Session, task: Task) -> bool:
     ).one_or_none()
     if identity is None:
         return False
+    if identity.type in {
+        TaskType.PREPARE_MODEL.value,
+        TaskType.PREPARE_IMAGE.value,
+    }:
+        from .preparation import cancel_preparation_task
+
+        try:
+            locked_node = session.scalar(
+                select(Node)
+                .where(Node.id == identity.node_id)
+                .with_for_update()
+            )
+            if locked_node is None:
+                session.rollback()
+                return False
+            accepted = cancel_preparation_task(session, task)
+            if not accepted:
+                session.rollback()
+                return False
+            audit(session, "admin", "task.cancel", task.id, "success")
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            raise
     if (
         identity.operation_node_id is not None
         or identity.operation_attempt is not None

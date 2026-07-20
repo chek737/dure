@@ -1032,6 +1032,8 @@ def _previous_generation(
                     TaskType.START_DEPLOYMENT.value,
                     TaskType.STOP_DEPLOYMENT.value,
                     TaskType.RESTART_DEPLOYMENT.value,
+                    TaskType.PREPARE_MODEL.value,
+                    TaskType.PREPARE_IMAGE.value,
                 }
             ),
             Task.status.in_(

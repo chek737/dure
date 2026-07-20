@@ -21,6 +21,7 @@ from dure.control.benchmark import (
 from dure.control.models import (
     ArtifactManifest,
     ArtifactPreparation,
+    DeploymentOperation,
     Node,
     NodeProfileRecord,
     Task,
@@ -41,7 +42,9 @@ from .helpers import profile
 from .test_artifact_manifest_api import _manifest
 
 
-def _oversized_manifest(size_bytes: int) -> dict:
+def _oversized_manifest(
+    size_bytes: int, *, chunk_character: str = "a"
+) -> dict:
     return {
         "schema_version": 1,
         "files": [
@@ -55,7 +58,7 @@ def _oversized_manifest(size_bytes: int) -> dict:
                         "ordinal": 0,
                         "offset_bytes": 0,
                         "length_bytes": size_bytes,
-                        "sha256": "sha256:" + "a" * 64,
+                        "sha256": "sha256:" + chunk_character * 64,
                     }
                 ],
             }
@@ -254,6 +257,7 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(promoted.status, "ACTIVE")
             artifact_id = artifact.id
+            release_id = release.id
             runtime_image = runtime.image
 
         recommendation_response = self.client.post(
@@ -290,6 +294,7 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                 session.commit()
         return {
             "artifact_id": artifact_id,
+            "release_id": release_id,
             "deployment": accepted_response.json()["deployment"],
             "enrolled": enrolled,
             "manifest": manifest_value,
@@ -420,6 +425,8 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         )
         self._failure_code(other_node, "PREPARATION_MANIFEST_UNAVAILABLE")
 
+        self._complete(model_task, context["enrolled"][0], context)
+        # A committed completion whose HTTP response was lost is replay-safe.
         self._complete(model_task, context["enrolled"][0], context)
         image_task = self._claim(context["enrolled"][0])
         self.assertEqual(image_task["type"], "PREPARE_IMAGE")
@@ -571,6 +578,128 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                 0,
             )
 
+    def test_deprecated_release_is_rejected_before_preparation_creation(self):
+        context = self._seed_accepted_generation("deprecated")
+        with self.factory() as session:
+            transition_model_release(
+                session, context["release_id"], "DEPRECATED"
+            )
+
+        response = self._prepare(context, str(uuid.uuid4()), apply=False)
+
+        self._failure_code(response, "PREPARATION_RECOMMENDATION_STALE")
+        with self.factory() as session:
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(ArtifactPreparation)
+                ),
+                0,
+            )
+
+    def test_revoked_release_is_rejected_when_failed_stage_is_retried(self):
+        context = self._seed_accepted_generation("rev-retry")
+        request_id = str(uuid.uuid4())
+        applied = self._prepare(context, request_id, apply=True)
+        self.assertEqual(applied.status_code, 200, applied.text)
+        task = self._claim(context["enrolled"][0])
+        failed = self.client.post(
+            f"/v1/agent/tasks/{task['id']}/fail",
+            headers=context["enrolled"][0]["headers"],
+            json={"error": "PREPARATION_ORIGIN_UNAVAILABLE"},
+        )
+        self.assertEqual(failed.status_code, 200, failed.text)
+
+        with self.factory() as session:
+            transition_model_release(
+                session, context["release_id"], "DEPRECATED"
+            )
+            transition_model_release(
+                session, context["release_id"], "REVOKED"
+            )
+
+        retry = self._prepare(context, request_id, apply=True)
+        self._failure_code(retry, "PREPARATION_RECOMMENDATION_STALE")
+        with self.factory() as session:
+            tasks = list(
+                session.scalars(
+                    select(Task).where(
+                        Task.bulk_id
+                        == applied.json()["preparation"]["id"]
+                    )
+                )
+            )
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].status, "FAILED")
+
+    def test_revoked_release_blocks_prepared_apply_but_not_emergency_stop(self):
+        context = self._seed_accepted_generation("rev-consume")
+        applied = self._prepare(context, str(uuid.uuid4()), apply=True)
+        self.assertEqual(applied.status_code, 200, applied.text)
+
+        with self.factory() as session:
+            transition_model_release(
+                session, context["release_id"], "DEPRECATED"
+            )
+            transition_model_release(
+                session, context["release_id"], "REVOKED"
+            )
+
+        enrolled = context["enrolled"][0]
+        model_task = self._claim(enrolled)
+        self._complete(model_task, enrolled, context)
+        image_task = self._claim(enrolled)
+        self._complete(image_task, enrolled, context)
+
+        deployment_apply = self.client.post(
+            "/v1/admin/tasks",
+            headers=self.admin,
+            json={
+                "node_ids": [enrolled["node_id"]],
+                "type": "APPLY_DEPLOYMENT",
+                "deployment_id": context["deployment"]["id"],
+                "options": {"serve": False},
+            },
+        )
+        self._failure_code(
+            deployment_apply, "DEPLOYMENT_MODEL_RELEASE_REVOKED"
+        )
+
+        emergency_stop = self.client.post(
+            "/v1/admin/tasks",
+            headers=self.admin,
+            json={
+                "node_ids": [enrolled["node_id"]],
+                "type": "STOP_DEPLOYMENT",
+                "deployment_id": context["deployment"]["id"],
+                "options": {},
+            },
+        )
+        self.assertEqual(emergency_stop.status_code, 200, emergency_stop.text)
+
+    def test_image_failure_with_no_complete_node_is_failed(self):
+        context = self._seed_accepted_generation("no-complete-node")
+        applied = self._prepare(context, str(uuid.uuid4()), apply=True)
+        self.assertEqual(applied.status_code, 200, applied.text)
+        enrolled = context["enrolled"][0]
+
+        model_task = self._claim(enrolled)
+        self._complete(model_task, enrolled, context)
+        image_task = self._claim(enrolled)
+        failed = self.client.post(
+            f"/v1/agent/tasks/{image_task['id']}/fail",
+            headers=enrolled["headers"],
+            json={"error": "PREPARATION_IMAGE_PULL_FAILED"},
+        )
+        self.assertEqual(failed.status_code, 200, failed.text)
+
+        detail = self.client.get(
+            "/v1/admin/deployment-preparations/"
+            + applied.json()["preparation"]["id"],
+            headers=self.admin,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["preparation"]["status"], "FAILED")
+
     def test_pending_offline_and_stale_nodes_fail_before_task_creation(self):
         context = self._seed_accepted_generation("node-gates")
         node_id = context["enrolled"][0]["node_id"]
@@ -608,7 +737,6 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             self._prepare(context, request_id, apply=False),
             "PREPARATION_PROFILE_STALE",
         )
-
         with self.factory() as session:
             profile_record = session.get(NodeProfileRecord, node_id)
             profile_record.updated_at = original_profile_updated_at
@@ -617,13 +745,115 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                 session.scalar(select(func.count()).select_from(Task)), 0
             )
 
+    def test_invalid_result_is_terminal_and_revocation_fences_queued_work(self):
+        context = self._seed_accepted_generation("result-rejection")
+        request_id = str(uuid.uuid4())
+        applied = self._prepare(context, request_id, apply=True)
+        self.assertEqual(applied.status_code, 200, applied.text)
+        task = self._claim(context["enrolled"][0])
+
+        # Even a credential that remains otherwise valid cannot extend a
+        # preparation lease after central approval is removed.
+        with self.factory() as session:
+            node = session.get(Node, context["enrolled"][0]["node_id"])
+            node.approved = False
+            session.commit()
+        heartbeat = self.client.post(
+            f"/v1/agent/tasks/{task['id']}/heartbeat",
+            headers=context["enrolled"][0]["headers"],
+        )
+        self.assertEqual(heartbeat.status_code, 409, heartbeat.text)
+        with self.factory() as session:
+            node = session.get(Node, context["enrolled"][0]["node_id"])
+            node.approved = True
+            session.commit()
+
+        invalid_result = self._result(task, context)
+        invalid_result.pop("file_count")
+        rejected = self.client.post(
+            f"/v1/agent/tasks/{task['id']}/complete",
+            headers=context["enrolled"][0]["headers"],
+            json={"result": invalid_result},
+        )
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(
+            rejected.json()["detail"]["code"],
+            "PREPARATION_RESULT_REJECTED",
+        )
+        with self.factory() as session:
+            stored = session.get(Task, task["id"])
+            self.assertEqual(stored.status, "FAILED")
+            self.assertEqual(stored.error, "PREPARATION_RESULT_REJECTED")
+            self.assertIsNone(stored.lease_until)
+        retry = self._prepare(context, request_id, apply=True)
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertEqual(len(retry.json()["tasks"]), 1)
+        self.assertEqual(retry.json()["tasks"][0]["payload"]["attempt_no"], 2)
+
+        queued_context = self._seed_accepted_generation(
+            "revoke-queued",
+            manifest=_oversized_manifest(3, chunk_character="e"),
+        )
+        queued = self._prepare(
+            queued_context, str(uuid.uuid4()), apply=True
+        )
+        queued_task = queued.json()["tasks"][0]
+        revoked = self.client.post(
+            "/v1/admin/nodes/"
+            f"{queued_context['enrolled'][0]['node_id']}/revoke",
+            headers=self.admin,
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        with self.factory() as session:
+            stored = session.get(Task, queued_task["id"])
+            self.assertEqual(stored.status, "CANCELED")
+            self.assertEqual(stored.error, "PREPARATION_NODE_REVOKED")
+
+    def test_request_binding_and_node_exclusive_mutation_conflicts_are_closed(self):
+        first = self._seed_accepted_generation("request-first")
+        request_id = str(uuid.uuid4())
+        prepared = self._prepare(first, request_id, apply=False)
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+
+        applied = self._prepare(first, request_id, apply=True)
+        self.assertEqual(applied.status_code, 200, applied.text)
+        stop = self.client.post(
+            "/v1/admin/tasks",
+            headers=self.admin,
+            json={
+                "node_ids": [first["enrolled"][0]["node_id"]],
+                "type": "STOP_DEPLOYMENT",
+                "deployment_id": first["deployment"]["id"],
+                "options": {},
+            },
+        )
+        self.assertEqual(stop.status_code, 409, stop.text)
+        with self.factory() as session:
+            active = list(
+                session.scalars(
+                    select(Task).where(
+                        Task.node_id == first["enrolled"][0]["node_id"],
+                        Task.status.in_({"QUEUED", "RUNNING"}),
+                    )
+                )
+            )
+            self.assertEqual([task.type for task in active], ["PREPARE_MODEL"])
+
+        second = self._seed_accepted_generation(
+            "request-second",
+            manifest=_oversized_manifest(4, chunk_character="f"),
+        )
+        duplicate = self._prepare(second, request_id, apply=False)
+        self._failure_code(duplicate, "PREPARATION_REQUEST_CONFLICT")
+
     def test_disk_capacity_and_busy_node_gates_fail_closed(self):
         too_large = 2 * 1024 * 1024
         disk_context = self._seed_accepted_generation(
             "disk-gate",
             manifest=_oversized_manifest(too_large),
-            disk_free_mib=1,
+            disk_free_mib=2,
         )
+        node_id = disk_context["enrolled"][0]["node_id"]
         disk_response = self._prepare(
             disk_context, str(uuid.uuid4()), apply=False
         )
@@ -633,7 +863,6 @@ class ArtifactPreparationControlTests(unittest.TestCase):
 
         # A separate accepted generation is not needed for the active-task
         # boundary: the oversized generation's node remains otherwise valid.
-        node_id = disk_context["enrolled"][0]["node_id"]
         busy_task = self.client.post(
             "/v1/admin/tasks",
             headers=self.admin,
@@ -648,6 +877,41 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             disk_context, str(uuid.uuid4()), apply=False
         )
         self._failure_code(busy_response, "PREPARATION_NODE_BUSY")
+
+        with self.factory() as session:
+            task = session.scalar(
+                select(Task).where(
+                    Task.node_id == node_id,
+                    Task.type == "PROBE",
+                    Task.status == "QUEUED",
+                )
+            )
+            task.status = "CANCELED"
+            operation_id = str(uuid.uuid4())
+            operation = DeploymentOperation(
+                id=operation_id,
+                request_digest="sha256:" + "9" * 64,
+                lineage_id=disk_context["deployment"]["id"],
+                deployment_id=disk_context["deployment"]["id"],
+                kind="APPLY",
+                status="PARTIAL_FAILED",
+                phase="APPLY",
+                node_ids=[node_id],
+                serve=False,
+                api=False,
+                active_lineage_id=disk_context["deployment"]["id"],
+            )
+            session.add(operation)
+            session.commit()
+
+        operation_response = self._prepare(
+            disk_context, str(uuid.uuid4()), apply=False
+        )
+        self._failure_code(operation_response, "PREPARATION_NODE_BUSY")
+        self.assertEqual(
+            operation_response.json()["detail"]["details"],
+            {"operation_id": operation_id, "node_ids": [node_id]},
+        )
 
 
 if __name__ == "__main__":

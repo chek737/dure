@@ -100,7 +100,7 @@ _IMAGE_RESULT_FIELDS = _COMMON_RESULT_FIELDS | frozenset(
 
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}")
 _OCI_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_OCI_NAME = re.compile(r"[a-z0-9][a-z0-9._:/-]{0,446}[a-z0-9]")
+_OCI_NAME = re.compile(r"[a-z0-9](?:[a-z0-9._:/-]*[a-z0-9])?")
 _MAX_BINDING_INTEGER = (1 << 31) - 1
 _MAX_DOCKER_OUTPUT_BYTES = 256 * 1024
 _IMAGE_INSPECT_FORMAT = "{{json .RepoDigests}}"
@@ -173,25 +173,35 @@ def _positive_integer(value: object) -> int:
     return value
 
 
-def _validated_runtime_image(value: object) -> tuple[str, str]:
+def validate_digest_pinned_runtime_image(value: object) -> tuple[str, str]:
     if (
         type(value) is not str
-        or not 1 <= len(value) <= 519
+        or not 1 <= len(value) <= 512
         or value.count("@") != 1
         or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
         or "\\" in value
     ):
-        raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
+        raise ValueError("runtime image must be a supported OCI digest reference")
     name, digest = value.rsplit("@", 1)
     segments = name.split("/")
     if (
         _OCI_NAME.fullmatch(name) is None
         or _OCI_DIGEST.fullmatch(digest) is None
         or any(segment in {"", ".", ".."} for segment in segments)
+        or ":" in segments[-1]
         or "//" in name
     ):
-        raise ArtifactPreparationError("PREPARATION_PAYLOAD_REJECTED")
+        raise ValueError("runtime image must be a supported OCI digest reference")
     return value, digest
+
+
+def _validated_runtime_image(value: object) -> tuple[str, str]:
+    try:
+        return validate_digest_pinned_runtime_image(value)
+    except ValueError:
+        raise ArtifactPreparationError(
+            "PREPARATION_PAYLOAD_REJECTED"
+        ) from None
 
 
 @dataclass(frozen=True)
