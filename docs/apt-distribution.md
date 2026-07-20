@@ -7,11 +7,11 @@ Dure is distributed as a signed Debian package repository. GitHub Pages is the d
 After the repository is published, users can bootstrap it with:
 
 ```bash
-curl -fsSL https://chek737.github.io/dure/install.sh | sudo sh
+curl -fsSL https://madcamp-official.github.io/legendary-super-ultra-black-dragon/install.sh | sudo sh
 ```
 
 The Dure APT signing-key fingerprint is
-`E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01`.
+`AA21C6EF3B58AE58F67633F12A5ECAEA8B8543F5`.
 
 The installer places the public signing key in `/usr/share/keyrings`, creates a deb822 source under `/etc/apt/sources.list.d`, runs `apt-get update`, and installs Dure.
 
@@ -26,12 +26,12 @@ sudo apt upgrade
 Users who do not want to run a bootstrap script can register the repository manually:
 
 ```bash
-curl -fsSL https://chek737.github.io/dure/dure-archive-keyring.gpg \
+curl -fsSL https://madcamp-official.github.io/legendary-super-ultra-black-dragon/dure-archive-keyring.gpg \
   | sudo tee /usr/share/keyrings/dure-archive-keyring.gpg >/dev/null
 
 sudo tee /etc/apt/sources.list.d/dure.sources >/dev/null <<'EOF'
 Types: deb
-URIs: https://chek737.github.io/dure
+URIs: https://madcamp-official.github.io/legendary-super-ultra-black-dragon
 Suites: stable
 Components: main
 Architectures: amd64
@@ -41,6 +41,21 @@ EOF
 sudo apt update
 sudo apt install dure
 ```
+
+## July 2026 repository and signing-key migration
+
+The GitHub repository transfer changed both the APT repository URL and its signing key. Systems
+registered with the former `https://chek737.github.io/dure` source and fingerprint
+`E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01` must run the new installer again to replace both the
+keyring and source definition:
+
+```bash
+curl -fsSL https://madcamp-official.github.io/legendary-super-ultra-black-dragon/install.sh | sudo sh
+```
+
+Verify that the new public-key fingerprint is
+`AA21C6EF3B58AE58F67633F12A5ECAEA8B8543F5`. GitHub repository redirects do not migrate GitHub
+Pages project URLs, so the former source will not receive future updates.
 
 ## Publisher setup
 

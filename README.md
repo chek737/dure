@@ -42,11 +42,11 @@ SQLAlchemy requirements are intentionally not resolved from Ubuntu 22.04 system 
 Once the signed repository has been published, users register it once and install Dure:
 
 ```bash
-curl -fsSL https://chek737.github.io/dure/install.sh | sudo sh
+curl -fsSL https://madcamp-official.github.io/legendary-super-ultra-black-dragon/install.sh | sudo sh
 ```
 
 APT signing-key fingerprint:
-`E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01`.
+`AA21C6EF3B58AE58F67633F12A5ECAEA8B8543F5`.
 
 Subsequent installs and upgrades use normal APT commands:
 
