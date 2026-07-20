@@ -116,7 +116,7 @@ def _add_release(
     model_id: str = "qwen-test-awq",
     gpu_architectures: list[str] | None = None,
     placement_overrides: dict | None = None,
-    benchmark_nodes: list[Node] | None = None,
+    evidence_nodes: list[Node] | None = None,
 ):
     artifact = create_model_artifact(
         session,
@@ -171,24 +171,9 @@ def _add_release(
     if status in {"VALIDATED", "ACTIVE", "DEPRECATED"}:
         transition_model_release(session, release.id, "VALIDATED")
     if status in {"ACTIVE", "DEPRECATED"}:
-        if benchmark_nodes is None:
-            capability_by_architecture = {
-                "ampere": "8.6",
-                "ada": "8.9",
-                "hopper": "9.0",
-                "blackwell": "10.0",
-            }
-            benchmark_capability = capability_by_architecture[architectures[0]]
-            benchmark_nodes = [
-                _add_node(
-                    session,
-                    f"benchmark-{key}-{index}",
-                    now=utcnow(),
-                    compute_capability=benchmark_capability,
-                )
-                for index in range(placement.node_count)
-            ]
-        node_ids = [node.id for node in benchmark_nodes]
+        if not evidence_nodes:
+            raise ValueError("ACTIVE recommendation fixtures require evidence_nodes")
+        node_ids = [node.id for node in evidence_nodes]
         requires_network = (
             placement.requires_network_evidence or placement.node_count > 1
         )
@@ -202,7 +187,7 @@ def _add_release(
             artifact_revision=artifact.revision,
             artifact_manifest_digest=artifact.manifest_digest,
             runtime_image=runtime.image,
-            dure_commit=_hex(f"dure-{key}", 40),
+            dure_commit="d" * 40,
             policy_version=BENCHMARK_POLICY_VERSION,
             input_tokens=4096,
             output_tokens=256,
@@ -220,12 +205,14 @@ def _add_release(
             success_rate=1.0,
             vram_headroom_pct=12.0,
             quality_score=0.90,
-            network_bandwidth_mbps=20000.0 if requires_network else None,
-            network_rtt_ms=1.0 if requires_network else None,
-            packet_loss_pct=0.0 if requires_network else None,
-            nccl_all_reduce_ok=True if placement.requires_nccl else None,
+            network_bandwidth_mbps=(20000.0 if requires_network else None),
+            network_rtt_ms=(1.0 if requires_network else None),
+            packet_loss_pct=(0.0 if requires_network else None),
+            nccl_all_reduce_ok=(True if placement.requires_nccl else None),
         )
-        promote_model_release(session, release.id)
+        promoted, _, changed = promote_model_release(session, release.id)
+        if not changed or promoted.status != "ACTIVE":
+            raise AssertionError("fixture release was not promoted through benchmark evidence")
     if status == "DEPRECATED":
         transition_model_release(session, release.id, "DEPRECATED")
     if status == "REVOKED":
@@ -258,10 +245,20 @@ class RecommendationServiceTests(unittest.TestCase):
         with self.factory() as session:
             first = _add_node(session, "first", now=self.now)
             second = _add_node(session, "second", now=self.now)
-            lower, _ = _add_release(session, "lower", quality_rank=10)
-            higher, _ = _add_release(session, "higher", quality_rank=20)
+            lower, _ = _add_release(
+                session, "lower", quality_rank=10, evidence_nodes=[first]
+            )
+            higher, _ = _add_release(
+                session, "higher", quality_rank=20, evidence_nodes=[first]
+            )
             _add_release(session, "draft", status="DRAFT", quality_rank=100)
-            _add_release(session, "old", status="DEPRECATED", quality_rank=200)
+            _add_release(
+                session,
+                "old",
+                status="DEPRECATED",
+                quality_rank=200,
+                evidence_nodes=[first],
+            )
             before = _row_counts(session)
 
             forward = recommend_deployment(
@@ -311,7 +308,8 @@ class RecommendationServiceTests(unittest.TestCase):
             pending = _add_node(session, "pending", now=self.now, approved=False)
             offline = _add_node(session, "offline", now=self.now, last_seen_age=40)
             stale = _add_node(session, "stale", now=self.now, profile_age=91)
-            _add_release(session, "eligible")
+            promoter = _add_node(session, "promoter", now=self.now)
+            _add_release(session, "eligible", evidence_nodes=[promoter])
 
             result = recommend_deployment(
                 session,
@@ -327,13 +325,14 @@ class RecommendationServiceTests(unittest.TestCase):
                 <= codes
             )
 
-    def test_multinode_candidate_remains_fail_closed_until_evidence_is_linked(self):
+    def test_multinode_candidate_fails_closed_without_network_evidence(self):
         with self.factory() as session:
             nodes = [_add_node(session, f"node-{index}", now=self.now) for index in range(3)]
             release, _ = _add_release(
                 session,
                 "pipeline",
                 quality_rank=72,
+                evidence_nodes=nodes,
                 placement_overrides={
                     "profile_id": "pipeline-3x24g",
                     "topology": "pipeline",
@@ -345,12 +344,14 @@ class RecommendationServiceTests(unittest.TestCase):
                     "max_rtt_ms": 5.0,
                     "max_packet_loss_pct": 0.1,
                 },
-                benchmark_nodes=nodes,
             )
 
             self.assertEqual(release.status, "ACTIVE")
             self.assertEqual(len(release.promotion_evidence_ids), 1)
-            evidence = session.get(BenchmarkEvidence, release.promotion_evidence_ids[0])
+            evidence = session.get(
+                BenchmarkEvidence,
+                release.promotion_evidence_ids[0],
+            )
             self.assertIsNotNone(evidence)
             assert evidence is not None
             self.assertEqual(evidence.status, "PASSED")
@@ -371,7 +372,8 @@ class RecommendationServiceTests(unittest.TestCase):
         with self.factory() as session:
             missing = _add_node(session, "missing", now=self.now, stored_profile=None)
             invalid = _add_node(session, "invalid", now=self.now, stored_profile={"bad": True})
-            _add_release(session, "profiles")
+            promoter = _add_node(session, "profile-promoter", now=self.now)
+            _add_release(session, "profiles", evidence_nodes=[promoter])
 
             result = recommend_deployment(
                 session,
@@ -384,11 +386,20 @@ class RecommendationServiceTests(unittest.TestCase):
 
         with self.factory() as session:
             ampere = _add_node(session, "ampere", now=self.now)
+            hopper_profile = profile("hopper-promoter").to_dict()
+            hopper_profile["gpus"][0]["compute_capability"] = "9.0"
+            hopper = _add_node(
+                session,
+                "hopper-promoter",
+                now=self.now,
+                stored_profile=hopper_profile,
+            )
             hopper_release, _ = _add_release(
                 session,
                 "hopper-only",
                 quality_rank=20,
                 gpu_architectures=["hopper"],
+                evidence_nodes=[hopper],
             )
             result = recommend_deployment(
                 session,
@@ -473,19 +484,20 @@ class RecommendationAPITests(unittest.TestCase):
                     json={"all_online": True, field: value},
                 )
                 self.assertEqual(response.status_code, 422)
-        self.assertEqual(
-            self.client.post(
-                endpoint,
-                headers=self.admin,
-                json={"node_ids": [node_id]},
-            ).status_code,
-            404,
+        unknown = self.client.post(
+            endpoint,
+            headers=self.admin,
+            json={"node_ids": [node_id]},
         )
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.json()["detail"], f"unknown node(s): {node_id}")
 
     def test_api_returns_recommendation_without_deployment_or_task_mutation(self):
         with self.client.app.state.session_factory() as session:
             node = _add_node(session, "api-node", now=self.now)
-            release, _ = _add_release(session, "api-release")
+            release, _ = _add_release(
+                session, "api-release", evidence_nodes=[node]
+            )
             before = _row_counts(session)
 
         response = self.client.post(
