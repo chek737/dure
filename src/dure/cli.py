@@ -87,6 +87,26 @@ def _parser() -> argparse.ArgumentParser:
     deployment_create.add_argument("--network-interface")
     deployment_create.add_argument("--accept-model-download", action="store_true")
     deployment_create.add_argument("--pull", action="store_true")
+    deployment_recommend = deployment_sub.add_parser(
+        "recommend", help="Recommend a deployment from stored central inventory"
+    )
+    recommendation_nodes = deployment_recommend.add_mutually_exclusive_group(required=True)
+    recommendation_nodes.add_argument(
+        "--all-online", action="store_true", help="Consider all approved online nodes"
+    )
+    recommendation_nodes.add_argument(
+        "--nodes",
+        action="append",
+        nargs="+",
+        metavar="NODE_ID",
+        help="Consider only these approved node UUIDs; may be repeated",
+    )
+    deployment_recommend.add_argument(
+        "--objective",
+        choices=("quality-first",),
+        default="quality-first",
+        help="Recommendation policy objective",
+    )
     for command in ("apply", "start", "stop", "restart"):
         operation = admin_sub.add_parser(command)
         operation.add_argument("deployment_id")
@@ -322,6 +342,25 @@ def _admin(args: argparse.Namespace) -> int:
         print(f"Expires: {value['expires_at']}", file=sys.stderr)
         return 0
     if args.admin_command == "deployment":
+        if args.deployment_command == "recommend":
+            node_ids = list(
+                dict.fromkeys(
+                    node_id
+                    for node_group in (args.nodes or [])
+                    for node_id in node_group
+                )
+            )
+            value = client.request(
+                "POST",
+                "/v1/admin/deployment-recommendations",
+                {
+                    "node_ids": node_ids,
+                    "all_online": args.all_online,
+                    "objective": args.objective,
+                },
+            )
+            print(json.dumps(value, indent=2, sort_keys=True))
+            return 0
         profiles = _load_profiles(args.profile)
         plan = build_plan(profiles, model_id=args.model, image=args.image, network_interface=args.network_interface)
         if plan is None:
