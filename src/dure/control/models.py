@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     JSON,
@@ -262,6 +264,11 @@ class ModelArtifact(Base):
     __tablename__ = "model_artifacts"
     __table_args__ = (
         UniqueConstraint("repository", "revision", "quantization"),
+        UniqueConstraint(
+            "id",
+            "manifest_digest",
+            name="uq_model_artifacts_id_manifest_digest",
+        ),
         CheckConstraint("size_mib > 0", name="ck_model_artifact_size_positive"),
         CheckConstraint("default_max_model_len > 0", name="ck_model_artifact_context_positive"),
         CheckConstraint("layer_count > 0", name="ck_model_artifact_layers_positive"),
@@ -278,6 +285,184 @@ class ModelArtifact(Base):
     layer_count: Mapped[int] = mapped_column(Integer, nullable=False)
     license_id: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtifactManifest(Base):
+    __tablename__ = "artifact_manifests"
+    __table_args__ = (
+        CheckConstraint(
+            "length(digest) = 71 AND digest LIKE 'sha256:%'",
+            name="ck_artifact_manifest_digest_sha256",
+        ),
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_artifact_manifest_schema_version",
+        ),
+        CheckConstraint(
+            "total_size_bytes > 0",
+            name="ck_artifact_manifest_total_size_positive",
+        ),
+        CheckConstraint(
+            "file_count > 0",
+            name="ck_artifact_manifest_file_count_positive",
+        ),
+        CheckConstraint(
+            "chunk_count > 0",
+            name="ck_artifact_manifest_chunk_count_positive",
+        ),
+        CheckConstraint(
+            "length(canonical_json) > 0",
+            name="ck_artifact_manifest_canonical_json_nonempty",
+        ),
+        ForeignKeyConstraint(
+            ["model_artifact_id", "digest"],
+            ["model_artifacts.id", "model_artifacts.manifest_digest"],
+            name="fk_artifact_manifests_model_artifact_identity",
+        ),
+        Index(
+            "ix_artifact_manifests_model_artifact_id",
+            "model_artifact_id",
+        ),
+    )
+    digest: Mapped[str] = mapped_column(String(71), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    model_artifact_id: Mapped[str | None] = mapped_column(String(36))
+    total_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtifactManifestFile(Base):
+    __tablename__ = "artifact_manifest_files"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_artifact_manifest_file_id_length",
+        ),
+        CheckConstraint(
+            "ordinal >= 0",
+            name="ck_artifact_manifest_file_ordinal_nonnegative",
+        ),
+        CheckConstraint(
+            "length(path) >= 1 AND length(path) <= 1024",
+            name="ck_artifact_manifest_file_path_length",
+        ),
+        CheckConstraint(
+            "path NOT LIKE '/%' AND path <> '.' AND path <> '..' "
+            "AND path NOT LIKE './%' AND path NOT LIKE '../%' "
+            "AND path NOT LIKE '%/./%' AND path NOT LIKE '%/../%' "
+            "AND path NOT LIKE '%/.' AND path NOT LIKE '%/..' "
+            "AND path NOT LIKE '%//%' AND path NOT LIKE '%/'",
+            name="ck_artifact_manifest_file_path_relative",
+        ),
+        CheckConstraint(
+            "kind = 'REGULAR'",
+            name="ck_artifact_manifest_file_kind",
+        ),
+        CheckConstraint(
+            "size_bytes >= 0",
+            name="ck_artifact_manifest_file_size_nonnegative",
+        ),
+        CheckConstraint(
+            "length(file_digest) = 71 AND file_digest LIKE 'sha256:%'",
+            name="ck_artifact_manifest_file_digest_sha256",
+        ),
+        UniqueConstraint(
+            "manifest_digest",
+            "path",
+            name="uq_artifact_manifest_files_manifest_path",
+        ),
+        UniqueConstraint(
+            "manifest_digest",
+            "ordinal",
+            name="uq_artifact_manifest_files_manifest_ordinal",
+        ),
+        Index(
+            "ix_artifact_manifest_files_manifest_digest",
+            "manifest_digest",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    manifest_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifests.digest",
+            ondelete="CASCADE",
+            name="fk_artifact_manifest_files_manifest_digest",
+        ),
+        nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), default="REGULAR", nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtifactChunk(Base):
+    __tablename__ = "artifact_chunks"
+    __table_args__ = (
+        CheckConstraint(
+            "length(digest) = 71 AND digest LIKE 'sha256:%'",
+            name="ck_artifact_chunk_digest_sha256",
+        ),
+        CheckConstraint(
+            "size_bytes > 0",
+            name="ck_artifact_chunk_size_positive",
+        ),
+    )
+    digest: Mapped[str] = mapped_column(String(71), primary_key=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtifactFileChunk(Base):
+    __tablename__ = "artifact_file_chunks"
+    __table_args__ = (
+        CheckConstraint(
+            "ordinal >= 0",
+            name="ck_artifact_file_chunk_ordinal_nonnegative",
+        ),
+        CheckConstraint(
+            "offset_bytes >= 0",
+            name="ck_artifact_file_chunk_offset_nonnegative",
+        ),
+        CheckConstraint(
+            "length_bytes > 0",
+            name="ck_artifact_file_chunk_length_positive",
+        ),
+        UniqueConstraint(
+            "file_id",
+            "offset_bytes",
+            name="uq_artifact_file_chunks_file_offset",
+        ),
+        Index(
+            "ix_artifact_file_chunks_chunk_digest",
+            "chunk_digest",
+        ),
+    )
+    file_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifest_files.id",
+            ondelete="CASCADE",
+            name="fk_artifact_file_chunks_file_id",
+        ),
+        primary_key=True,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chunk_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_chunks.digest",
+            name="fk_artifact_file_chunks_chunk_digest",
+        ),
+        nullable=False,
+    )
+    offset_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    length_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class RuntimeRelease(Base):

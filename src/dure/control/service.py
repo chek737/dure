@@ -5,10 +5,13 @@ import json
 import math
 import re
 import secrets
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -32,6 +35,10 @@ from .benchmark import (
     register_benchmark_evidence,
 )
 from .models import (
+    ArtifactChunk,
+    ArtifactFileChunk,
+    ArtifactManifest,
+    ArtifactManifestFile,
     AuditEvent,
     BenchmarkRun,
     Deployment,
@@ -103,9 +110,31 @@ BENCHMARK_RESULT_METRIC_FIELDS = {
     "packet_loss_pct",
     "nccl_all_reduce_ok",
 }
+ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
+MAX_ARTIFACT_MANIFEST_FILES = 100_000
+MAX_ARTIFACT_MANIFEST_CHUNKS = 1_000_000
+MAX_ARTIFACT_PATH_LENGTH = 1024
+MAX_ARTIFACT_FILE_BYTES = 1 << 50
+MAX_ARTIFACT_TOTAL_BYTES = 1 << 50
+_ARTIFACT_CHUNK_BATCH_SIZE = 200
+_ARTIFACT_MANIFEST_KEYS = frozenset({"schema_version", "files"})
+_ARTIFACT_FILE_KEYS = frozenset(
+    {"path", "kind", "size_bytes", "sha256", "chunks"}
+)
+_ARTIFACT_CHUNK_KEYS = frozenset(
+    {"ordinal", "offset_bytes", "length_bytes", "sha256"}
+)
 
 
 class RegistryConflictError(ValueError):
+    pass
+
+
+class ArtifactManifestNotFoundError(ValueError):
+    pass
+
+
+class ArtifactManifestConflictError(ValueError):
     pass
 
 
@@ -137,6 +166,281 @@ def audit(session: Session, actor: str, action: str, target: str | None, outcome
 def _require_digest(value: str, *, field: str) -> None:
     if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
         raise ValueError(f"{field} must be an immutable sha256 digest")
+
+
+def _artifact_manifest_keys(
+    value: object,
+    *,
+    expected: frozenset[str],
+    field: str,
+) -> dict:
+    if type(value) is not dict:
+        raise ValueError(f"{field} must be an object")
+    if any(type(key) is not str for key in value):
+        raise ValueError(f"{field} keys must be strings")
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        detail = []
+        if missing:
+            detail.append(f"missing={','.join(missing)}")
+        if unknown:
+            detail.append(f"unknown={','.join(unknown)}")
+        raise ValueError(f"{field} has invalid fields ({'; '.join(detail)})")
+    return value
+
+
+def _artifact_manifest_integer(
+    value: object,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be an integer in range")
+    return value
+
+
+def _artifact_manifest_digest(value: object, *, field: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field} must be an immutable sha256 digest")
+    _require_digest(value, field=field)
+    return value
+
+
+def _artifact_manifest_path(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("file.path must be a relative string")
+    if (
+        not value
+        or "\\" in value
+        or value.startswith("/")
+        or any(unicodedata.category(character).startswith("C") for character in value)
+    ):
+        raise ValueError("file.path must be a safe relative path")
+    if re.match(r"^[A-Za-z]:", value):
+        raise ValueError("file.path must not be an absolute drive path")
+    normalized = unicodedata.normalize("NFC", value)
+    if len(normalized) > MAX_ARTIFACT_PATH_LENGTH:
+        raise ValueError("file.path exceeds the maximum length")
+    segments = normalized.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise ValueError("file.path must not contain empty, dot, or parent segments")
+    return normalized
+
+
+def _canonical_artifact_manifest(
+    manifest: dict,
+) -> tuple[dict, str, str, int, int, int]:
+    source = _artifact_manifest_keys(
+        manifest,
+        expected=_ARTIFACT_MANIFEST_KEYS,
+        field="manifest",
+    )
+    if type(source["schema_version"]) is not int or source["schema_version"] != 1:
+        raise ValueError("manifest.schema_version must be exactly 1")
+    source_files = source["files"]
+    if type(source_files) is not list:
+        raise ValueError("manifest.files must be a list")
+    if not 1 <= len(source_files) <= MAX_ARTIFACT_MANIFEST_FILES:
+        raise ValueError("manifest file count is out of range")
+
+    files: list[dict] = []
+    paths: set[str] = set()
+    chunk_sizes: dict[str, int] = {}
+    total_size = 0
+    chunk_count = 0
+    for file_index, raw_file in enumerate(source_files):
+        item = _artifact_manifest_keys(
+            raw_file,
+            expected=_ARTIFACT_FILE_KEYS,
+            field=f"manifest.files[{file_index}]",
+        )
+        path = _artifact_manifest_path(item["path"])
+        if path in paths:
+            raise ValueError("manifest contains a duplicate normalized file path")
+        paths.add(path)
+        if type(item["kind"]) is not str or item["kind"] != "REGULAR":
+            raise ValueError("file.kind must be REGULAR")
+        size_bytes = _artifact_manifest_integer(
+            item["size_bytes"],
+            field="file.size_bytes",
+            minimum=0,
+            maximum=MAX_ARTIFACT_FILE_BYTES,
+        )
+        if total_size > MAX_ARTIFACT_TOTAL_BYTES - size_bytes:
+            raise ValueError("manifest total size exceeds the maximum")
+        total_size += size_bytes
+        file_digest = _artifact_manifest_digest(
+            item["sha256"],
+            field="file.sha256",
+        )
+        raw_chunks = item["chunks"]
+        if type(raw_chunks) is not list:
+            raise ValueError("file.chunks must be a list")
+        if len(raw_chunks) > MAX_ARTIFACT_MANIFEST_CHUNKS - chunk_count:
+            raise ValueError("manifest chunk count exceeds the maximum")
+
+        chunks: list[dict] = []
+        for chunk_index, raw_chunk in enumerate(raw_chunks):
+            chunk = _artifact_manifest_keys(
+                raw_chunk,
+                expected=_ARTIFACT_CHUNK_KEYS,
+                field=f"file.chunks[{chunk_index}]",
+            )
+            ordinal = _artifact_manifest_integer(
+                chunk["ordinal"],
+                field="chunk.ordinal",
+                minimum=0,
+                maximum=MAX_ARTIFACT_MANIFEST_CHUNKS - 1,
+            )
+            offset_bytes = _artifact_manifest_integer(
+                chunk["offset_bytes"],
+                field="chunk.offset_bytes",
+                minimum=0,
+                maximum=MAX_ARTIFACT_FILE_BYTES,
+            )
+            length_bytes = _artifact_manifest_integer(
+                chunk["length_bytes"],
+                field="chunk.length_bytes",
+                minimum=1,
+                maximum=MAX_ARTIFACT_FILE_BYTES,
+            )
+            chunk_digest = _artifact_manifest_digest(
+                chunk["sha256"],
+                field="chunk.sha256",
+            )
+            known_size = chunk_sizes.setdefault(chunk_digest, length_bytes)
+            if known_size != length_bytes:
+                raise ValueError("a shared chunk digest has inconsistent lengths")
+            chunks.append(
+                {
+                    "ordinal": ordinal,
+                    "offset_bytes": offset_bytes,
+                    "length_bytes": length_bytes,
+                    "sha256": chunk_digest,
+                }
+            )
+        chunks.sort(key=lambda value: value["ordinal"])
+        if size_bytes == 0 and chunks:
+            raise ValueError("an empty file must not contain chunks")
+        if size_bytes > 0 and not chunks:
+            raise ValueError("a non-empty file must contain chunks")
+        cursor = 0
+        for expected_ordinal, chunk in enumerate(chunks):
+            if chunk["ordinal"] != expected_ordinal:
+                raise ValueError("chunk ordinals must be contiguous from zero")
+            if chunk["offset_bytes"] != cursor:
+                raise ValueError("chunk ranges must be contiguous without gaps or overlap")
+            cursor += chunk["length_bytes"]
+            if cursor > size_bytes:
+                raise ValueError("chunk ranges exceed the file size")
+        if cursor != size_bytes:
+            raise ValueError("chunk ranges must cover the exact file size")
+        chunk_count += len(chunks)
+        files.append(
+            {
+                "path": path,
+                "kind": "REGULAR",
+                "size_bytes": size_bytes,
+                "sha256": file_digest,
+                "chunks": chunks,
+            }
+        )
+
+    if total_size <= 0 or chunk_count <= 0:
+        raise ValueError("manifest must contain non-empty regular file content")
+    files.sort(key=lambda value: value["path"])
+    canonical = {"schema_version": ARTIFACT_MANIFEST_SCHEMA_VERSION, "files": files}
+    canonical_json = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    digest = "sha256:" + hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    return canonical, canonical_json, digest, total_size, len(files), chunk_count
+
+
+def canonical_artifact_manifest_digest(manifest: dict) -> str:
+    return _canonical_artifact_manifest(manifest)[2]
+
+
+def _artifact_chunks_by_digest(
+    session: Session,
+    digests: list[str],
+) -> dict[str, ArtifactChunk]:
+    records: dict[str, ArtifactChunk] = {}
+    for start in range(0, len(digests), _ARTIFACT_CHUNK_BATCH_SIZE):
+        batch = digests[start : start + _ARTIFACT_CHUNK_BATCH_SIZE]
+        records.update(
+            {
+                record.digest: record
+                for record in session.scalars(
+                    select(ArtifactChunk).where(ArtifactChunk.digest.in_(batch))
+                )
+            }
+        )
+    return records
+
+
+def _ensure_artifact_chunks(
+    session: Session,
+    chunk_sizes: dict[str, int],
+) -> None:
+    digests = sorted(chunk_sizes)
+    stored = _artifact_chunks_by_digest(session, digests)
+    for digest, record in stored.items():
+        if record.size_bytes != chunk_sizes[digest]:
+            raise ArtifactManifestConflictError(
+                "stored chunk digest has a different immutable size"
+            )
+
+    missing = [digest for digest in digests if digest not in stored]
+    dialect = session.get_bind().dialect.name
+    for start in range(0, len(missing), _ARTIFACT_CHUNK_BATCH_SIZE):
+        batch = missing[start : start + _ARTIFACT_CHUNK_BATCH_SIZE]
+        values = [
+            {
+                "digest": digest,
+                "size_bytes": chunk_sizes[digest],
+                "created_at": utcnow(),
+            }
+            for digest in batch
+        ]
+        if dialect == "postgresql":
+            statement = postgresql_insert(ArtifactChunk).values(values)
+            session.execute(
+                statement.on_conflict_do_nothing(index_elements=["digest"])
+            )
+        elif dialect == "sqlite":
+            statement = sqlite_insert(ArtifactChunk).values(values)
+            session.execute(
+                statement.on_conflict_do_nothing(index_elements=["digest"])
+            )
+        else:  # pragma: no cover - production and development use PostgreSQL/SQLite
+            for value in values:
+                try:
+                    with session.begin_nested():
+                        session.add(ArtifactChunk(**value))
+                        session.flush()
+                except IntegrityError:
+                    pass
+
+    stored = _artifact_chunks_by_digest(session, digests)
+    if set(stored) != set(digests):
+        raise ArtifactManifestConflictError(
+            "artifact chunk registry is incomplete after registration"
+        )
+    if any(
+        stored[digest].size_bytes != size_bytes
+        for digest, size_bytes in chunk_sizes.items()
+    ):
+        raise ArtifactManifestConflictError(
+            "stored chunk digest has a different immutable size"
+        )
 
 
 def create_model_artifact(
@@ -199,6 +503,260 @@ def create_model_artifact(
     audit(session, "admin", "model_artifact.create", record.id, "success")
     session.commit()
     return record
+
+
+def _artifact_manifest_record_matches(
+    record: ArtifactManifest,
+    *,
+    artifact_id: str | None,
+    canonical_json: str,
+    total_size_bytes: int,
+    file_count: int,
+    chunk_count: int,
+) -> bool:
+    return (
+        record.model_artifact_id == artifact_id
+        and record.schema_version == ARTIFACT_MANIFEST_SCHEMA_VERSION
+        and record.canonical_json == canonical_json
+        and record.total_size_bytes == total_size_bytes
+        and record.file_count == file_count
+        and record.chunk_count == chunk_count
+    )
+
+
+def register_artifact_manifest(
+    session: Session,
+    *,
+    artifact_id: str,
+    manifest: dict,
+    commit: bool = True,
+) -> tuple[ArtifactManifest, bool]:
+    artifact = session.get(ModelArtifact, artifact_id)
+    if artifact is None:
+        raise ArtifactManifestNotFoundError("model artifact not found")
+    (
+        canonical,
+        canonical_json,
+        digest,
+        total_size_bytes,
+        file_count,
+        chunk_count,
+    ) = _canonical_artifact_manifest(manifest)
+    if artifact.manifest_digest != digest:
+        raise ArtifactManifestConflictError(
+            "canonical manifest digest does not match the model artifact"
+        )
+
+    def existing_is_exact(record: ArtifactManifest) -> bool:
+        if not _artifact_manifest_record_matches(
+            record,
+            artifact_id=artifact.id,
+            canonical_json=canonical_json,
+            total_size_bytes=total_size_bytes,
+            file_count=file_count,
+            chunk_count=chunk_count,
+        ):
+            return False
+        try:
+            stored = artifact_manifest_dict(session, record)
+        except ArtifactManifestConflictError:
+            return False
+        return (
+            stored["schema_version"] == canonical["schema_version"]
+            and stored["files"] == canonical["files"]
+        )
+
+    existing = session.get(ArtifactManifest, digest)
+    if existing is not None:
+        if existing_is_exact(existing):
+            return existing, False
+        raise ArtifactManifestConflictError(
+            "manifest digest is already bound to different immutable content"
+        )
+    artifact_manifest = session.scalar(
+        select(ArtifactManifest).where(
+            ArtifactManifest.model_artifact_id == artifact.id
+        )
+    )
+    if artifact_manifest is not None:
+        raise ArtifactManifestConflictError(
+            "model artifact is already bound to a different manifest"
+        )
+
+    chunk_sizes: dict[str, int] = {}
+    for file_item in canonical["files"]:
+        for chunk_item in file_item["chunks"]:
+            chunk_sizes[chunk_item["sha256"]] = chunk_item["length_bytes"]
+    record = ArtifactManifest(
+        digest=digest,
+        schema_version=ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        model_artifact_id=artifact.id,
+        total_size_bytes=total_size_bytes,
+        file_count=file_count,
+        chunk_count=chunk_count,
+        canonical_json=canonical_json,
+    )
+    file_records: list[ArtifactManifestFile] = []
+    link_records: list[ArtifactFileChunk] = []
+    for file_ordinal, file_item in enumerate(canonical["files"]):
+        file_id = str(uuid.uuid4())
+        file_records.append(
+            ArtifactManifestFile(
+                id=file_id,
+                manifest_digest=digest,
+                ordinal=file_ordinal,
+                path=file_item["path"],
+                kind=file_item["kind"],
+                size_bytes=file_item["size_bytes"],
+                file_digest=file_item["sha256"],
+            )
+        )
+        link_records.extend(
+            ArtifactFileChunk(
+                file_id=file_id,
+                ordinal=chunk_item["ordinal"],
+                chunk_digest=chunk_item["sha256"],
+                offset_bytes=chunk_item["offset_bytes"],
+                length_bytes=chunk_item["length_bytes"],
+            )
+            for chunk_item in file_item["chunks"]
+        )
+
+    try:
+        with session.begin_nested():
+            _ensure_artifact_chunks(session, chunk_sizes)
+            session.add(record)
+            session.flush()
+            session.add_all(file_records)
+            session.flush()
+            session.add_all(link_records)
+            session.flush()
+    except IntegrityError as exc:
+        session.expire_all()
+        existing = session.get(ArtifactManifest, digest)
+        if existing is not None and existing_is_exact(existing):
+            return existing, False
+        raise ArtifactManifestConflictError(
+            "artifact manifest registration conflicts with immutable registry data"
+        ) from exc
+    if commit:
+        session.commit()
+    return record, True
+
+
+def get_artifact_manifest(
+    session: Session,
+    artifact_id: str,
+) -> ArtifactManifest | None:
+    if session.get(ModelArtifact, artifact_id) is None:
+        raise ArtifactManifestNotFoundError("model artifact not found")
+    return session.scalar(
+        select(ArtifactManifest).where(
+            ArtifactManifest.model_artifact_id == artifact_id
+        )
+    )
+
+
+def artifact_manifest_dict(
+    session: Session,
+    record: ArtifactManifest,
+) -> dict:
+    files = list(
+        session.scalars(
+            select(ArtifactManifestFile)
+            .where(ArtifactManifestFile.manifest_digest == record.digest)
+            .order_by(ArtifactManifestFile.ordinal, ArtifactManifestFile.id)
+        )
+    )
+    link_rows = list(
+        session.execute(
+            select(ArtifactFileChunk, ArtifactChunk.size_bytes)
+            .join(
+                ArtifactManifestFile,
+                ArtifactManifestFile.id == ArtifactFileChunk.file_id,
+            )
+            .outerjoin(
+                ArtifactChunk,
+                ArtifactChunk.digest == ArtifactFileChunk.chunk_digest,
+            )
+            .where(ArtifactManifestFile.manifest_digest == record.digest)
+            .order_by(
+                ArtifactManifestFile.ordinal,
+                ArtifactFileChunk.ordinal,
+            )
+        )
+    )
+    links_by_file: dict[str, list[ArtifactFileChunk]] = {
+        item.id: [] for item in files
+    }
+    invalid_chunk_link = False
+    for link, stored_size in link_rows:
+        if link.file_id not in links_by_file:
+            invalid_chunk_link = True
+            continue
+        links_by_file[link.file_id].append(link)
+        if stored_size is None or stored_size != link.length_bytes:
+            invalid_chunk_link = True
+    manifest = {
+        "schema_version": record.schema_version,
+        "files": [
+            {
+                "path": file_record.path,
+                "kind": file_record.kind,
+                "size_bytes": file_record.size_bytes,
+                "sha256": file_record.file_digest,
+                "chunks": [
+                    {
+                        "ordinal": link.ordinal,
+                        "offset_bytes": link.offset_bytes,
+                        "length_bytes": link.length_bytes,
+                        "sha256": link.chunk_digest,
+                    }
+                    for link in links_by_file[file_record.id]
+                ],
+            }
+            for file_record in files
+        ],
+    }
+    try:
+        (
+            canonical,
+            canonical_json,
+            digest,
+            total_size_bytes,
+            file_count,
+            chunk_count,
+        ) = _canonical_artifact_manifest(manifest)
+    except ValueError as exc:
+        raise ArtifactManifestConflictError(
+            "stored artifact manifest is internally inconsistent"
+        ) from exc
+    files_have_valid_ordinals = all(
+        file_record.ordinal == ordinal
+        for ordinal, file_record in enumerate(files)
+    )
+    if not files_have_valid_ordinals or invalid_chunk_link or not _artifact_manifest_record_matches(
+        record,
+        artifact_id=record.model_artifact_id,
+        canonical_json=canonical_json,
+        total_size_bytes=total_size_bytes,
+        file_count=file_count,
+        chunk_count=chunk_count,
+    ) or digest != record.digest:
+        raise ArtifactManifestConflictError(
+            "stored artifact manifest is internally inconsistent"
+        )
+    created_at = aware(record.created_at)
+    return {
+        "digest": record.digest,
+        "model_artifact_id": record.model_artifact_id,
+        "schema_version": canonical["schema_version"],
+        "total_size_bytes": record.total_size_bytes,
+        "file_count": record.file_count,
+        "chunk_count": record.chunk_count,
+        "files": canonical["files"],
+        "created_at": created_at.isoformat() if created_at is not None else None,
+    }
 
 
 def create_runtime_release(
