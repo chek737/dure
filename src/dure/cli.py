@@ -154,6 +154,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Canonical UUID used to retry the same immutable preparation request",
     )
     deployment_prepare.add_argument(
+        "--stage-variant",
+        dest="artifact_set_digest",
+        help=(
+            "Use this exact VALIDATED stage artifact-set sha256 digest; "
+            "omitting it preserves FULL_SNAPSHOT preparation"
+        ),
+    )
+    deployment_prepare.add_argument(
         "--apply",
         action="store_true",
         help="Queue preparation tasks after all server-side safety checks pass",
@@ -486,13 +494,16 @@ def _admin(args: argparse.Namespace) -> int:
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0
         if args.deployment_command == "prepare":
+            body = {
+                "request_id": args.request_id,
+                "apply": args.apply,
+            }
+            if args.artifact_set_digest is not None:
+                body["artifact_set_digest"] = args.artifact_set_digest
             value = client.request(
                 "POST",
                 f"/v1/admin/deployments/{args.deployment_id}/prepare",
-                {
-                    "request_id": args.request_id,
-                    "apply": args.apply,
-                },
+                body,
             )
             print(json.dumps(value, indent=2, sort_keys=True))
             return 0

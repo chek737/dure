@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import tempfile
 import unittest
 import uuid
@@ -21,11 +22,17 @@ from dure.control.benchmark import (
 from dure.control.models import (
     ArtifactManifest,
     ArtifactPreparation,
+    Deployment,
     DeploymentOperation,
     Node,
     NodeProfileRecord,
     Task,
     utcnow,
+)
+from dure.control.preparation import effective_deployment_plan
+from dure.control.rollout import (
+    DeploymentRolloutError,
+    prepare_or_apply_rollback,
 )
 from dure.control.service import (
     add_placement_profile,
@@ -36,10 +43,70 @@ from dure.control.service import (
     register_artifact_manifest,
     transition_model_release,
 )
-from dure.model_cache import MODEL_CACHE_VERIFICATION_VERSION
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
+)
+from dure.stage_cache import (
+    STAGE_CACHE_VERIFICATION_VERSION,
+    StageCacheIdentity,
+)
 
 from .helpers import profile
 from .test_artifact_manifest_api import _manifest
+
+
+def _digest(character: str) -> str:
+    return "sha256:" + character * 64
+
+
+def _named_digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _stage_manifest(rank: int, *, changed: bool = False) -> dict:
+    digests = (
+        tuple(
+            _named_digest(f"changed-stage-{rank}-{index}")
+            for index in range(5)
+        )
+        if changed
+        else (
+            tuple(_digest(item) for item in ("0", "1", "2", "3", "4"))
+            if rank == 0
+            else tuple(
+                _digest(item) for item in ("5", "6", "7", "8", "9")
+            )
+        )
+    )
+    files = [
+        ("model-rank-0-part-0.safetensors", 4 + rank, digests[0]),
+        ("config.json", 2, digests[1]),
+        ("tokenizer.json", 3, digests[2]),
+        ("tokenizer_config.json", 4, digests[3]),
+        ("dure-stage.json", 5, digests[4]),
+    ]
+    return {
+        "schema_version": 1,
+        "files": [
+            {
+                "path": path,
+                "kind": "REGULAR",
+                "size_bytes": size_bytes,
+                "sha256": digest,
+                "chunks": [
+                    {
+                        "ordinal": 0,
+                        "offset_bytes": 0,
+                        "length_bytes": size_bytes,
+                        "sha256": digest,
+                    }
+                ],
+            }
+            for path, size_bytes, digest in files
+        ],
+    }
 
 
 def _oversized_manifest(
@@ -92,6 +159,7 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         key: str,
         *,
         disk_free_mib: int = 80000,
+        agent_version: str = "0.3.16",
     ) -> list[dict]:
         enrolled = []
         for index in range(count):
@@ -111,7 +179,7 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                 json={
                     "token": enrollment.json()["token"],
                     "install_id": f"install-{key}-{index}-{uuid.uuid4()}",
-                    "agent_version": "0.3.16",
+                    "agent_version": agent_version,
                     "profile": reported_profile,
                 },
             )
@@ -136,9 +204,13 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         manifest: dict | None = None,
         register_manifest: bool = True,
         disk_free_mib: int = 80000,
+        agent_version: str = "0.3.16",
     ) -> dict:
         enrolled = self._enroll_nodes(
-            node_count, key, disk_free_mib=disk_free_mib
+            node_count,
+            key,
+            disk_free_mib=disk_free_mib,
+            agent_version=agent_version,
         )
         manifest_value = copy.deepcopy(manifest or _manifest())
         manifest_digest = canonical_artifact_manifest_digest(manifest_value)
@@ -302,11 +374,123 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             "runtime_image": runtime_image,
         }
 
-    def _prepare(self, context: dict, request_id: str, *, apply: bool):
+    def _create_stage_variant(
+        self,
+        context: dict,
+        *,
+        validate: bool = True,
+        changed_rank: int | None = None,
+        exporter_character: str = "6",
+    ) -> dict:
+        manifests: dict[str, dict] = {}
+        stages = []
+        for rank in range(2):
+            manifest = _stage_manifest(
+                rank, changed=rank == changed_rank
+            )
+            manifest_digest = canonical_artifact_manifest_digest(manifest)
+            manifests[manifest_digest] = manifest
+            stages.append(
+                {
+                    "pipeline_rank": rank,
+                    "tensor_rank": 0,
+                    "manifest_digest": manifest_digest,
+                    "tensor_key_count": 2 + rank,
+                    "tensor_keys_digest": _digest(str(4 + rank)),
+                    "weight_size_bytes": 4 + rank,
+                    "manifest": manifest,
+                }
+            )
+        response = self.client.post(
+            "/v1/admin/stage-artifact-variants",
+            headers=self.admin,
+            json={
+                "source_manifest_digest": context["manifest_digest"],
+                "runtime_image": context["runtime_image"],
+                "vllm_version": "0.9.0",
+                "exporter_build_digest": _digest(exporter_character),
+                "architecture": "Qwen2ForCausalLM",
+                "quantization": "awq",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 2,
+                "loader_format": "VLLM_SHARDED_STATE_V1",
+                "stages": stages,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        stage = {
+            "variant": response.json()["variant"],
+            "manifests": manifests,
+        }
+        if validate:
+            self._validate_stage_variant(stage)
+        context["stage_variant"] = stage["variant"]
+        context["stage_manifests"] = manifests
+        return stage
+
+    def _validate_stage_variant(self, stage: dict) -> None:
+        variant = stage["variant"]
+        endpoint = (
+            "/v1/admin/stage-artifact-variants/"
+            + variant["artifact_set_digest"]
+        )
+        evidence = self.client.post(
+            endpoint + "/evidence",
+            headers=self.admin,
+            json={
+                "schema_version": 1,
+                "variant_identity_digest": variant[
+                    "artifact_set_digest"
+                ],
+                "validation_run_id": str(uuid.uuid4()),
+                "kind": "GPU_EXPORT_LOAD",
+                "status": "PASSED",
+                "validator_version": "validator-1",
+                "validator_build_digest": _digest("7"),
+                "failure_code": None,
+                "ranks": [
+                    {
+                        "pipeline_rank": item["pipeline_rank"],
+                        "tensor_rank": item["tensor_rank"],
+                        "manifest_digest": item["manifest_digest"],
+                        "tensor_keys_digest": item[
+                            "tensor_keys_digest"
+                        ],
+                        "loaded_tensor_count": item[
+                            "tensor_key_count"
+                        ],
+                        "loaded_weight_size_bytes": item[
+                            "weight_size_bytes"
+                        ],
+                    }
+                    for item in variant["stages"]
+                ],
+            },
+        )
+        self.assertEqual(evidence.status_code, 200, evidence.text)
+        transition = self.client.post(
+            endpoint + "/transition",
+            headers=self.admin,
+            json={"status": "VALIDATED"},
+        )
+        self.assertEqual(transition.status_code, 200, transition.text)
+        stage["variant"] = transition.json()["variant"]
+
+    def _prepare(
+        self,
+        context: dict,
+        request_id: str,
+        *,
+        apply: bool,
+        artifact_set_digest: str | None = None,
+    ):
+        body = {"request_id": request_id, "apply": apply}
+        if artifact_set_digest is not None:
+            body["artifact_set_digest"] = artifact_set_digest
         return self.client.post(
             f"/v1/admin/deployments/{context['deployment']['id']}/prepare",
             headers=self.admin,
-            json={"request_id": request_id, "apply": apply},
+            json=body,
         )
 
     def _claim(self, enrolled: dict) -> dict:
@@ -333,16 +517,66 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             "reused": False,
         }
         if task["type"] == "PREPARE_MODEL":
-            result.update(
-                model_id=payload["model_id"],
-                manifest_digest=payload["manifest_digest"],
-                cache_kind="FULL_SNAPSHOT",
-                verification_version=MODEL_CACHE_VERIFICATION_VERSION,
-                bytes_verified=sum(
-                    item["size_bytes"] for item in context["manifest"]["files"]
-                ),
-                file_count=len(context["manifest"]["files"]),
-            )
+            if payload["cache_kind"] == MODEL_CACHE_KIND_STAGE:
+                manifest = context["stage_manifests"][
+                    payload["manifest_digest"]
+                ]
+                identity = StageCacheIdentity(
+                    repository=payload["repository"],
+                    revision=payload["revision"],
+                    manifest_digest=payload["manifest_digest"],
+                    quantization=payload["quantization"],
+                    artifact_set_digest=payload["artifact_set_digest"],
+                    contract_identity_digest=payload[
+                        "contract_identity_digest"
+                    ],
+                    source_manifest_digest=payload[
+                        "source_manifest_digest"
+                    ],
+                    runtime_image=payload["runtime_image"],
+                    vllm_version=payload["vllm_version"],
+                    exporter_build_digest=payload[
+                        "exporter_build_digest"
+                    ],
+                    architecture=payload["architecture"],
+                    loader_format=payload["loader_format"],
+                    tensor_parallel_size=payload[
+                        "tensor_parallel_size"
+                    ],
+                    pipeline_parallel_size=payload[
+                        "pipeline_parallel_size"
+                    ],
+                    pipeline_rank=payload["pipeline_rank"],
+                    tensor_rank=payload["tensor_rank"],
+                    tensor_keys_digest=payload["tensor_keys_digest"],
+                )
+                result.update(
+                    model_id=payload["model_id"],
+                    manifest_digest=payload["manifest_digest"],
+                    cache_kind=MODEL_CACHE_KIND_STAGE,
+                    verification_version=STAGE_CACHE_VERIFICATION_VERSION,
+                    bytes_verified=sum(
+                        item["size_bytes"] for item in manifest["files"]
+                    ),
+                    file_count=len(manifest["files"]),
+                    artifact_set_digest=payload["artifact_set_digest"],
+                    pipeline_rank=payload["pipeline_rank"],
+                    tensor_rank=payload["tensor_rank"],
+                    tensor_keys_digest=payload["tensor_keys_digest"],
+                    cache_identity_digest=identity.cache_identity_digest,
+                )
+            else:
+                result.update(
+                    model_id=payload["model_id"],
+                    manifest_digest=payload["manifest_digest"],
+                    cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                    verification_version=MODEL_CACHE_VERIFICATION_VERSION,
+                    bytes_verified=sum(
+                        item["size_bytes"]
+                        for item in context["manifest"]["files"]
+                    ),
+                    file_count=len(context["manifest"]["files"]),
+                )
         else:
             result.update(
                 runtime_image=payload["runtime_image"],
@@ -404,6 +638,11 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         )
         model_task = self._claim(context["enrolled"][0])
         self.assertEqual(model_task["type"], "PREPARE_MODEL")
+        self.assertEqual(
+            model_task["payload"]["cache_kind"],
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
+        self.assertNotIn("artifact_set_digest", model_task["payload"])
 
         manifest = self.client.get(
             f"/v1/agent/tasks/{model_task['id']}/artifact-manifest",
@@ -456,8 +695,575 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             + context["manifest_digest"].removeprefix("sha256:")
         )
         self.assertEqual(apply_task["payload"]["plan"]["model_path"], expected_path)
+        self.assertNotIn(
+            "stage_artifact", apply_task["payload"]["plan"]
+        )
+        self.assertNotIn(
+            "model_cache_kind", apply_task["payload"]["plan"]
+        )
         self.assertFalse(apply_task["payload"]["accept_model_download"])
         self.assertFalse(apply_task["payload"]["pull_image"])
+
+    def test_exact_validated_stage_digest_binds_rank_tasks_and_preserves_retry_evidence(
+        self,
+    ):
+        context = self._seed_accepted_generation(
+            "stage-success",
+            node_count=2,
+            agent_version="0.3.19",
+        )
+        unused = self._create_stage_variant(
+            context, exporter_character="6"
+        )
+        selected = self._create_stage_variant(
+            context,
+            changed_rank=0,
+            exporter_character="8",
+        )
+        selected_digest = selected["variant"]["artifact_set_digest"]
+        self.assertNotEqual(
+            selected_digest, unused["variant"]["artifact_set_digest"]
+        )
+
+        request_id = str(uuid.uuid4())
+        preview = self._prepare(
+            context,
+            request_id,
+            apply=False,
+            artifact_set_digest=selected_digest,
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["tasks"], [])
+        snapshot = preview.json()["preparation"]["plan_snapshot"]
+        self.assertEqual(
+            snapshot["artifact"]["cache_kind"], MODEL_CACHE_KIND_STAGE
+        )
+        self.assertEqual(
+            snapshot["stage_artifact"]["artifact_set_digest"],
+            selected_digest,
+        )
+        self.assertEqual(
+            snapshot["effective_plan"]["model_path"],
+            "/var/lib/dure/models/stages",
+        )
+        self.assertEqual(
+            snapshot["effective_plan"]["model_cache_kind"],
+            MODEL_CACHE_KIND_STAGE,
+        )
+
+        omitted_replay = self._prepare(
+            context, request_id, apply=False
+        )
+        self._failure_code(
+            omitted_replay, "PREPARATION_REQUEST_CONFLICT"
+        )
+
+        applied = self._prepare(
+            context,
+            request_id,
+            apply=True,
+            artifact_set_digest=selected_digest,
+        )
+        self.assertEqual(applied.status_code, 200, applied.text)
+        self.assertEqual(len(applied.json()["tasks"]), 2)
+        self.assertEqual(
+            {item["type"] for item in applied.json()["tasks"]},
+            {"PREPARE_MODEL"},
+        )
+        expected_payload_fields = {
+            "preparation_id",
+            "preparation_node_id",
+            "attempt_id",
+            "attempt_no",
+            "deployment_id",
+            "generation",
+            "node_id",
+            "apply",
+            "model_id",
+            "repository",
+            "revision",
+            "manifest_digest",
+            "quantization",
+            "cache_kind",
+            "artifact_set_digest",
+            "contract_identity_digest",
+            "source_manifest_digest",
+            "runtime_image",
+            "vllm_version",
+            "exporter_build_digest",
+            "architecture",
+            "loader_format",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "pipeline_rank",
+            "tensor_rank",
+            "tensor_keys_digest",
+        }
+        binding_by_node = {
+            item["node_id"]: item
+            for item in snapshot["stage_artifact"]["node_bindings"]
+        }
+        for task in applied.json()["tasks"]:
+            payload = task["payload"]
+            binding = binding_by_node[task["node_id"]]
+            self.assertEqual(set(payload), expected_payload_fields)
+            self.assertEqual(payload["cache_kind"], MODEL_CACHE_KIND_STAGE)
+            self.assertEqual(
+                payload["artifact_set_digest"], selected_digest
+            )
+            self.assertEqual(
+                payload["manifest_digest"], binding["manifest_digest"]
+            )
+            self.assertEqual(
+                payload["pipeline_rank"], binding["pipeline_rank"]
+            )
+            self.assertEqual(
+                payload["tensor_rank"], binding["tensor_rank"]
+            )
+            self.assertEqual(
+                payload["tensor_keys_digest"],
+                binding["tensor_keys_digest"],
+            )
+
+        ordered = sorted(
+            context["enrolled"], key=lambda item: item["node_id"]
+        )
+        model_tasks = {
+            enrolled["node_id"]: self._claim(enrolled)
+            for enrolled in ordered
+        }
+        for enrolled in ordered:
+            task = model_tasks[enrolled["node_id"]]
+            manifest_response = self.client.get(
+                f"/v1/agent/tasks/{task['id']}/artifact-manifest",
+                headers=enrolled["headers"],
+            )
+            self.assertEqual(
+                manifest_response.status_code, 200, manifest_response.text
+            )
+            self.assertEqual(
+                canonical_artifact_manifest_digest(
+                    manifest_response.json()["manifest"]
+                ),
+                task["payload"]["manifest_digest"],
+            )
+
+        cross_rank_manifest = self.client.get(
+            "/v1/agent/tasks/"
+            + model_tasks[ordered[0]["node_id"]]["id"]
+            + "/artifact-manifest",
+            headers=ordered[1]["headers"],
+        )
+        self._failure_code(
+            cross_rank_manifest, "PREPARATION_MANIFEST_UNAVAILABLE"
+        )
+
+        first_model = model_tasks[ordered[0]["node_id"]]
+        first_model_result = self._result(first_model, context)
+        completed_model = self.client.post(
+            f"/v1/agent/tasks/{first_model['id']}/complete",
+            headers=ordered[0]["headers"],
+            json={"result": first_model_result},
+        )
+        self.assertEqual(
+            completed_model.status_code, 200, completed_model.text
+        )
+        first_image = self._claim(ordered[0])
+        first_image_result = self._result(first_image, context)
+        completed_image = self.client.post(
+            f"/v1/agent/tasks/{first_image['id']}/complete",
+            headers=ordered[0]["headers"],
+            json={"result": first_image_result},
+        )
+        self.assertEqual(
+            completed_image.status_code, 200, completed_image.text
+        )
+
+        second_model = model_tasks[ordered[1]["node_id"]]
+        cross_rank_result = self._result(second_model, context)
+        for field in (
+            "manifest_digest",
+            "pipeline_rank",
+            "tensor_rank",
+            "tensor_keys_digest",
+            "cache_identity_digest",
+        ):
+            cross_rank_result[field] = first_model_result[field]
+        rejected = self.client.post(
+            f"/v1/agent/tasks/{second_model['id']}/complete",
+            headers=ordered[1]["headers"],
+            json={"result": cross_rank_result},
+        )
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(
+            rejected.json()["detail"]["code"],
+            "PREPARATION_RESULT_REJECTED",
+        )
+
+        preparation_id = preview.json()["preparation"]["id"]
+        partial = self.client.get(
+            f"/v1/admin/deployment-preparations/{preparation_id}",
+            headers=self.admin,
+        )
+        self.assertEqual(partial.status_code, 200, partial.text)
+        self.assertEqual(
+            partial.json()["preparation"]["status"], "PARTIAL_FAILED"
+        )
+        partial_by_node = {
+            item["node_id"]: item
+            for item in partial.json()["preparation"]["nodes"]
+        }
+        first_evidence = copy.deepcopy(
+            partial_by_node[ordered[0]["node_id"]]["attempts"]
+        )
+        self.assertEqual(
+            [item["result"] for item in first_evidence],
+            [first_image_result, first_model_result],
+        )
+        self.assertEqual(
+            partial_by_node[ordered[1]["node_id"]][
+                "model_failure_code"
+            ],
+            "PREPARATION_RESULT_REJECTED",
+        )
+
+        retry = self._prepare(
+            context,
+            request_id,
+            apply=True,
+            artifact_set_digest=selected_digest,
+        )
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertEqual(len(retry.json()["tasks"]), 1)
+        retry_task = retry.json()["tasks"][0]
+        self.assertEqual(retry_task["type"], "PREPARE_MODEL")
+        self.assertEqual(retry_task["node_id"], ordered[1]["node_id"])
+        self.assertEqual(retry_task["payload"]["attempt_no"], 2)
+
+        retried_model = self._claim(ordered[1])
+        self._complete(retried_model, ordered[1], context)
+        retried_image = self._claim(ordered[1])
+        self.assertEqual(retried_image["payload"]["attempt_no"], 1)
+        self._complete(retried_image, ordered[1], context)
+
+        completed = self.client.get(
+            f"/v1/admin/deployment-preparations/{preparation_id}",
+            headers=self.admin,
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(
+            completed.json()["preparation"]["status"], "SUCCEEDED"
+        )
+        completed_by_node = {
+            item["node_id"]: item
+            for item in completed.json()["preparation"]["nodes"]
+        }
+        self.assertEqual(
+            completed_by_node[ordered[0]["node_id"]]["attempts"],
+            first_evidence,
+        )
+
+        with self.factory() as session:
+            deployment = session.get(
+                Deployment, context["deployment"]["id"]
+            )
+            plan = effective_deployment_plan(session, deployment)
+        self.assertEqual(plan, snapshot["effective_plan"])
+        self.assertEqual(
+            plan["stage_artifact"]["artifact_set_digest"],
+            selected_digest,
+        )
+
+        revoked = self.client.post(
+            "/v1/admin/stage-artifact-variants/"
+            + selected_digest
+            + "/transition",
+            headers=self.admin,
+            json={"status": "REVOKED"},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        with self.factory() as session:
+            deployment = session.get(
+                Deployment, context["deployment"]["id"]
+            )
+            containment_plan = effective_deployment_plan(
+                session, deployment, require_prepared=False
+            )
+        self.assertEqual(containment_plan, snapshot["effective_plan"])
+
+        for task_type, options in (
+            ("START_DEPLOYMENT", {"serve": True}),
+            ("RESTART_DEPLOYMENT", {"serve": True}),
+            ("VERIFY", {"api": True}),
+        ):
+            with self.subTest(task_type=task_type):
+                rejected = self.client.post(
+                    "/v1/admin/tasks",
+                    headers=self.admin,
+                    json={
+                        "node_ids": [item["node_id"] for item in ordered],
+                        "type": task_type,
+                        "deployment_id": context["deployment"]["id"],
+                        "options": options,
+                    },
+                )
+                self._failure_code(
+                    rejected, "DEPLOYMENT_STAGE_VARIANT_UNAVAILABLE"
+                )
+
+        emergency_stop = self.client.post(
+            "/v1/admin/tasks",
+            headers=self.admin,
+            json={
+                "node_ids": [item["node_id"] for item in ordered],
+                "type": "STOP_DEPLOYMENT",
+                "deployment_id": context["deployment"]["id"],
+                "options": {},
+            },
+        )
+        self.assertEqual(emergency_stop.status_code, 200, emergency_stop.text)
+        self.assertEqual(len(emergency_stop.json()["tasks"]), 2)
+        for task in emergency_stop.json()["tasks"]:
+            self.assertEqual(
+                task["payload"]["plan"]["model_cache_kind"],
+                MODEL_CACHE_KIND_STAGE,
+            )
+            self.assertEqual(
+                task["payload"]["plan"]["stage_artifact"][
+                    "artifact_set_digest"
+                ],
+                selected_digest,
+            )
+
+    def test_rollback_stage_source_requires_agent_and_preserves_labels(self):
+        context = self._seed_accepted_generation(
+            "stage-rb",
+            node_count=2,
+            agent_version="0.3.19",
+        )
+        selected = self._create_stage_variant(context)
+        selected_digest = selected["variant"]["artifact_set_digest"]
+        preview = self._prepare(
+            context,
+            str(uuid.uuid4()),
+            apply=False,
+            artifact_set_digest=selected_digest,
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+
+        revoked = self.client.post(
+            "/v1/admin/stage-artifact-variants/"
+            + selected_digest
+            + "/transition",
+            headers=self.admin,
+            json={"status": "REVOKED"},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+
+        node_ids = sorted(item["node_id"] for item in context["enrolled"])
+        with self.factory() as session:
+            source = session.get(
+                Deployment, context["deployment"]["id"]
+            )
+            self.assertIsNotNone(source)
+            preparation = session.scalar(
+                select(ArtifactPreparation).where(
+                    ArtifactPreparation.deployment_id == source.id
+                )
+            )
+            self.assertIsNotNone(preparation)
+
+            target_id = str(uuid.uuid4())
+            target_plan = copy.deepcopy(source.plan)
+            target_plan["deployment_id"] = target_id
+            target_plan["generation"] = 1
+            target = Deployment(
+                id=target_id,
+                lineage_id=target_id,
+                previous_generation_id=None,
+                generation=1,
+                plan=target_plan,
+                accept_model_download=False,
+                pull_image=False,
+                status="VERIFIED",
+                verified_at=utcnow() - timedelta(hours=1),
+            )
+            session.add(target)
+            session.flush()
+
+            source_plan = copy.deepcopy(source.plan)
+            source_plan["generation"] = 2
+            source.plan = source_plan
+            source.lineage_id = target_id
+            source.previous_generation_id = target_id
+            source.generation = 2
+            source.status = "APPLIED"
+            source.verified_at = None
+
+            snapshot = copy.deepcopy(preparation.plan_snapshot)
+            snapshot["generation"] = 2
+            snapshot["effective_plan"]["generation"] = 2
+            preparation.plan_snapshot = snapshot
+            session.commit()
+
+            for node_id in node_ids:
+                session.get(Node, node_id).agent_version = "0.3.18"
+            session.commit()
+            with self.assertRaises(DeploymentRolloutError) as rejected:
+                prepare_or_apply_rollback(
+                    session,
+                    source.id,
+                    node_ids,
+                    apply=True,
+                    serve=True,
+                )
+            self.assertEqual(
+                rejected.exception.code, "ROLLBACK_STAGE_AGENT_TOO_OLD"
+            )
+            self.assertEqual(
+                rejected.exception.details, {"node_ids": node_ids}
+            )
+            session.rollback()
+
+            for node_id in node_ids:
+                session.get(Node, node_id).agent_version = "0.3.19"
+            session.commit()
+            operation, tasks, changed = prepare_or_apply_rollback(
+                session,
+                source.id,
+                node_ids,
+                apply=True,
+                serve=True,
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(operation.phase, "STOP_SOURCE")
+            self.assertEqual(len(tasks), 2)
+            task_ids = [task.id for task in tasks]
+            with self.factory() as verification_session:
+                persisted_tasks = [
+                    verification_session.get(Task, task_id)
+                    for task_id in task_ids
+                ]
+            self.assertTrue(all(task is not None for task in persisted_tasks))
+            for persisted in persisted_tasks:
+                self.assertEqual(
+                    persisted.payload["plan"], snapshot["effective_plan"]
+                )
+                self.assertEqual(
+                    persisted.payload["plan"]["stage_artifact"][
+                        "artifact_set_digest"
+                    ],
+                    selected_digest,
+                )
+                assignment = next(
+                    item
+                    for item in persisted.payload["plan"]["assignments"]
+                    if item["node_id"] == persisted.node_id
+                )
+                self.assertRegex(
+                    assignment["stage_manifest_digest"],
+                    r"^sha256:[0-9a-f]{64}$",
+                )
+                self.assertRegex(
+                    assignment["stage_tensor_keys_digest"],
+                    r"^sha256:[0-9a-f]{64}$",
+                )
+
+    def test_stage_prepare_rejects_missing_draft_and_revoked_variants(self):
+        context = self._seed_accepted_generation(
+            "stage-state-gates",
+            node_count=2,
+            agent_version="0.3.19",
+        )
+        unavailable = self._prepare(
+            context,
+            str(uuid.uuid4()),
+            apply=False,
+            artifact_set_digest=_digest("a"),
+        )
+        self._failure_code(
+            unavailable, "PREPARATION_STAGE_VARIANT_UNAVAILABLE"
+        )
+
+        stage = self._create_stage_variant(
+            context,
+            validate=False,
+            exporter_character="b",
+        )
+        digest = stage["variant"]["artifact_set_digest"]
+        draft = self._prepare(
+            context,
+            str(uuid.uuid4()),
+            apply=False,
+            artifact_set_digest=digest,
+        )
+        self._failure_code(draft, "PREPARATION_STAGE_VARIANT_INVALID")
+
+        self._validate_stage_variant(stage)
+        revoked = self.client.post(
+            "/v1/admin/stage-artifact-variants/"
+            + digest
+            + "/transition",
+            headers=self.admin,
+            json={"status": "REVOKED"},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        revoked_prepare = self._prepare(
+            context,
+            str(uuid.uuid4()),
+            apply=False,
+            artifact_set_digest=digest,
+        )
+        self._failure_code(
+            revoked_prepare, "PREPARATION_STAGE_VARIANT_INVALID"
+        )
+
+        with self.factory() as session:
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(ArtifactPreparation)
+                ),
+                0,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)), 0
+            )
+
+    def test_stage_prepare_requires_agent_0_3_19_or_newer(self):
+        context = self._seed_accepted_generation(
+            "stage-old",
+            node_count=2,
+            agent_version="0.3.18",
+        )
+        stage = self._create_stage_variant(context)
+        response = self._prepare(
+            context,
+            str(uuid.uuid4()),
+            apply=False,
+            artifact_set_digest=stage["variant"][
+                "artifact_set_digest"
+            ],
+        )
+        self._failure_code(response, "PREPARATION_AGENT_UNSUPPORTED")
+        self.assertEqual(
+            response.json()["detail"]["details"]["minimum_version"],
+            "0.3.19",
+        )
+        self.assertEqual(
+            response.json()["detail"]["details"]["node_ids"],
+            sorted(item["node_id"] for item in context["enrolled"]),
+        )
+        with self.factory() as session:
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(ArtifactPreparation)
+                ),
+                0,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)), 0
+            )
 
     def test_partial_failure_retries_only_failed_stage_and_fences_old_task(self):
         context = self._seed_accepted_generation("retry", node_count=3)

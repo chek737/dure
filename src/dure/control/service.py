@@ -81,6 +81,7 @@ MODEL_RELEASE_TRANSITIONS = {
     "REVOKED": set(),
 }
 STRICT_RAY_AGENT_VERSION = (0, 3, 18)
+STAGE_ARTIFACT_AGENT_VERSION = (0, 3, 19)
 
 
 def _agent_supports_strict_ray(value: str) -> bool:
@@ -90,6 +91,17 @@ def _agent_supports_strict_ray(value: str) -> bool:
     if matched is None:
         return False
     return tuple(int(part) for part in matched.groups()) >= STRICT_RAY_AGENT_VERSION
+
+
+def _agent_supports_stage_artifact(value: str) -> bool:
+    if type(value) is not str:
+        return False
+    matched = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", value)
+    if matched is None:
+        return False
+    return tuple(int(part) for part in matched.groups()) >= STAGE_ARTIFACT_AGENT_VERSION
+
+
 QUANTIZATIONS = {"awq", "gptq", "fp8", "fp16", "bf16", "int8"}
 GPU_ARCHITECTURES = {"ampere", "ada", "hopper", "blackwell"}
 TOPOLOGIES = {"single-gpu", "pipeline"}
@@ -2066,6 +2078,7 @@ def create_tasks(
             else set()
         )
         strict_ray = False
+        stage_artifact = False
         if type(effective_plan) is dict and "execution_backend" in effective_plan:
             if effective_plan.get("execution_backend") != VLLM_RAY_PP_BACKEND:
                 raise DeploymentRolloutConflictError(
@@ -2089,6 +2102,7 @@ def create_tasks(
                     code="DEPLOYMENT_PLAN_INVALID",
                 ) from exc
             strict_ray = True
+            stage_artifact = effective_plan.get("model_cache_kind") == "STAGE"
         if strict_ray:
             requested = set(dict.fromkeys(node_ids))
             if (
@@ -2143,6 +2157,20 @@ def create_tasks(
                     "strict Ray deployment requires Dure Agent 0.3.18 or newer",
                     code="DEPLOYMENT_STRICT_AGENT_TOO_OLD",
                     details={"node_ids": unsupported},
+                )
+            stage_unsupported = sorted(
+                node_id
+                for node_id in requested
+                if stage_artifact
+                and (node := locked_nodes.get(node_id)) is not None
+                and node.approved
+                and not _agent_supports_stage_artifact(node.agent_version)
+            )
+            if stage_unsupported:
+                raise DeploymentRolloutConflictError(
+                    "stage artifact deployment requires Dure Agent 0.3.19 or newer",
+                    code="DEPLOYMENT_STAGE_AGENT_TOO_OLD",
+                    details={"node_ids": stage_unsupported},
                 )
         for node_id in dict.fromkeys(node_ids):
             node = locked_nodes.get(node_id)

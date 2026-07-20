@@ -786,6 +786,125 @@ def stage_artifact_variant_dict(
     }
 
 
+def validated_stage_artifact_projection(
+    session: Session,
+    artifact_set_digest: str,
+) -> dict:
+    """Return the immutable deployment projection for one validated variant.
+
+    A caller may only select a variant by its exact artifact-set digest.  This
+    helper deliberately performs no latest/preferred lookup and returns no
+    mutable timestamps or evidence history.  It does, however, revalidate the
+    complete stored variant and its latest GPU export/load evidence before
+    exposing any rank manifest to preparation code.  The exact variant row is
+    locked through the caller's transaction so a concurrent REVOKED transition
+    cannot pass a deployment mutation gate after this projection is returned.
+    """
+
+    _require_digest(artifact_set_digest, field="artifact_set_digest")
+    variant = session.scalar(
+        select(StageArtifactVariant)
+        .where(
+            StageArtifactVariant.artifact_set_digest
+            == artifact_set_digest
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if variant is None:
+        raise StageArtifactNotFoundError("stage artifact variant not found")
+
+    _identity, ranks = _validate_stored_variant(session, variant)
+    if (
+        variant.status != "VALIDATED"
+        or variant.validated_at is None
+        or variant.revoked_at is not None
+    ):
+        raise StageArtifactConflictError(
+            "stage artifact variant is not currently VALIDATED"
+        )
+
+    latest = session.scalar(
+        select(StageArtifactValidationEvidence)
+        .where(
+            StageArtifactValidationEvidence.variant_id == artifact_set_digest,
+            StageArtifactValidationEvidence.kind == "GPU_EXPORT_LOAD",
+        )
+        .order_by(
+            StageArtifactValidationEvidence.registration_sequence.desc(),
+            StageArtifactValidationEvidence.identity_digest.desc(),
+        )
+        .limit(1)
+    )
+    if latest is None or latest.status != "PASSED":
+        raise StageArtifactConflictError(
+            "latest GPU export/load validation evidence must be PASSED"
+        )
+    evidence = stage_artifact_evidence_dict(session, latest)
+    expected_evidence_ranks = [
+        {
+            "rank": item.rank,
+            "manifest_digest": item.manifest_digest,
+            "tensor_keys_digest": item.tensor_keys_digest,
+            "loaded_tensor_count": item.tensor_key_count,
+            "loaded_weight_size_bytes": item.weight_size_bytes,
+        }
+        for item in ranks
+    ]
+    if (
+        evidence["kind"] != "GPU_EXPORT_LOAD"
+        or evidence["status"] != "PASSED"
+        or evidence["failure_code"] is not None
+        or evidence["rank_count"] != len(ranks)
+        or evidence["ranks"] != expected_evidence_ranks
+    ):
+        raise StageArtifactConflictError(
+            "latest GPU export/load evidence does not cover every stage rank"
+        )
+
+    projected_ranks: list[dict] = []
+    for item in ranks:
+        manifest = session.get(ArtifactManifest, item.manifest_digest)
+        if manifest is None or manifest.model_artifact_id is not None:
+            raise StageArtifactConflictError(
+                "stored stage manifest is missing or attached"
+            )
+        try:
+            manifest_value = artifact_manifest_dict(session, manifest)
+        except ArtifactManifestConflictError as exc:
+            raise StageArtifactConflictError(
+                "stored stage manifest is internally inconsistent"
+            ) from exc
+        projected_ranks.append(
+            {
+                "rank": item.rank,
+                "pipeline_rank": item.pipeline_rank,
+                "tensor_rank": item.tensor_rank,
+                "manifest_digest": item.manifest_digest,
+                "tensor_key_count": item.tensor_key_count,
+                "tensor_keys_digest": item.tensor_keys_digest,
+                "weight_size_bytes": item.weight_size_bytes,
+                "total_size_bytes": manifest_value["total_size_bytes"],
+                "file_count": manifest_value["file_count"],
+            }
+        )
+
+    return {
+        "artifact_set_digest": variant.artifact_set_digest,
+        "contract_identity_digest": variant.contract_identity_digest,
+        "source_manifest_digest": variant.source_manifest_digest,
+        "runtime_image": variant.runtime_image,
+        "vllm_version": variant.vllm_version,
+        "exporter_build_digest": variant.exporter_build_digest,
+        "architecture": variant.architecture,
+        "quantization": variant.quantization,
+        "tensor_parallel_size": variant.tensor_parallel_size,
+        "pipeline_parallel_size": variant.pipeline_parallel_size,
+        "loader_format": variant.loader_format,
+        "ranks": projected_ranks,
+    }
+
+
 def _canonical_evidence_ranks(
     ranks: list[dict],
     *,

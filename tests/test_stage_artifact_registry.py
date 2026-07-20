@@ -36,7 +36,11 @@ from dure.control.service import (
     create_runtime_release,
     register_artifact_manifest,
 )
-from dure.control.stage_artifacts import StageArtifactConflictError
+from dure.control.stage_artifacts import (
+    StageArtifactConflictError,
+    StageArtifactNotFoundError,
+    validated_stage_artifact_projection,
+)
 from dure.stage_artifact import StageExportContract, TrustedStageBuilder
 
 from .test_stage_builder import SyntheticNativeExporter, _write_source
@@ -208,6 +212,26 @@ class StageArtifactRegistryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["variant"]
 
+    def _create_validated_variant(self) -> dict:
+        variant = self._create_variant()
+        endpoint = (
+            "/v1/admin/stage-artifact-variants/"
+            f"{variant['artifact_set_digest']}"
+        )
+        evidence = self.client.post(
+            endpoint + "/evidence",
+            headers=self.admin,
+            json=self._evidence_body(variant),
+        )
+        self.assertEqual(evidence.status_code, 200, evidence.text)
+        transition = self.client.post(
+            endpoint + "/transition",
+            headers=self.admin,
+            json={"status": "VALIDATED"},
+        )
+        self.assertEqual(transition.status_code, 200, transition.text)
+        return transition.json()["variant"]
+
     def _evidence_body(
         self,
         variant: dict,
@@ -318,6 +342,245 @@ class StageArtifactRegistryTests(unittest.TestCase):
                 )
             )
             self.assertEqual(len(detached), 2)
+
+    def test_validated_projection_is_closed_immutable_and_includes_rank_sizes(self):
+        variant = self._create_validated_variant()
+
+        with self.factory() as session:
+            projection = validated_stage_artifact_projection(
+                session, variant["artifact_set_digest"]
+            )
+            replay = validated_stage_artifact_projection(
+                session, variant["artifact_set_digest"]
+            )
+
+        self.assertEqual(projection, replay)
+        self.assertEqual(
+            set(projection),
+            {
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "loader_format",
+                "ranks",
+            },
+        )
+        self.assertEqual(
+            {
+                key: projection[key]
+                for key in (
+                    "artifact_set_digest",
+                    "contract_identity_digest",
+                    "source_manifest_digest",
+                    "runtime_image",
+                    "vllm_version",
+                    "exporter_build_digest",
+                    "architecture",
+                    "quantization",
+                    "tensor_parallel_size",
+                    "pipeline_parallel_size",
+                    "loader_format",
+                )
+            },
+            {
+                key: variant[key]
+                for key in (
+                    "artifact_set_digest",
+                    "contract_identity_digest",
+                    "source_manifest_digest",
+                    "runtime_image",
+                    "vllm_version",
+                    "exporter_build_digest",
+                    "architecture",
+                    "quantization",
+                    "tensor_parallel_size",
+                    "pipeline_parallel_size",
+                    "loader_format",
+                )
+            },
+        )
+        self.assertEqual([item["rank"] for item in projection["ranks"]], [0, 1])
+        self.assertEqual(
+            [item["total_size_bytes"] for item in projection["ranks"]],
+            [18, 19],
+        )
+        self.assertEqual(
+            [item["file_count"] for item in projection["ranks"]],
+            [5, 5],
+        )
+        for projected, registered in zip(
+            projection["ranks"], variant["stages"], strict=True
+        ):
+            self.assertEqual(
+                set(projected),
+                {
+                    "rank",
+                    "pipeline_rank",
+                    "tensor_rank",
+                    "manifest_digest",
+                    "tensor_key_count",
+                    "tensor_keys_digest",
+                    "weight_size_bytes",
+                    "total_size_bytes",
+                    "file_count",
+                },
+            )
+            for field in (
+                "rank",
+                "pipeline_rank",
+                "tensor_rank",
+                "manifest_digest",
+                "tensor_key_count",
+                "tensor_keys_digest",
+                "weight_size_bytes",
+            ):
+                self.assertEqual(projected[field], registered[field])
+
+    def test_projection_requires_exact_current_validated_variant(self):
+        with self.factory() as session:
+            with self.assertRaises(StageArtifactNotFoundError):
+                validated_stage_artifact_projection(session, _digest("f"))
+            with self.assertRaises(ValueError):
+                validated_stage_artifact_projection(session, "latest")
+
+        draft = self._create_variant()
+        with self.factory() as session:
+            with self.assertRaisesRegex(
+                StageArtifactConflictError, "currently VALIDATED"
+            ):
+                validated_stage_artifact_projection(
+                    session, draft["artifact_set_digest"]
+                )
+
+        endpoint = (
+            "/v1/admin/stage-artifact-variants/"
+            f"{draft['artifact_set_digest']}"
+        )
+        evidence = self.client.post(
+            endpoint + "/evidence",
+            headers=self.admin,
+            json=self._evidence_body(draft),
+        )
+        self.assertEqual(evidence.status_code, 200, evidence.text)
+        validated = self.client.post(
+            endpoint + "/transition",
+            headers=self.admin,
+            json={"status": "VALIDATED"},
+        )
+        self.assertEqual(validated.status_code, 200, validated.text)
+
+        with self.factory() as session:
+            record = session.get(StageArtifactVariant, draft["artifact_set_digest"])
+            self.assertIsNotNone(record)
+            record.validated_at = None
+            with session.no_autoflush:
+                # The mutation gate refreshes the locked row instead of
+                # trusting potentially stale identity-map state.
+                validated_stage_artifact_projection(
+                    session, draft["artifact_set_digest"]
+                )
+            self.assertIsNotNone(record.validated_at)
+            session.rollback()
+
+        with self.factory() as session:
+            latest = session.scalar(
+                select(StageArtifactValidationEvidence)
+                .where(
+                    StageArtifactValidationEvidence.variant_id
+                    == draft["artifact_set_digest"],
+                    StageArtifactValidationEvidence.kind == "GPU_EXPORT_LOAD",
+                )
+                .order_by(
+                    StageArtifactValidationEvidence.registration_sequence.desc()
+                )
+            )
+            self.assertIsNotNone(latest)
+            latest.status = "FAILED"
+            with session.no_autoflush:
+                with self.assertRaisesRegex(
+                    StageArtifactConflictError, "must be PASSED"
+                ):
+                    validated_stage_artifact_projection(
+                        session, draft["artifact_set_digest"]
+                    )
+            session.rollback()
+
+        revoked = self.client.post(
+            endpoint + "/transition",
+            headers=self.admin,
+            json={"status": "REVOKED"},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        with self.factory() as session:
+            with self.assertRaisesRegex(
+                StageArtifactConflictError, "currently VALIDATED"
+            ):
+                validated_stage_artifact_projection(
+                    session, draft["artifact_set_digest"]
+                )
+
+    def test_projection_rejects_incomplete_evidence_and_corrupt_manifest(self):
+        variant = self._create_validated_variant()
+
+        with self.factory() as session:
+            latest = session.scalar(
+                select(StageArtifactValidationEvidence)
+                .where(
+                    StageArtifactValidationEvidence.variant_id
+                    == variant["artifact_set_digest"],
+                    StageArtifactValidationEvidence.kind == "GPU_EXPORT_LOAD",
+                )
+                .order_by(
+                    StageArtifactValidationEvidence.registration_sequence.desc()
+                )
+            )
+            self.assertIsNotNone(latest)
+            evidence_rank = session.scalar(
+                select(StageArtifactValidationRank).where(
+                    StageArtifactValidationRank.evidence_id
+                    == latest.identity_digest,
+                    StageArtifactValidationRank.rank == 1,
+                )
+            )
+            self.assertIsNotNone(evidence_rank)
+            session.delete(evidence_rank)
+            session.flush()
+            with self.assertRaisesRegex(
+                StageArtifactConflictError,
+                "validation ranks are inconsistent",
+            ):
+                validated_stage_artifact_projection(
+                    session, variant["artifact_set_digest"]
+                )
+            session.rollback()
+
+        with self.factory() as session:
+            stage_rank = session.scalar(
+                select(StageArtifactRank).where(
+                    StageArtifactRank.variant_id == variant["artifact_set_digest"],
+                    StageArtifactRank.rank == 0,
+                )
+            )
+            self.assertIsNotNone(stage_rank)
+            manifest = session.get(ArtifactManifest, stage_rank.manifest_digest)
+            self.assertIsNotNone(manifest)
+            manifest.total_size_bytes += 1
+            with session.no_autoflush:
+                with self.assertRaisesRegex(
+                    StageArtifactConflictError,
+                    "manifest is internally inconsistent",
+                ):
+                    validated_stage_artifact_projection(
+                        session, variant["artifact_set_digest"]
+                    )
+            session.rollback()
 
     def test_trusted_builder_registration_payload_is_accepted_without_adapter_logic(self):
         with tempfile.TemporaryDirectory() as temporary:
