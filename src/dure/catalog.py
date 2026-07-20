@@ -30,6 +30,8 @@ class CatalogEntry:
     placement: PlacementProfile
     quality_rank: int
     artifact_revision: str | None = None
+    candidate_id: str | None = None
+    gpu_architectures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

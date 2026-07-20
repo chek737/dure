@@ -11,11 +11,12 @@ from .models import GPUProfile, NodeProfile
 @dataclass(frozen=True)
 class InventoryNode:
     node_id: str
-    profile: NodeProfile
+    profile: NodeProfile | None
     approved: bool
     online: bool
     profile_fresh: bool
     network_verified: bool
+    profile_error: str | None = None
 
     @classmethod
     def local(cls, profile: NodeProfile, *, network_verified: bool = False) -> "InventoryNode":
@@ -41,6 +42,7 @@ class Rejection:
 
 @dataclass(frozen=True)
 class CandidateEvaluation:
+    candidate_id: str
     model_id: str
     placement_profile_id: str
     quality_rank: int
@@ -50,6 +52,7 @@ class CandidateEvaluation:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "candidate_id": self.candidate_id,
             "model_id": self.model_id,
             "placement_profile_id": self.placement_profile_id,
             "quality_rank": self.quality_rank,
@@ -64,6 +67,7 @@ class ModelRecommendation:
     catalog_version: str
     policy_version: str
     inventory_fingerprint: str
+    selected_candidate_id: str | None
     selected_model_id: str | None
     selected_node_ids: tuple[str, ...]
     evaluations: tuple[CandidateEvaluation, ...]
@@ -73,6 +77,7 @@ class ModelRecommendation:
             "catalog_version": self.catalog_version,
             "policy_version": self.policy_version,
             "inventory_fingerprint": self.inventory_fingerprint,
+            "selected_candidate_id": self.selected_candidate_id,
             "selected_model_id": self.selected_model_id,
             "selected_node_ids": list(self.selected_node_ids),
             "evaluations": [item.to_dict() for item in self.evaluations],
@@ -98,7 +103,8 @@ def inventory_fingerprint(nodes: list[InventoryNode]) -> str:
             "online": node.online,
             "profile_fresh": node.profile_fresh,
             "network_verified": node.network_verified,
-            "profile": canonical(node.profile.to_dict()),
+            "profile_error": node.profile_error,
+            "profile": canonical(node.profile.to_dict()) if node.profile else None,
         }
         for node in sorted(nodes, key=lambda item: item.node_id)
     ]
@@ -116,7 +122,7 @@ def _best_gpu(node: InventoryNode, minimum_mib: int) -> GPUProfile | None:
 
 
 def _has_cached_model(node: InventoryNode, entry: CatalogEntry) -> bool:
-    if entry.artifact_revision is None:
+    if entry.artifact_revision is None or node.profile is None:
         return False
     return any(
         model.complete
@@ -125,6 +131,24 @@ def _has_cached_model(node: InventoryNode, entry: CatalogEntry) -> bool:
         and model.quantization == entry.model.quantization
         for model in node.profile.installed_models
     )
+
+
+def _gpu_architecture(compute_capability: str | None) -> str | None:
+    if compute_capability is None:
+        return None
+    try:
+        major, minor = (int(part) for part in compute_capability.split(".", 1))
+    except (TypeError, ValueError):
+        return None
+    if major >= 10:
+        return "blackwell"
+    if major == 9:
+        return "hopper"
+    if major == 8 and minor >= 9:
+        return "ada"
+    if major == 8:
+        return "ampere"
+    return None
 
 
 def _compute_capability_at_least(actual: str | None, minimum: str | None) -> bool:
@@ -150,10 +174,13 @@ def _evaluate(
     available: list[tuple[InventoryNode, GPUProfile]] = []
     pending: list[str] = []
     offline: list[str] = []
+    missing_profile: list[str] = []
+    invalid_profile: list[str] = []
     stale: list[str] = []
     insufficient_gpu: list[str] = []
     missing_driver: list[str] = []
     unsupported_compute: list[str] = []
+    unsupported_runtime_arch: list[str] = []
     insufficient_disk: list[str] = []
     missing_runtime: list[str] = []
     missing_network: list[str] = []
@@ -165,6 +192,12 @@ def _evaluate(
             continue
         if not node.online:
             offline.append(node_id)
+            continue
+        if node.profile is None:
+            if node.profile_error == "invalid":
+                invalid_profile.append(node_id)
+            else:
+                missing_profile.append(node_id)
             continue
         if not node.profile_fresh:
             stale.append(node_id)
@@ -180,6 +213,12 @@ def _evaluate(
             gpu.compute_capability, placement.min_compute_capability
         ):
             unsupported_compute.append(node_id)
+            continue
+        if (
+            entry.gpu_architectures
+            and _gpu_architecture(gpu.compute_capability) not in entry.gpu_architectures
+        ):
+            unsupported_runtime_arch.append(node_id)
             continue
         if node.profile.disk_free_mib < placement.min_disk_free_mib:
             insufficient_disk.append(node_id)
@@ -212,6 +251,22 @@ def _evaluate(
     )
     selected = tuple(item[0].node_id for item in available[: placement.node_count])
     rejections: list[Rejection] = []
+    if missing_profile:
+        rejections.append(
+            Rejection(
+                "PROFILE_MISSING",
+                f"stored profile is missing: {', '.join(missing_profile)}",
+                tuple(missing_profile),
+            )
+        )
+    if invalid_profile:
+        rejections.append(
+            Rejection(
+                "PROFILE_INVALID",
+                f"stored profile is invalid: {', '.join(invalid_profile)}",
+                tuple(invalid_profile),
+            )
+        )
     for code, label, node_ids in (
         ("NODE_PENDING", "승인되지 않은 노드", pending),
         ("NODE_OFFLINE", "오프라인 노드", offline),
@@ -239,6 +294,15 @@ def _evaluate(
                 f"최소 compute capability {placement.min_compute_capability}를 충족하지 못한 노드: "
                 f"{', '.join(unsupported_compute)}",
                 tuple(unsupported_compute),
+            )
+        )
+    if unsupported_runtime_arch:
+        rejections.append(
+            Rejection(
+                "RUNTIME_GPU_ARCH",
+                "runtime does not support the GPU architecture on node(s): "
+                f"{', '.join(unsupported_runtime_arch)}",
+                tuple(unsupported_runtime_arch),
             )
         )
     if insufficient_disk:
@@ -269,6 +333,8 @@ def _evaluate(
     else:
         rejections = []
     return CandidateEvaluation(
+        candidate_id=entry.candidate_id
+        or f"local:{entry.model.model_id}:{entry.placement.profile_id}",
         model_id=entry.model.model_id,
         placement_profile_id=placement.profile_id,
         quality_rank=entry.quality_rank,
@@ -296,7 +362,14 @@ def recommend_model(
             entries = [catalog.entry(model_id)]
         except KeyError as exc:
             raise ValueError(f"unknown model: {model_id}") from exc
-    entries.sort(key=lambda entry: (-entry.quality_rank, entry.model.model_id))
+    entries.sort(
+        key=lambda entry: (
+            -entry.quality_rank,
+            entry.model.model_id,
+            entry.candidate_id or "",
+            entry.placement.profile_id,
+        )
+    )
     evaluations = tuple(
         _evaluate(entry, nodes, allow_unverified_network=allow_unverified_network)
         for entry in entries
@@ -306,6 +379,7 @@ def recommend_model(
         catalog_version=catalog.version,
         policy_version=catalog.policy_version,
         inventory_fingerprint=inventory_fingerprint(nodes),
+        selected_candidate_id=selected.candidate_id if selected else None,
         selected_model_id=selected.model_id if selected else None,
         selected_node_ids=selected.node_ids if selected else (),
         evaluations=evaluations,
