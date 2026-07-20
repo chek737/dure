@@ -1,3 +1,11 @@
+dure (0.3.20) UNRELEASED; urgency=medium
+
+  * 추천 시 정확한 STAGE 또는 FULL 전달 방식을 선택하고 세대에 고정합니다.
+  * 노드 아티팩트 캐시 상태, 검증 게이트와 추가 전용 감사 이력을 추가합니다.
+  * 참조를 확인하는 명시적 캐시 격리와 롤백 직전 재검사를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 12:00:00 +0900
+
 dure (0.3.19) UNRELEASED; urgency=medium
 
   * 검증된 stage variant의 pipeline rank별 다운로드와 원자적 캐시 활성화를 추가합니다.
