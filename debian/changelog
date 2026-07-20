@@ -1,3 +1,11 @@
+dure (0.3.17) UNRELEASED; urgency=medium
+
+  * vLLM 단계 아티팩트 variant와 rank별 불변 매니페스트를 추가합니다.
+  * 신뢰된 오프라인 빌더 계약과 단계 아티팩트 검증·승격 게이트를 추가합니다.
+  * 검증되지 않은 런타임, 토폴로지와 불완전한 rank 구성을 실패 안전하게 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 04:20:00 +0900
+
 dure (0.3.16) UNRELEASED; urgency=medium
 
   * 추천 배포 세대의 모델과 이미지를 명시적으로 준비하는 중앙 작업을 추가합니다.
