@@ -4,47 +4,11 @@ import re
 import time
 from dataclasses import replace
 
+from .catalog import STATIC_CATALOG
 from .models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
 
 
-MODELS: dict[str, ModelSpec] = {
-    "qwen2.5-7b-awq": ModelSpec(
-        model_id="qwen2.5-7b-awq",
-        repository="Qwen/Qwen2.5-7B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=4.8,
-        min_gpu_memory_gib=8,
-        default_max_model_len=8192,
-        layer_count=28,
-    ),
-    "qwen2.5-14b-awq": ModelSpec(
-        model_id="qwen2.5-14b-awq",
-        repository="Qwen/Qwen2.5-14B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=9.5,
-        min_gpu_memory_gib=12,
-        default_max_model_len=8192,
-        layer_count=48,
-    ),
-    "qwen2.5-32b-awq": ModelSpec(
-        model_id="qwen2.5-32b-awq",
-        repository="Qwen/Qwen2.5-32B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=19.5,
-        min_gpu_memory_gib=24,
-        default_max_model_len=4096,
-        layer_count=64,
-    ),
-    "qwen2.5-72b-awq": ModelSpec(
-        model_id="qwen2.5-72b-awq",
-        repository="Qwen/Qwen2.5-72B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=38.74,
-        min_gpu_memory_gib=24,
-        default_max_model_len=8192,
-        layer_count=80,
-    ),
-}
+MODELS: dict[str, ModelSpec] = STATIC_CATALOG.models
 
 
 def _gpu_for(profile: NodeProfile, gpu_index: int):
