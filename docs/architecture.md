@@ -15,7 +15,7 @@ Dure는 세 개의 협력 계층으로 구성됩니다.
 ```
 
 - 로컬 CLI는 중앙 관리 없이도 하드웨어를 조사하고 배포 계획을 만들고 적용·검증할 수 있습니다.
-- 중앙 제어면은 노드 프로필, 관측·희망 상태, 추천·인벤토리 스냅샷, 배포 세대, 작업, 모델 레지스트리·벤치마크 증적, 자격 증명과 감사 이벤트를 저장합니다.
+- 중앙 제어면은 노드 프로필, 관측·희망 상태, 추천·인벤토리 스냅샷, 배포 세대, 작업, 모델·stage variant 레지스트리와 검증 증적, 자격 증명과 감사 이벤트를 저장합니다.
 - root 권한 에이전트는 중앙 제어면에 외부 방향 폴링으로 연결하고, 미리 정의된 Python 작업만 실행합니다.
 - Ray는 신뢰된 포드 내부의 분산 실행 수단이며, 등록·인증·보안 경계가 아닙니다.
 
@@ -66,6 +66,32 @@ production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 
 로컬 상태는 `부분 다운로드 → 검증 CAS → assembling → marker-last 검증 staging → no-replace final` 순서로만 전진합니다. 다운로드·조립 중단은 결정적 부분 파일에서 재개합니다. 잘못된 CAS, 예상 밖 entry, symlink·hardlink·special file, marker·양자화 불일치와 기존 final 충돌은 보존한 채 실패하며 자동 재귀 삭제나 캐시 퇴출을 하지 않습니다. 반복 실패가 staging 디렉터리를 계속 늘리지 않도록 매니페스트마다 조립 영역을 하나만 사용합니다. 로컬 저널은 마지막 시도 상태일 뿐 중앙 진행률이나 `READY` 증적이 아닙니다. 특히 공유 CAS 청크는 전역 미참조를 증명할 수 없으면 수동으로 옮기거나 삭제해서는 안 되며, 감사 가능한 quarantine 명령은 후속 범위입니다.
 
 패키지는 root Agent의 캐시 경계를 중앙 서버 계정과 분리합니다. `/var/lib/dure`는 `root:dure`의 비쓰기 부모이고 중앙 서버의 로컬 쓰기 상태는 `/var/lib/dure/server`에 둡니다. 준비기는 설정 루트의 가장 가까운 기존 조상부터 생성한 루트까지 소유권·쓰기 권한·symlink를 검사합니다. 인벤토리와 벤치마크는 `/var/lib/dure/models` 루트와 캐시 후보·`config.json`·marker를 현재 Agent 사용자 소유의 비쓰기 일반 항목으로 각각 검사하며, 상위 `/var/lib/dure`까지 같은 검사를 반복하지는 않습니다. Hugging Face inventory의 표준 snapshot→repository `blobs` 링크는 읽기 호환성을 유지하지만 자동 벤치마크의 검증 캐시가 되지는 않습니다.
+
+## 현재 stage artifact 생성·등록 계층
+
+0.3.17에는 검증된 `FULL_SNAPSHOT`을 pipeline rank별 vLLM `sharded_state`로 내보내는 신뢰된 오프라인 빌더와 중앙 variant 레지스트리가 있습니다. 이 빌더는 Agent task가 아니며 커뮤니티 GPU 노드에서 중앙 지시로 실행되지 않습니다.
+
+```text
+정규 매니페스트로 검증된 FULL_SNAPSHOT
+        ↓ digest 고정 오프라인 빌더 런타임
+vLLM 0.9.0 / V0 / Qwen2ForCausalLM / AWQ / TP=1
+        ↓ worker 내부의 네이티브 sharded-state 저장
+stages/<pp-rank>별 파일과 정규 매니페스트
+        ↓ 전체 rank를 원자적으로 결합
+DRAFT variant
+        ↓ 실제 GPU_EXPORT_LOAD / PASSED
+VALIDATED ── 운영자 철회 ──> REVOKED
+```
+
+vLLM 0.9.0의 sharded-state 파일명 rank는 PP rank가 아니라 TP rank입니다. 현재 `TP=1`에서는 모든 PP worker가 `model-rank-0-*`를 사용하므로 공용 출력 디렉터리는 충돌과 덮어쓰기 위험이 있습니다. 각 worker는 자신의 pipeline rank를 확인하고 `stages/<pp-rank>` 아래에만 저장합니다. Dure의 `layer_start`·`layer_end`로 원본 파일을 임의 분할하지 않습니다.
+
+variant identity는 원본 매니페스트, 런타임 OCI 다이제스트, vLLM 버전, exporter 빌드 다이제스트, 아키텍처·양자화, TP·PP, loader 형식과 rank 순서의 stage 매니페스트를 결합합니다. 누락·중복·범위 밖 rank, topology 불일치와 같은 고정 입력에서 달라진 stage 출력은 거부합니다. remote code, LoRA·adapter, MoE, 멀티모달과 임의 아키텍처도 지원하지 않습니다.
+
+등록은 실제 실행 가능성 증명이 아닙니다. synthetic 검사는 구조·tensor coverage·결정성을 검사하지만 승격할 수 없고, 정확한 variant를 실제 GPU에서 export하고 다시 load한 최신 `GPU_EXPORT_LOAD/PASSED` 증적만 `DRAFT → VALIDATED`를 허용합니다. 전제 조건 부족을 뜻하는 `NOT_RUN`과 실패는 DRAFT 승격을 차단합니다. canonical UUIDv4 validation run의 새 증적은 `DRAFT`에서만 추가합니다. 등록된 동일 run의 정확한 재전송은 상태 전환 뒤에도 멱등 반환하지만, `VALIDATED`와 `REVOKED`에는 새 run을 추가하지 못합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 닫고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. 번들 acceptance harness의 native load 범위는 `PP=1`뿐이므로 PP>1은 모든 rank를 검증하는 별도 신뢰 증적이 없으면 `DRAFT`로 유지합니다.
+
+이 PR의 추천기, 중앙 준비 operation, Agent와 런타임은 stage variant를 아직 소비하지 않습니다. 노드에는 계속 전체 `FULL_SNAPSHOT`을 준비합니다. 빌드·등록·검증 실패는 deployment나 task를 만들지 않고 기존 컨테이너를 변경하지 않습니다. rank별 다운로드, `STAGE` 캐시의 원자적 활성화, 배포 세대와 rank 증적 결합은 후속 PR 범위입니다. 상세 계약은 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
+
+빌더의 vLLM·PyTorch·safetensors·CUDA 계열 의존성은 기본 Debian 패키지에 포함하지 않습니다. 운영 Agent·중앙 서버와 분리한 digest 고정 OCI 환경에서만 heavy dependency를 설치합니다.
 
 ## 현재 모델 자격 검증 흐름
 
@@ -172,6 +198,8 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 
 `BENCHMARK`는 일반 작업 생성 API에서 만들 수 없습니다. 관리자 준비 API가 릴리스·배치·노드·인벤토리·작업 부하를 고정한 뒤, 별도 적용 API가 정확히 한 작업을 만듭니다. 페이로드는 suite, 정책, 모델·이미지 식별자, 고정 작업 부하 수치와 `apply=true`만 허용하고 셸 명령, Docker 인자, 환경 변수, 마운트, 프롬프트 또는 호스트 경로를 받지 않습니다. 노드는 한 번에 하나의 임대 작업만 처리하는 기존 직렬화 규칙을 그대로 따릅니다.
 
+stage builder는 이 중앙 작업 열거형에 속하지 않습니다. 신뢰된 오프라인 환경에서만 실행하며, variant 등록·증적 기록·상태 전이는 중앙 DB 작업일 뿐 Agent 작업이나 호스트 변경 권한이 아닙니다.
+
 계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
 
 ## 신뢰 경계
@@ -180,6 +208,7 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 - 관리자 전달자 자격 증명과 노드 자격 증명은 다른 권한을 가집니다.
 - 토큰 없는 등록은 대기 상태 하트비트 권한만 주며 실행 권한을 주지 않습니다.
 - 에이전트는 Docker와 `/var/lib/dure`를 관리하므로 root로 실행됩니다. 중앙 제어면이 일반 원격 셸이 되지 않도록 작업 언어는 폐쇄형입니다.
+- stage builder는 digest 고정 별도 환경에 격리하고 remote code·adapter·임의 아키텍처를 거부합니다. 기본 Agent 패키지에 빌더 heavy dependency를 설치하지 않습니다.
 - GPU 호스트 운영자는 로컬 작업 부하를 관찰할 수 있습니다. 더 강한 기밀 컴퓨팅 경계가 생기기 전에는 민감 프롬프트나 비밀값을 커뮤니티 노드에서 처리하면 안 됩니다.
 
 운영 절차는 [operations.md](operations.md), 위협 모델과 보안 강화 작업 목록은 [security.md](security.md)를 참고합니다.
