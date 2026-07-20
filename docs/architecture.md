@@ -15,7 +15,7 @@ Dure는 세 개의 협력 계층으로 구성됩니다.
 ```
 
 - 로컬 CLI는 중앙 관리 없이도 하드웨어를 조사하고 배포 계획을 만들고 적용·검증할 수 있습니다.
-- 중앙 제어면은 노드 프로필, 관측·희망 상태, 추천·인벤토리 스냅샷, 배포 세대, 작업, 모델 레지스트리·벤치마크 증적, 자격 증명과 감사 이벤트를 저장합니다.
+- 중앙 제어면은 노드 프로필, 관측·희망 상태, 추천·인벤토리 스냅샷, 배포 세대, 작업, 모델·stage variant 레지스트리와 검증 증적, 자격 증명과 감사 이벤트를 저장합니다.
 - root 권한 에이전트는 중앙 제어면에 외부 방향 폴링으로 연결하고, 미리 정의된 Python 작업만 실행합니다.
 - Ray는 신뢰된 포드 내부의 분산 실행 수단이며, 등록·인증·보안 경계가 아닙니다.
 
@@ -44,6 +44,54 @@ DISCOVERED → PROBING → ELIGIBLE → PLANNED → DOWNLOADING
 컨테이너 명령, 환경 변수, 마운트 내용, 자격 증명, 프롬프트는 수집하지 않습니다. 운영자 CLI는 `GET /v1/admin/inventory` 결과를 읽고, 운영자 컴퓨터의 `codex exec`를 빈 임시 디렉터리와 읽기 전용 샌드박스에서 실행합니다. 이 진단은 참고용이며 배포 구성 생성이나 새 에이전트 작업 유형 전송 권한이 없습니다.
 
 CPU 전용 노드는 중앙 제어면, 게이트웨이, 아티팩트 캐시, 관측성, 대기열, 전처리 같은 보조 역할의 후보가 될 수 있습니다. 현재 Dure 런타임은 GPU 노드가 Ray head여야 하며 CPU 노드에는 모델 레이어를 배정하지 않습니다.
+
+## 현재 로컬 모델 캐시와 중앙 준비 계층
+
+`0.3.16`에는 정규 아티팩트 매니페스트를 로컬 `FULL_SNAPSHOT` 캐시로 materialize하는 노드 라이브러리와 이를 호출하는 중앙 준비 operation·관리자 CLI·Agent 작업이 있습니다. 추천과 수락은 여전히 호스트를 바꾸지 않으며, 운영자가 같은 준비 요청에 명시적으로 `--apply`를 지정한 뒤에만 `PREPARE_MODEL → PREPARE_IMAGE` 작업이 실행됩니다. GPU 노드 추가만으로 준비를 자동 시작하지 않습니다.
+
+```text
+정규 매니페스트 + 검증된 TrustedHTTPSOrigin 객체
+                    ↓ 경로·크기·응답 계약 검사
+        SHA-256 청크 CAS와 재개 가능한 .part
+                    ↓ 청크별·매니페스트별 잠금
+       digest별 고정 staging과 파일별 부분 조립
+                    ↓ 전체 파일·config·트리 재검증
+          v2 marker를 마지막에 기록·fsync
+                    ↓ no-replace 원자적 rename
+             검증된 FULL_SNAPSHOT 캐시
+```
+
+production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 활성 캐시와 숨은 staging은 `/var/lib/dure/models` 아래의 고정 경로를 사용합니다. 매니페스트 다이제스트가 캐시와 staging 이름을 결정하고 원격 task 입력은 호스트 경로를 지정하지 않습니다. 내부 `ContentAddressedModelStore` 생성자는 테스트와 로컬 임베딩을 위한 명시적 루트 override를 허용하지만 이를 원격 payload와 연결하면 안 됩니다. Agent handler는 노드 로컬 `artifact_origin` 신뢰 설정에서만 `TrustedHTTPSOrigin`을 구성하고 작업 payload의 URL·host·header·token을 거부합니다. 같은 매니페스트의 실행은 하나의 artifact lock으로 직렬화하고, 여러 매니페스트가 공유하는 청크는 chunk lock과 전체 SHA-256 검사 뒤 재사용합니다.
+
+로컬 상태는 `부분 다운로드 → 검증 CAS → assembling → marker-last 검증 staging → no-replace final` 순서로만 전진합니다. 다운로드·조립 중단은 결정적 부분 파일에서 재개합니다. 잘못된 CAS, 예상 밖 entry, symlink·hardlink·special file, marker·양자화 불일치와 기존 final 충돌은 보존한 채 실패하며 자동 재귀 삭제나 캐시 퇴출을 하지 않습니다. 반복 실패가 staging 디렉터리를 계속 늘리지 않도록 매니페스트마다 조립 영역을 하나만 사용합니다. 로컬 저널은 마지막 시도 상태일 뿐 중앙 진행률이나 `READY` 증적이 아닙니다. 특히 공유 CAS 청크는 전역 미참조를 증명할 수 없으면 수동으로 옮기거나 삭제해서는 안 되며, 감사 가능한 quarantine 명령은 후속 범위입니다.
+
+패키지는 root Agent의 캐시 경계를 중앙 서버 계정과 분리합니다. `/var/lib/dure`는 `root:dure`의 비쓰기 부모이고 중앙 서버의 로컬 쓰기 상태는 `/var/lib/dure/server`에 둡니다. 준비기는 설정 루트의 가장 가까운 기존 조상부터 생성한 루트까지 소유권·쓰기 권한·symlink를 검사합니다. 인벤토리와 벤치마크는 `/var/lib/dure/models` 루트와 캐시 후보·`config.json`·marker를 현재 Agent 사용자 소유의 비쓰기 일반 항목으로 각각 검사하며, 상위 `/var/lib/dure`까지 같은 검사를 반복하지는 않습니다. Hugging Face inventory의 표준 snapshot→repository `blobs` 링크는 읽기 호환성을 유지하지만 자동 벤치마크의 검증 캐시가 되지는 않습니다.
+
+## 현재 stage artifact 생성·등록 계층
+
+0.3.17에는 검증된 `FULL_SNAPSHOT`을 pipeline rank별 vLLM `sharded_state`로 내보내는 신뢰된 오프라인 빌더와 중앙 variant 레지스트리가 있습니다. 이 빌더는 Agent task가 아니며 커뮤니티 GPU 노드에서 중앙 지시로 실행되지 않습니다.
+
+```text
+정규 매니페스트로 검증된 FULL_SNAPSHOT
+        ↓ digest 고정 오프라인 빌더 런타임
+vLLM 0.9.0 / V0 / Qwen2ForCausalLM / AWQ / TP=1
+        ↓ worker 내부의 네이티브 sharded-state 저장
+stages/<pp-rank>별 파일과 정규 매니페스트
+        ↓ 전체 rank를 원자적으로 결합
+DRAFT variant
+        ↓ 실제 GPU_EXPORT_LOAD / PASSED
+VALIDATED ── 운영자 철회 ──> REVOKED
+```
+
+vLLM 0.9.0의 sharded-state 파일명 rank는 PP rank가 아니라 TP rank입니다. 현재 `TP=1`에서는 모든 PP worker가 `model-rank-0-*`를 사용하므로 공용 출력 디렉터리는 충돌과 덮어쓰기 위험이 있습니다. 각 worker는 자신의 pipeline rank를 확인하고 `stages/<pp-rank>` 아래에만 저장합니다. Dure의 `layer_start`·`layer_end`로 원본 파일을 임의 분할하지 않습니다.
+
+variant identity는 원본 매니페스트, 런타임 OCI 다이제스트, vLLM 버전, exporter 빌드 다이제스트, 아키텍처·양자화, TP·PP, loader 형식과 rank 순서의 stage 매니페스트를 결합합니다. 누락·중복·범위 밖 rank, topology 불일치와 같은 고정 입력에서 달라진 stage 출력은 거부합니다. remote code, LoRA·adapter, MoE, 멀티모달과 임의 아키텍처도 지원하지 않습니다.
+
+등록은 실제 실행 가능성 증명이 아닙니다. synthetic 검사는 구조·tensor coverage·결정성을 검사하지만 승격할 수 없고, 정확한 variant를 실제 GPU에서 export하고 다시 load한 최신 `GPU_EXPORT_LOAD/PASSED` 증적만 `DRAFT → VALIDATED`를 허용합니다. 전제 조건 부족을 뜻하는 `NOT_RUN`과 실패는 DRAFT 승격을 차단합니다. canonical UUIDv4 validation run의 새 증적은 `DRAFT`에서만 추가합니다. 등록된 동일 run의 정확한 재전송은 상태 전환 뒤에도 멱등 반환하지만, `VALIDATED`와 `REVOKED`에는 새 run을 추가하지 못합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 닫고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. 번들 acceptance harness의 native load 범위는 `PP=1`뿐이므로 PP>1은 모든 rank를 검증하는 별도 신뢰 증적이 없으면 `DRAFT`로 유지합니다.
+
+이 PR의 추천기, 중앙 준비 operation, Agent와 런타임은 stage variant를 아직 소비하지 않습니다. 노드에는 계속 전체 `FULL_SNAPSHOT`을 준비합니다. 빌드·등록·검증 실패는 deployment나 task를 만들지 않고 기존 컨테이너를 변경하지 않습니다. rank별 다운로드, `STAGE` 캐시의 원자적 활성화, 배포 세대와 rank 증적 결합은 후속 PR 범위입니다. 상세 계약은 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
+
+빌더의 vLLM·PyTorch·safetensors·CUDA 계열 의존성은 기본 Debian 패키지에 포함하지 않습니다. 운영 Agent·중앙 서버와 분리한 digest 고정 OCI 환경에서만 heavy dependency를 설치합니다.
 
 ## 현재 모델 자격 검증 흐름
 
@@ -120,7 +168,7 @@ VERIFY_TARGET
 
 새 Ray·API 컨테이너에는 `dure.deployment`, `dure.generation`, `dure.node` 레이블을 모두 기록합니다. 시작·검증·중지는 예상 배포 ID, 세대와 노드 ID를 다시 검사하며 하나라도 다른 컨테이너는 조작하지 않습니다. 0.3.12 이전에 만든 컨테이너는 `dure.node` 레이블이 없을 수 있어, 이 경우에만 정확한 배포 ID와 세대가 모두 일치할 때 제한적으로 기존 컨테이너로 인정합니다. 이미 존재하는 노드 레이블이 다르거나 배포·세대 레이블이 없거나 다르면 항상 거부합니다.
 
-추천기는 모델의 이름·크기만 비교하지 않고 GPU VRAM, 드라이버·연산 능력·런타임 지원 아키텍처, 디스크, 모델 아티팩트, 런타임 이미지, 컨텍스트·동시성, 네트워크/NCCL 조건을 평가합니다. 구조화된 네트워크·NCCL 증적 저장과 승격 판정은 구현됐지만, 추천기가 이를 노드 조합 적격성 입력으로 조회하는 연계와 자동 다중 노드 시험은 아직 구현되지 않았습니다. 따라서 중앙 다중 노드 후보는 실패 안전 방식으로 거부됩니다. 현재 계획 전송 형식으로 안전하게 표현할 수 없는 TP 계열 배치도 수락 단계에서 거부합니다. 세대별 상태와 롤백은 전체 작업 부하 매트릭스, 네트워크·NCCL 시험 또는 24시간 복구 수용 검사를 새로 수행하지 않으므로 이 제한을 해제하지 않습니다. 모델 레지스트리, 아티팩트 검증, 세대별 단계적 전환의 상세 정책은 [모델 선택 정책](model-selection.md)과 [벤치마크 문서](benchmarking.md)를 따릅니다.
+추천기는 모델의 이름·크기만 비교하지 않고 GPU VRAM, 드라이버·연산 능력·런타임 지원 아키텍처, 디스크, 모델 아티팩트, 런타임 이미지, 컨텍스트·동시성, 네트워크/NCCL 조건을 평가합니다. 중앙 다중 노드 후보는 정확히 정렬된 노드 UUID 집합·릴리스·배치 프로필·런타임·현재 인벤토리 지문에 결합된 최신 `PASSED` 네트워크·NCCL 증적을 적격성 입력으로 조회합니다. 증적이 없거나 오래됐거나 다른 조합에 속하거나, 그 뒤에 실패·취소·진행 중 실행이 있으면 실패 안전 방식으로 거부합니다. 다만 Dure가 네트워크·NCCL 시험 자체를 다중 노드에서 자동 실행하는 기능은 아직 구현되지 않았습니다. 현재 계획 전송 형식으로 안전하게 표현할 수 없는 TP 계열 배치도 수락 단계에서 거부합니다. 세대별 상태와 롤백은 전체 작업 부하 매트릭스, 네트워크·NCCL 시험 또는 24시간 복구 수용 검사를 새로 수행하지 않으므로 이 제한을 해제하지 않습니다. 모델 레지스트리, 아티팩트 검증, 세대별 단계적 전환의 상세 정책은 [모델 선택 정책](model-selection.md)과 [벤치마크 문서](benchmarking.md)를 따릅니다.
 
 Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해석할 수 있는 참고 보고서로 유지합니다.
 
@@ -130,11 +178,17 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 
 - `PROBE`
 - `BENCHMARK`
+- `PREPARE_MODEL`
+- `PREPARE_IMAGE`
 - `VERIFY`
 - `APPLY_DEPLOYMENT`
 - `START_DEPLOYMENT`
 - `STOP_DEPLOYMENT`
 - `RESTART_DEPLOYMENT`
+
+`PREPARE_MODEL`과 `PREPARE_IMAGE`는 일반 작업 생성 API로 만들 수 없습니다. 추천을 수락해 만든 세대에 대해 관리자 전용 deployment 준비 API가 먼저 불변 preview를 저장하고, 같은 요청에 명시적으로 `apply=true`를 지정한 뒤에만 노드별 모델 작업을 만듭니다. 모델 해시와 marker 검증이 성공한 노드에만 다이제스트 고정 이미지 작업을 이어서 만들며, 실패 시에는 성공한 단계를 보존하고 실패한 현재 단계만 새 시도 번호로 재시도합니다. 모든 노드의 두 단계가 성공해야 콘텐츠 주소 final 경로를 세대 plan에 주입해 일반 apply가 소비할 수 있습니다. 롤백은 과거의 정확한 성공 증적과 로컬 캐시·이미지만 사용하고 새 준비 작업이나 네트워크 복구를 만들지 않습니다.
+
+`POST /v1/admin/benchmark-runs/prepare`는 이 아티팩트 준비 API와 별개입니다. 벤치마크 실행 문맥만 고정하고 모델 바이트를 준비하지 않으며, 적용 시 대상 노드에 배포·준비·다른 벤치마크 작업이 있으면 실패 안전 방식으로 거부합니다.
 
 에이전트는 HTTPS 폴링으로 한 번에 하나의 작업을 5분 임대로 요청하고 실행 중 임대를 갱신합니다. 완료한 작업 ID와 결과는 로컬에 보관하므로 재전달된 작업은 가능한 한 변경을 반복하지 않고 이전 결과를 보고합니다. PostgreSQL 노드 행 잠금은 같은 노드의 요청을 직렬화합니다.
 
@@ -144,6 +198,8 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 
 `BENCHMARK`는 일반 작업 생성 API에서 만들 수 없습니다. 관리자 준비 API가 릴리스·배치·노드·인벤토리·작업 부하를 고정한 뒤, 별도 적용 API가 정확히 한 작업을 만듭니다. 페이로드는 suite, 정책, 모델·이미지 식별자, 고정 작업 부하 수치와 `apply=true`만 허용하고 셸 명령, Docker 인자, 환경 변수, 마운트, 프롬프트 또는 호스트 경로를 받지 않습니다. 노드는 한 번에 하나의 임대 작업만 처리하는 기존 직렬화 규칙을 그대로 따릅니다.
 
+stage builder는 이 중앙 작업 열거형에 속하지 않습니다. 신뢰된 오프라인 환경에서만 실행하며, variant 등록·증적 기록·상태 전이는 중앙 DB 작업일 뿐 Agent 작업이나 호스트 변경 권한이 아닙니다.
+
 계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
 
 ## 신뢰 경계
@@ -152,6 +208,7 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 - 관리자 전달자 자격 증명과 노드 자격 증명은 다른 권한을 가집니다.
 - 토큰 없는 등록은 대기 상태 하트비트 권한만 주며 실행 권한을 주지 않습니다.
 - 에이전트는 Docker와 `/var/lib/dure`를 관리하므로 root로 실행됩니다. 중앙 제어면이 일반 원격 셸이 되지 않도록 작업 언어는 폐쇄형입니다.
+- stage builder는 digest 고정 별도 환경에 격리하고 remote code·adapter·임의 아키텍처를 거부합니다. 기본 Agent 패키지에 빌더 heavy dependency를 설치하지 않습니다.
 - GPU 호스트 운영자는 로컬 작업 부하를 관찰할 수 있습니다. 더 강한 기밀 컴퓨팅 경계가 생기기 전에는 민감 프롬프트나 비밀값을 커뮤니티 노드에서 처리하면 안 됩니다.
 
 운영 절차는 [operations.md](operations.md), 위협 모델과 보안 강화 작업 목록은 [security.md](security.md)를 참고합니다.

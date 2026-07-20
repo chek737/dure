@@ -13,6 +13,8 @@
 
 - [모델 선택 정책](model-selection.md): GPU 인벤토리 기반 결정론적 선택기, 모델 레지스트리·승격 게이트, 결정론적 추천 스냅샷, 배포 세대 상태와 명시적 롤백 — 부분 구현
 - [벤치마크 및 모델 자격 검증](benchmarking.md): 구조화된 증적, 단일 노드 폐쇄형 실행과 후보 모델의 품질·성능·안정성 승격 기준 — 부분 구현
+- [모델 아티팩트 매니페스트와 배포 계약](artifact-distribution.md): 불변 파일·청크 레지스트리, 명시적 중앙 준비 preview·apply·재시도, 노드 `FULL_SNAPSHOT` 캐시와 OCI 이미지 증적, 배포·롤백 소비 게이트
+- [vLLM 단계 아티팩트 생성과 검증](stage-artifacts.md): 제한된 vLLM 0.9.0 stage builder, variant·rank 매니페스트와 검증 상태 — 생성·등록 구현, 노드 배포 소비는 계획됨
 - [제품 제안서](dure-proposal.md): 장기 제품 비전과 MVP 가설
 
 ## 개발과 배포
@@ -29,3 +31,5 @@
 - 프롬프트, 자격 증명, 토큰, 실제 비밀값을 예시나 벤치마크 결과에 기록하지 않습니다.
 - 모델 릴리스와 배치 프로필의 실제 상태는 중앙 레지스트리가 진실의 원천이며, 이 문서는 정책과 절차를 설명합니다.
 - 배포 세대의 `verified_at`은 전체 배정 노드의 검증 작업이 성공하고 모든 노드의 Agent가 0.3.12 이상일 때만 롤백 증거로 사용합니다.
+- 추천 세대의 apply와 rollback은 배포·노드·매니페스트·exact cache path·OCI 다이제스트에 결합된 성공한 준비 증적을 요구하며, rollback은 네트워크 준비를 수행하지 않습니다.
+- stage variant의 `VALIDATED`는 실제 GPU export/load 검증 상태이지 노드 설치나 배포 완료 상태가 아닙니다. 현재 중앙 준비와 Agent는 계속 `FULL_SNAPSHOT`만 소비합니다.
