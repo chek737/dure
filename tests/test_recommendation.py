@@ -211,6 +211,10 @@ class RecommendationServiceTests(unittest.TestCase):
             self.assertEqual(forward, reverse)
             recommendation = forward["recommendation"]
             self.assertEqual(recommendation["selected"]["model_release_id"], higher.id)
+            self.assertEqual(len(recommendation["selected"]["artifact_revision"]), 40)
+            self.assertTrue(
+                recommendation["selected"]["runtime_image"].count("@sha256:") == 1
+            )
             self.assertEqual(
                 {item["model_release_id"] for item in recommendation["candidates"]},
                 {lower.id, higher.id},
