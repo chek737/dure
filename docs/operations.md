@@ -528,6 +528,9 @@ dure admin deployment rollback <latest-deployment-id> \
 
 API는 `POST /v1/admin/deployments/{source_id}/rollback`에 다음과 같은 닫힌 본문을 받습니다. `apply`와 `serve`는 엄격한 불리언이며 기본값은 `false`입니다. 응답은 operation 상세, 이번 호출로 만든 task 목록과 `changed` 여부를 포함합니다.
 
+아래 `serve=false` 예시는 legacy backend에만 적용됩니다. `VLLM_RAY_PP_V1`은 준비
+요청부터 `serve=true`가 필수이고 `START_API → VERIFY_API`도 선택 단계가 아닙니다.
+
 ```json
 {
   "node_ids": ["<node-uuid>"],
@@ -557,9 +560,9 @@ START_TARGET (serve=false)
     ↓ 모든 노드 성공
 VERIFY_TARGET
     ↓ 모든 노드 성공
-선택적 START_API (Ray head)
+legacy에서 선택적, 엄격 backend에서 필수 START_API (Ray head)
     ↓
-선택적 VERIFY_API (Ray head)
+legacy에서 선택적, 엄격 backend에서 필수 VERIFY_API (Ray head)
 ```
 
 한 단계에서 일부 노드가 실패하거나 취소되면 다음 단계로 넘어가지 않습니다. 실행 중 task가 남아 있는 동안에는 재시도를 거부합니다. 원인을 해결한 뒤 같은 입력으로 `--apply`를 다시 지정하면 현재 단계의 실패 노드만 새 시도 번호로 큐잉합니다. 이미 성공한 노드는 반복하지 않고 과거 시도의 늦은 claim·완료·실패 보고는 현재 시도와 맞지 않으므로 무시합니다.
