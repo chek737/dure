@@ -23,6 +23,7 @@ from .model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_MARKER_FILE,
+    MODEL_CACHE_MARKER_MAX_BYTES,
     ModelCacheMarkerError,
     build_model_cache_marker,
     read_model_cache_marker,
@@ -33,6 +34,7 @@ DURE_MODEL_STORE_ROOT = Path("/var/lib/dure/model-store")
 DURE_MODEL_CACHE_ROOT = Path("/var/lib/dure/models")
 DURE_MODEL_STAGING_DIRECTORY = ".dure-staging"
 DURE_MODEL_STAGING_WORK_DIRECTORY = ".dure-work"
+DURE_MODEL_STAGING_MARKER_PART_FILE = f"{MODEL_CACHE_MARKER_FILE}.part"
 ATTEMPT_JOURNAL_SCHEMA_VERSION = 1
 MAX_ATTEMPT_JOURNAL_BYTES = 16 * 1024
 MAX_MODEL_CONFIG_BYTES = 1024 * 1024
@@ -1225,7 +1227,9 @@ def _verified_staging_bytes(
     items = {item["path"]: item for item in manifest.document["files"]}
     parts = {_staging_part_relative(item): item for item in items.values()}
     actual_files, actual_directories = _scan_exact_tree(root)
-    allowed_files = expected_files | set(parts)
+    allowed_files = expected_files | set(parts) | {
+        DURE_MODEL_STAGING_MARKER_PART_FILE
+    }
     allowed_directories = expected_directories | {
         DURE_MODEL_STAGING_WORK_DIRECTORY
     }
@@ -1237,6 +1241,12 @@ def _verified_staging_bytes(
             raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
         _verify_cache_tree(root, manifest, identity)
         return manifest.total_size_bytes, 0
+
+    if DURE_MODEL_STAGING_MARKER_PART_FILE in actual_files:
+        _safe_partial_allocation(
+            root / DURE_MODEL_STAGING_MARKER_PART_FILE,
+            MODEL_CACHE_MARKER_MAX_BYTES,
+        )
 
     completed = 0
     partial_allocation = 0
@@ -1569,6 +1579,7 @@ class ModelCachePreparer:
             + "\n"
         ).encode("utf-8")
         path = staging / MODEL_CACHE_MARKER_FILE
+        partial = staging / DURE_MODEL_STAGING_MARKER_PART_FILE
         try:
             path.lstat()
         except FileNotFoundError:
@@ -1583,22 +1594,77 @@ class ModelCachePreparer:
             if marker.to_dict() != identity.marker():
                 raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
             return
+
+        try:
+            observed = partial.lstat()
+        except FileNotFoundError:
+            observed = None
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
         descriptor = -1
         try:
-            descriptor = os.open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
-                0o600,
-            )
+            if observed is None:
+                descriptor = os.open(
+                    partial,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | _CLOEXEC | _NOFOLLOW,
+                    0o600,
+                )
+            else:
+                descriptor = os.open(
+                    partial,
+                    os.O_RDWR | _CLOEXEC | _NOFOLLOW | _NONBLOCK,
+                )
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or opened.st_mode & 0o077
+                or opened.st_size > MODEL_CACHE_MARKER_MAX_BYTES
+                or (
+                    observed is not None
+                    and (
+                        not stat.S_ISREG(observed.st_mode)
+                        or opened.st_dev != observed.st_dev
+                        or opened.st_ino != observed.st_ino
+                    )
+                )
+            ):
+                raise ModelStoreError("MODEL_STORE_TARGET_COLLISION")
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
             _write_all(descriptor, payload)
             os.fsync(descriptor)
+            written = os.fstat(descriptor)
+            if (
+                written.st_dev != opened.st_dev
+                or written.st_ino != opened.st_ino
+                or written.st_uid != os.geteuid()
+                or written.st_nlink != 1
+                or written.st_mode & 0o077
+                or written.st_size != len(payload)
+            ):
+                raise ModelStoreError("MODEL_STORE_IO_FAILED")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.read(descriptor, len(payload) + 1) != payload:
+                raise ModelStoreError("MODEL_STORE_IO_FAILED")
         except ModelStoreError:
             raise
         except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise ModelStoreError("MODEL_STORE_DISK_INSUFFICIENT") from exc
+            if exc.errno in {
+                errno.ELOOP,
+                errno.EEXIST,
+                errno.EISDIR,
+                errno.ENOTDIR,
+            }:
+                raise ModelStoreError("MODEL_STORE_TARGET_COLLISION") from exc
             raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+        _rename_noreplace(partial, path)
 
     def _assemble(
         self,
@@ -1638,6 +1704,7 @@ class ModelCachePreparer:
                 manifest,
                 reserved_paths={
                     MODEL_CACHE_MARKER_FILE,
+                    DURE_MODEL_STAGING_MARKER_PART_FILE,
                     DURE_MODEL_STAGING_WORK_DIRECTORY,
                 },
             )
@@ -1652,6 +1719,7 @@ class ModelCachePreparer:
                 for path in paths
                 for reserved in (
                     MODEL_CACHE_MARKER_FILE,
+                    DURE_MODEL_STAGING_MARKER_PART_FILE,
                     DURE_MODEL_STAGING_WORK_DIRECTORY,
                 )
             )

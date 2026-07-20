@@ -28,6 +28,7 @@ from dure.model_store import (
     CacheIdentity,
     ContentAddressedModelStore,
     DURE_MODEL_STAGING_DIRECTORY,
+    DURE_MODEL_STAGING_MARKER_PART_FILE,
     DURE_MODEL_STAGING_WORK_DIRECTORY,
     MAX_MODEL_CONFIG_BYTES,
     ModelCachePreparer,
@@ -471,9 +472,13 @@ class ModelStoreRootBoundaryTests(unittest.TestCase):
             self.assertFalse((outside / "store").exists())
 
     def test_debian_postinstall_keeps_server_and_agent_ownership_separate(self):
+        repository = Path(__file__).resolve().parents[1]
         script = (
-            Path(__file__).resolve().parents[1] / "debian" / "dure.postinst"
+            repository / "debian" / "dure.postinst"
         ).read_text(encoding="utf-8")
+        server_unit = (repository / "packaging" / "dure-server.service").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn(
             "install -d -m 0750 -o root -g dure /var/lib/dure\n",
@@ -483,6 +488,8 @@ class ModelStoreRootBoundaryTests(unittest.TestCase):
             "install -d -m 0750 -o dure -g dure /var/lib/dure/server\n",
             script,
         )
+        self.assertIn("ProtectSystem=strict\n", server_unit)
+        self.assertIn("ReadWritePaths=/var/lib/dure/server\n", server_unit)
 
 
 class FullSnapshotPreparationTests(unittest.TestCase):
@@ -810,6 +817,62 @@ class FullSnapshotPreparationTests(unittest.TestCase):
         self.assertEqual(len(self.harness.transport.calls), calls_before)
         self.assertEqual(list(self.harness.store.model_staging_root.iterdir()), [])
 
+    def test_partial_marker_write_is_retried_without_manual_cleanup(self):
+        original_write_all = model_store_module._write_all
+        marker_payload = (
+            json.dumps(
+                self.harness.identity.marker(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        interrupted = False
+
+        def interrupt_marker(descriptor: int, payload: bytes) -> None:
+            nonlocal interrupted
+            if payload == marker_payload and not interrupted:
+                interrupted = True
+                os.write(descriptor, payload[: max(1, len(payload) // 2)])
+                os.fsync(descriptor)
+                raise ModelStoreError("MODEL_STORE_DISK_INSUFFICIENT")
+            original_write_all(descriptor, payload)
+
+        with patch.object(
+            model_store_module,
+            "_write_all",
+            side_effect=interrupt_marker,
+        ):
+            with self.assertRaises(ModelStoreError) as caught:
+                self.harness.preparer.prepare_full_snapshot(
+                    identity=self.harness.identity,
+                    manifest=self.harness.manifest,
+                    origin=ORIGIN,
+                )
+
+        self.assertEqual(
+            caught.exception.code,
+            "MODEL_STORE_DISK_INSUFFICIENT",
+        )
+        stages = list(self.harness.store.model_staging_root.iterdir())
+        self.assertEqual(len(stages), 1)
+        partial = stages[0] / DURE_MODEL_STAGING_MARKER_PART_FILE
+        self.assertTrue(partial.is_file())
+        self.assertFalse((stages[0] / MODEL_CACHE_MARKER_FILE).exists())
+        self.assertFalse(
+            self.harness.store.model_cache_path(
+                self.harness.identity.manifest_digest
+            ).exists()
+        )
+        calls_before = len(self.harness.transport.calls)
+
+        result = self._prepare_or_skip()
+
+        self.assertTrue((result.path / MODEL_CACHE_MARKER_FILE).is_file())
+        self.assertFalse(partial.exists())
+        self.assertEqual(len(self.harness.transport.calls), calls_before)
+        self.assertEqual(list(self.harness.store.model_staging_root.iterdir()), [])
+
     def test_stage_and_reserved_marker_paths_fail_before_network(self):
         stage_identity = _identity(
             self.harness.manifest,
@@ -830,6 +893,8 @@ class FullSnapshotPreparationTests(unittest.TestCase):
         reserved_paths = (
             MODEL_CACHE_MARKER_FILE,
             f"{MODEL_CACHE_MARKER_FILE}/child",
+            DURE_MODEL_STAGING_MARKER_PART_FILE,
+            f"{DURE_MODEL_STAGING_MARKER_PART_FILE}/child",
             DURE_MODEL_STAGING_WORK_DIRECTORY,
             f"{DURE_MODEL_STAGING_WORK_DIRECTORY}/child",
         )
