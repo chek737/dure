@@ -17,6 +17,59 @@ from .helpers import FakeRunner
 
 
 class ProbeTests(unittest.TestCase):
+    def test_huggingface_config_links_are_limited_to_repository_blobs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hub = root / "hub"
+            hub.mkdir()
+            revision = "a" * 40
+            config = json.dumps(
+                {
+                    "model_type": "dure-test",
+                    "quantization_config": {"quant_method": "awq"},
+                }
+            )
+
+            allowed = hub / "models--Example--Allowed"
+            allowed_blob = allowed / "blobs" / ("b" * 64)
+            allowed_blob.parent.mkdir(parents=True)
+            allowed_blob.write_text(config, encoding="utf-8")
+            allowed_snapshot = allowed / "snapshots" / revision
+            allowed_snapshot.mkdir(parents=True)
+            (allowed_snapshot / "config.json").symlink_to(
+                Path("../../blobs") / allowed_blob.name
+            )
+
+            outside_blob = root / "outside-config.json"
+            outside_blob.write_text(config, encoding="utf-8")
+            outside = hub / "models--Example--Outside"
+            outside_snapshot = outside / "snapshots" / revision
+            outside_snapshot.mkdir(parents=True)
+            (outside_snapshot / "config.json").symlink_to(outside_blob)
+
+            non_blob = hub / "models--Example--NonBlob"
+            non_blob_config = non_blob / "metadata" / "config.json"
+            non_blob_config.parent.mkdir(parents=True)
+            non_blob_config.write_text(config, encoding="utf-8")
+            non_blob_snapshot = non_blob / "snapshots" / revision
+            non_blob_snapshot.mkdir(parents=True)
+            (non_blob_snapshot / "config.json").symlink_to(
+                Path("../../metadata/config.json")
+            )
+
+            result = NodeProbe(
+                FakeRunner(),
+                model_roots=[hub],
+            ).collect()
+
+        by_id = {item.model_id: item for item in result.installed_models}
+        self.assertTrue(by_id["Example/Allowed"].complete)
+        self.assertEqual(by_id["Example/Allowed"].quantization, "awq")
+        self.assertFalse(by_id["Example/Outside"].complete)
+        self.assertIsNone(by_id["Example/Outside"].quantization)
+        self.assertFalse(by_id["Example/NonBlob"].complete)
+        self.assertIsNone(by_id["Example/NonBlob"].quantization)
+
     def test_parses_nvidia_smi_and_runtime(self):
         gpu_query = (
             "nvidia-smi",

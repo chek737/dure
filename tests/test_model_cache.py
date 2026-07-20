@@ -1,9 +1,14 @@
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from dure.model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_MARKER_MAX_BYTES,
     MODEL_CACHE_SCHEMA_V1,
     MODEL_CACHE_SCHEMA_V2,
     MODEL_CACHE_VERIFICATION_VERSION,
@@ -11,6 +16,7 @@ from dure.model_cache import (
     build_model_cache_marker,
     decode_model_cache_marker,
     parse_model_cache_marker,
+    read_model_cache_marker,
 )
 
 
@@ -94,6 +100,57 @@ class ModelCacheMarkerTests(unittest.TestCase):
 
         with self.assertRaises(ModelCacheMarkerError):
             decode_model_cache_marker(encoded)
+
+    def test_deeply_nested_json_is_reduced_to_a_marker_error(self):
+        encoded = "[" * 10_000 + "0" + "]" * 10_000
+
+        with self.assertRaises(ModelCacheMarkerError):
+            decode_model_cache_marker(encoded)
+
+    def test_safe_reader_rejects_links_special_files_and_oversized_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = root / "valid.json"
+            valid.write_text(json.dumps(marker_v1()), encoding="utf-8")
+            self.assertEqual(
+                read_model_cache_marker(valid).to_dict(),
+                marker_v1(),
+            )
+
+            symlink = root / "symlink.json"
+            symlink.symlink_to(valid)
+            with self.assertRaises(ModelCacheMarkerError):
+                read_model_cache_marker(symlink)
+
+            hardlink = root / "hardlink.json"
+            os.link(valid, hardlink)
+            with self.assertRaises(ModelCacheMarkerError):
+                read_model_cache_marker(valid)
+
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b"x" * (MODEL_CACHE_MARKER_MAX_BYTES + 1))
+            with self.assertRaises(ModelCacheMarkerError):
+                read_model_cache_marker(oversized)
+
+            writable = root / "world-writable.json"
+            writable.write_text(json.dumps(marker_v1()), encoding="utf-8")
+            writable.chmod(0o666)
+            with self.assertRaises(ModelCacheMarkerError):
+                read_model_cache_marker(writable)
+
+            foreign_owner = root / "foreign-owner.json"
+            foreign_owner.write_text(json.dumps(marker_v1()), encoding="utf-8")
+            with patch(
+                "dure.model_cache.os.geteuid",
+                return_value=foreign_owner.stat().st_uid + 1,
+            ), self.assertRaises(ModelCacheMarkerError):
+                read_model_cache_marker(foreign_owner)
+
+            if hasattr(os, "mkfifo"):
+                fifo = root / "marker.fifo"
+                os.mkfifo(fifo)
+                with self.assertRaises(ModelCacheMarkerError):
+                    read_model_cache_marker(fifo)
 
 
 if __name__ == "__main__":
