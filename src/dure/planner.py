@@ -4,47 +4,12 @@ import re
 import time
 from dataclasses import replace
 
+from .catalog import STATIC_CATALOG
 from .models import DeploymentPlan, ModelSpec, NodeAssignment, NodeProfile
+from .selector import InventoryNode, recommend_model
 
 
-MODELS: dict[str, ModelSpec] = {
-    "qwen2.5-7b-awq": ModelSpec(
-        model_id="qwen2.5-7b-awq",
-        repository="Qwen/Qwen2.5-7B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=4.8,
-        min_gpu_memory_gib=8,
-        default_max_model_len=8192,
-        layer_count=28,
-    ),
-    "qwen2.5-14b-awq": ModelSpec(
-        model_id="qwen2.5-14b-awq",
-        repository="Qwen/Qwen2.5-14B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=9.5,
-        min_gpu_memory_gib=12,
-        default_max_model_len=8192,
-        layer_count=48,
-    ),
-    "qwen2.5-32b-awq": ModelSpec(
-        model_id="qwen2.5-32b-awq",
-        repository="Qwen/Qwen2.5-32B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=19.5,
-        min_gpu_memory_gib=24,
-        default_max_model_len=4096,
-        layer_count=64,
-    ),
-    "qwen2.5-72b-awq": ModelSpec(
-        model_id="qwen2.5-72b-awq",
-        repository="Qwen/Qwen2.5-72B-Instruct-AWQ",
-        quantization="awq",
-        checkpoint_gib=38.74,
-        min_gpu_memory_gib=24,
-        default_max_model_len=8192,
-        layer_count=80,
-    ),
-}
+MODELS: dict[str, ModelSpec] = STATIC_CATALOG.models
 
 
 def _gpu_for(profile: NodeProfile, gpu_index: int):
@@ -118,15 +83,18 @@ def build_plan(
         return None
 
     if model_id == "auto":
-        large_nodes = [item for item in healthy if _gpu_for(item[0], item[1]).memory_mib >= 22528]
-        if len(large_nodes) >= 3:
-            model = MODELS["qwen2.5-72b-awq"]
-            selected = large_nodes[:3]
-        else:
-            model = recommend_local_model(healthy[0][0])
-            if model is None:
-                return None
-            selected = [healthy[0]]
+        recommendation = recommend_model(
+            [
+                InventoryNode.local(profile)
+                for profile, _gpu_index in healthy
+            ],
+            allow_unverified_network=True,
+        )
+        if recommendation.selected_model_id is None:
+            return None
+        model = MODELS[recommendation.selected_model_id]
+        by_node_id = {item[0].node_id: item for item in healthy}
+        selected = [by_node_id[node_id] for node_id in recommendation.selected_node_ids]
     else:
         if model_id not in MODELS:
             raise ValueError(f"unknown model: {model_id}")
