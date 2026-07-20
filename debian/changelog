@@ -5,6 +5,13 @@ dure (0.3.7) UNRELEASED; urgency=medium
 
  -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:10:00 +0900
 
+dure (0.3.6) UNRELEASED; urgency=medium
+
+  * GPU 인벤토리와 모델 카탈로그를 바탕으로 품질 우선의 결정론적 모델 선택을 추가합니다.
+  * 자원 부족과 잘못된 노드 식별자를 안전하게 거부하는 경계 및 회귀 테스트를 보강합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Mon, 20 Jul 2026 15:00:00 +0900
+
 dure (0.3.4) stable; urgency=medium
 
   * Identify Dure HTTP requests so Cloudflare does not reject Python urllib's default signature.
