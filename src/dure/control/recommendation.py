@@ -740,11 +740,24 @@ def _lock_recommendation_inputs(
     if session.get_bind().dialect.name == "postgresql":
         session.execute(
             text(
-                "LOCK TABLE model_artifacts, model_releases, nodes, "
-                "node_profiles, placement_profiles, runtime_releases IN SHARE MODE"
+                "LOCK TABLE benchmark_evidence, benchmark_runs, model_artifacts, "
+                "model_releases, nodes, node_profiles, placement_profiles, "
+                "runtime_releases IN SHARE MODE"
             )
         )
         return
+    list(
+        session.scalars(
+            select(BenchmarkEvidence)
+            .order_by(BenchmarkEvidence.id)
+            .with_for_update()
+        )
+    )
+    list(
+        session.scalars(
+            select(BenchmarkRun).order_by(BenchmarkRun.id).with_for_update()
+        )
+    )
     list(
         session.scalars(
             select(ModelRelease).order_by(ModelRelease.id).with_for_update()
