@@ -1,6 +1,6 @@
 # 모델 아티팩트 매니페스트와 배포 계약
 
-> 상태: **부분 구현**. 중앙 제어면의 불변 정규화 매니페스트·파일·청크 레지스트리와 관리자 등록·조회, 노드 내부의 콘텐츠 주소 기반 청크 다운로드와 `FULL_SNAPSHOT` 캐시 준비 라이브러리는 구현되었습니다. 중앙 준비 API·CLI와 Agent 작업, OCI 이미지 준비는 다음 버전 범위입니다.
+> 상태: **`FULL_SNAPSHOT` 경로 구현**. 중앙 제어면의 불변 정규화 매니페스트 레지스트리, 노드 콘텐츠 주소 캐시와 명시적 deployment 준비 API·CLI, `PREPARE_MODEL → PREPARE_IMAGE` Agent 작업과 배포 소비 게이트가 구현되었습니다. rank별 파일을 만드는 `STAGE` 분산은 아직 지원하지 않습니다.
 
 ## 목적
 
@@ -12,7 +12,7 @@
 - 각 파일을 구성하는 청크의 순서, 파일 내 오프셋과 길이
 - 파일 수와 파일-청크 연결 수. 고유 청크 레코드는 다이제스트로 중복 제거됩니다.
 
-이 레지스트리는 준비 작업이 필요한 바이트를 정확히 식별하고, 여러 파일이나 모델에서 같은 청크를 재사용할 수 있게 하는 기반입니다. `0.3.15`의 노드 라이브러리는 이 매니페스트로 로컬 캐시를 만들 수 있지만, 아직 중앙 제어면이나 공개 CLI가 이 동작을 요청하지 않습니다.
+이 레지스트리는 준비 작업이 필요한 바이트를 정확히 식별하고, 여러 파일이나 모델에서 같은 청크를 재사용할 수 있게 하는 기반입니다. `0.3.16`의 중앙 제어면은 추천을 수락해 만든 세대에 대해 준비 계획을 먼저 저장하고, 운영자가 명시적으로 적용한 뒤에만 이 매니페스트로 각 노드의 로컬 캐시와 OCI 이미지를 준비합니다.
 
 ## 현재 구현 범위
 
@@ -39,7 +39,7 @@
 - 검증 표식을 마지막에 기록한 뒤 `renameat2(RENAME_NOREPLACE)`로 활성화하는 `FULL_SNAPSHOT` 준비기
 - 매니페스트별 시도 저널과 폐쇄형 상태·실패 코드
 
-준비기는 GPU, Docker나 vLLM을 요구하지 않는 파일 계층입니다. 단위 테스트는 가짜 전송 계층을 사용하지만 실제 `ArtifactChunkDownloader`는 HTTPS 네트워크 원본을 사용합니다. 현재 내부 Python API는 검증된 `TrustedHTTPSOrigin` 객체를 직접 받으며 production 설정 로더나 Agent 호출자는 아직 없습니다. 다음 중앙 준비 PR의 Agent handler는 이 객체를 노드 로컬 신뢰 설정에서만 구성하고 작업 payload의 URL·host·header·token을 받지 않아야 합니다.
+모델 준비기는 GPU, Docker나 vLLM을 요구하지 않는 파일 계층입니다. 단위 테스트는 가짜 전송 계층을 사용하지만 실제 `ArtifactChunkDownloader`는 HTTPS 네트워크 원본을 사용합니다. Agent는 검증된 `TrustedHTTPSOrigin` 객체를 각 노드의 root 전용 설정에서만 구성하고, 중앙 task payload의 URL·host·header·token은 받지 않습니다. 현재 전송기는 인증 token, cookie와 사용자 지정 header를 지원하지 않으므로 별도 자격 증명 없이 접근 가능한 신뢰 HTTPS origin이 필요합니다.
 
 ## 정규 형식과 다이제스트
 
@@ -92,9 +92,65 @@ GET  /v1/admin/model-artifacts/{artifact_id}/manifest
 - Docker·Ray·vLLM 실행과 기존 배포 변경
 - 모델 추천, 릴리스 승격 또는 배포 세대 자동 생성
 
+## 명시적 중앙 준비 계약
+
+추천 수락으로 만들어진 배포 세대는 준비와 실행을 분리합니다. 같은 정규 UUID 요청 ID를 사용해 먼저 preview를 만들고, 응답을 검토한 다음에만 `--apply`를 추가합니다.
+
+```bash
+# DB에 불변 준비 계획과 노드 행만 저장하며 task는 만들지 않습니다.
+dure admin deployment prepare <deployment-id> --request-id <request-uuid>
+
+# 같은 요청 ID의 계획을 다시 검증한 뒤 모델 작업을 큐잉합니다.
+dure admin deployment prepare <deployment-id> \
+  --request-id <request-uuid> --apply
+
+# 준비, 노드, 단계와 시도 상태를 조회합니다.
+dure admin deployment preparation <preparation-id>
+```
+
+```text
+POST /v1/admin/deployments/{deployment_id}/prepare
+GET  /v1/admin/deployment-preparations/{preparation_id}
+```
+
+preview는 배포 세대, 정규 매니페스트, 런타임 이미지와 정확한 노드 UUID 집합을 하나의 준비 계획에 결합하고 task를 0개 만듭니다. 적용 시 서버는 전체 대상 노드를 정렬된 순서로 잠근 뒤 다음 조건을 다시 검사합니다.
+
+- 추천을 수락해 만든 배포 세대이고 등록된 정규 매니페스트가 아티팩트 다이제스트와 정확히 같습니다.
+- 모든 대상 노드가 승인되어 있고 최근 heartbeat와 신선한 인벤토리를 보유합니다.
+- 인벤토리의 남은 디스크가 등록 매니페스트 전체 크기와 보수적 여유 공간을 충족합니다.
+- 런타임 이미지가 정확한 OCI SHA-256 다이제스트로 고정돼 있습니다.
+- 준비 요청, 배포 세대, 모델·리비전·매니페스트, 런타임과 노드 집합이 preview 이후 바뀌지 않았습니다.
+
+한 조건이라도 불확실하거나 달라지면 작업을 일부만 만들지 않고 실패 안전 방식으로 거부합니다. 같은 요청 ID와 같은 내용의 재전송은 기존 준비를 반환하고, 같은 요청 ID에 다른 내용을 연결할 수 없습니다.
+
+적용 뒤 각 노드는 반드시 다음 순서로 진행합니다.
+
+```text
+PREPARE_MODEL
+    ↓ 전체 청크·파일·marker와 정확한 final 경로 검증 성공
+PREPARE_IMAGE
+    ↓ 정확한 RepoDigest inspect 성공
+노드 준비 완료
+```
+
+`PREPARE_MODEL`은 등록된 정규 매니페스트를 Agent 전용 인증 API로 읽고, 노드 로컬 origin으로만 바이트를 받아 `/var/lib/dure/models/sha256-<manifesthex>`의 `FULL_SNAPSHOT`을 준비합니다. task payload는 raw URL, 자격 증명, 임의 header, 호스트 경로, 셸 명령이나 Python 코드를 표현할 수 없습니다. `PREPARE_IMAGE`는 먼저 정확한 digest 참조를 `docker image inspect`하고, 없을 때만 같은 참조를 `docker pull`한 뒤 다시 inspect합니다. 이 작업은 컨테이너를 run·start·stop·remove하지 않습니다.
+
+준비 전체 상태는 `PREPARED`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `PARTIAL_FAILED`, `FAILED`의 폐쇄형 값입니다. 모델 단계가 성공한 노드에만 이미지 단계가 큐잉됩니다. 일부 노드만 완료되면 성공 증적을 보존한 채 `PARTIAL_FAILED`로 끝나며, 어떤 노드도 준비되지 못하면 `FAILED`입니다. 원인을 해결하고 같은 요청과 `--apply`를 다시 보내면 다음 규칙으로 재시도합니다.
+
+- 모델 단계가 실패한 노드는 새 모델 `attempt_no`로 다시 시작하고 이미지 작업은 만들지 않습니다.
+- 모델은 성공했지만 이미지 단계가 실패한 노드는 모델을 반복하지 않고 새 이미지 `attempt_no`만 큐잉합니다.
+- 이미 두 단계를 성공한 노드는 다시 실행하지 않습니다.
+- 완료·실패 보고는 preparation, 노드, 단계, task ID와 현재 시도 번호가 모두 일치할 때만 반영합니다. 임대 만료나 재시도 뒤 과거 작업이 늦게 보고해도 새 상태를 덮어쓰지 못합니다.
+
+일반 task 생성 API로 `PREPARE_MODEL`이나 `PREPARE_IMAGE`를 만들 수 없습니다. 전용 준비 서비스가 고정한 식별자와 payload만 Agent에 전달하며, Agent의 로컬 완료 저널 재전송도 같은 결합을 다시 검증합니다.
+
+모든 노드의 두 단계가 성공하면 준비 계획의 정확한 콘텐츠 주소 캐시 경로와 이미지 다이제스트가 해당 추천 세대의 실행 증거가 됩니다. 추천 세대의 일반 apply는 이 `SUCCEEDED` 증적이 없거나 배포·노드·매니페스트·경로·이미지 결합이 다르면 거부합니다. 기존 수동 deployment의 명시적 로컬 캐시 경로는 호환되지만, 추천 세대가 그 legacy 경로로 준비 게이트를 우회할 수는 없습니다.
+
+롤백은 준비 서비스의 네트워크 복구 경로가 아닙니다. 추천으로 만들어진 롤백 대상에는 과거에 성공한 정확한 준비 증적이 있어야 하며, 기존 검증 캐시와 로컬 다이제스트 이미지만 사용합니다. 롤백 중 새 `PREPARE_MODEL`·`PREPARE_IMAGE`, 모델 다운로드나 이미지 pull은 만들지 않습니다. 준비 증적은 완료 당시의 사실이며 이후 수동 삭제를 실시간 보증하지 않으므로, 운영자는 롤백 전에 대상 캐시와 이미지를 별도로 확인해야 합니다. 사라진 아티팩트는 자동 복구되지 않고 대상 시작 단계가 실패할 수 있습니다.
+
 ## 노드 캐시 준비 계약
 
-현재 내부 준비 API는 생성 시 검증된 `TrustedHTTPSOrigin` 객체에서만 청크를 받습니다. 최초 object URL은 이 객체와 매니페스트의 청크 SHA-256으로 만듭니다. redirect는 query·fragment·userinfo 없이 객체의 허용 host·port 안에 있어야 하지만, 그 host의 redirect path 자체는 신뢰 origin의 범위입니다. 매니페스트·중앙 DB·로컬 저널에는 raw URL이나 자격 증명을 넣지 않습니다. 압축 전송, `Transfer-Encoding`, 모호한 `Content-Length`와 범위가 다른 `Content-Range`도 거부합니다. 다만 이 객체를 노드 설정에서 만드는 production 연결은 아직 구현되지 않았습니다.
+Agent 준비기는 노드 로컬 설정으로 생성한 검증된 `TrustedHTTPSOrigin` 객체에서만 청크를 받습니다. 최초 object URL은 이 객체와 매니페스트의 청크 SHA-256으로 만듭니다. redirect는 query·fragment·userinfo 없이 객체의 허용 host·port 안에 있어야 하지만, 그 host의 redirect path 자체는 신뢰 origin의 범위입니다. 매니페스트·중앙 DB·task·결과·로컬 저널에는 raw URL이나 자격 증명을 넣지 않습니다. 압축 전송, `Transfer-Encoding`, 모호한 `Content-Length`와 범위가 다른 `Content-Range`도 거부합니다.
 
 처리 순서는 다음과 같습니다.
 
@@ -136,7 +192,8 @@ GET  /v1/admin/model-artifacts/{artifact_id}/manifest
 - 검증된 CAS 청크는 준비 성공 뒤에도 유지됩니다. 자동 eviction이 없으므로 `FULL_SNAPSHOT`과 함께 추가 디스크 공간을 계속 차지할 수 있습니다.
 - attempt journal은 매니페스트별 append-only 감사 이력이 아니라 마지막 상태 한 건을 원자적으로 교체하는 로컬 진단값입니다.
 - 현재 HTTPS 전송기는 인증 token, cookie 또는 사용자 지정 header를 지원하지 않습니다. 별도 인증 정보 없이 네트워크와 TLS 경계에서 접근 가능한 신뢰 origin이 필요합니다.
-- 중앙 상태 보고, 자동 경보, 참조 검사와 quarantine는 아직 없습니다.
+- 중앙 준비 상태와 노드별 시도 증적은 제공하지만 자동 경보, 전역 참조 검사와 quarantine는 아직 없습니다.
+- 중앙 준비는 각 노드에 모델 전체 `FULL_SNAPSHOT`을 둡니다. 모델 파일을 rank별로 나누는 `STAGE`, 노드 간 P2P 청크 전송, 별도 신뢰 빌더와 분산 배포는 아직 없습니다.
 
 ## 무결성과 신뢰 경계
 
@@ -147,12 +204,12 @@ SHA-256 다이제스트는 나중에 받은 바이트가 등록된 기대값과 
 - 등록 관리자가 악의적이거나 잘못된 매니페스트를 제출하지 않았다는 사실
 - 라이선스, 악성 모델 코드 또는 안전성을 검토했다는 사실
 
-공격자가 매니페스트와 파일을 함께 바꿀 수 있다면 새 SHA-256도 계산할 수 있습니다. 따라서 현재 레지스트리와 노드 준비기는 게시자 서명, 투명성 로그, 공급망 증명이나 신뢰할 수 있는 원본 출처를 대신하지 않습니다. 중앙의 `0.3.14` 등록 경로는 제출 당시 실제 파일을 읽지 않으며, `0.3.15` 준비기는 나중에 받은 바이트가 등록된 기대 해시와 같은지만 검증합니다.
+공격자가 매니페스트와 파일을 함께 바꿀 수 있다면 새 SHA-256도 계산할 수 있습니다. 따라서 현재 레지스트리와 노드 준비기는 게시자 서명, 투명성 로그, 공급망 증명이나 신뢰할 수 있는 원본 출처를 대신하지 않습니다. 중앙의 `0.3.14` 등록 경로는 제출 당시 실제 파일을 읽지 않으며, `0.3.16` 준비기는 나중에 받은 바이트가 등록된 기대 해시와 같은지만 검증합니다.
 
 운영자는 신뢰된 오프라인 작성 환경에서 매니페스트를 만들고, 모델 게시자와 리비전·라이선스를 별도로 확인해야 합니다. 게시자 서명과 provenance 검증이 추가되기 전에는 관리자 인증 경계 안에서만 등록 기능을 사용합니다.
 
 ## 다음 단계
 
-다음 버전은 현재 로컬 준비기를 중앙의 명시적 `deployment prepare` 흐름과 폐쇄형 Agent 작업에 연결합니다. 기본 준비 요청은 계획만 저장하고, 운영자가 별도 `--apply`를 지정한 뒤에만 대상 노드의 모델 준비와 digest-pinned OCI 이미지 pull을 시작해야 합니다. 추천과 수락은 계속 다운로드나 작업을 만들지 않습니다.
+정규 매니페스트 등록만으로 모델이 특정 노드에 준비됐거나 실행 가능하다고 판단해서는 안 됩니다. `0.3.16`에서는 전용 준비 적용을 완료해 두 단계의 정확한 노드 증적이 모두 성공해야 추천 세대 apply가 이를 소비할 수 있습니다. 추천·수락과 preview는 계속 다운로드나 호스트 변경을 만들지 않으며, `benchmark-runs/prepare`도 모델 바이트가 아니라 DB 실행 문맥만 준비합니다.
 
-따라서 정규 매니페스트 등록만으로 모델이 특정 노드에 준비됐거나 실행 가능하다고 판단해서는 안 됩니다. 중요하게도 현재 작업 열거형에는 `PREPARE_MODEL`과 `PREPARE_IMAGE`가 없고 공개·관리자 준비 CLI나 API도 없습니다. 추천·수락·apply·rollback과 `benchmark-runs/prepare`는 이 노드 로컬 준비기를 호출하지 않으며, 벤치마크의 prepare는 모델 바이트가 아니라 DB 실행 문맥만 준비합니다. 이 중앙 연결은 다음 PR에서만 추가합니다. `0.3.15`에는 노드별 READY 증적, 이미지 준비, 배포 소비 게이트와 quarantine 명령도 없습니다. 큰 모델의 rank별 `STAGE` 아티팩트 생성·배포는 결정론적 vLLM rank 결합과 신뢰 빌더 검증 뒤의 별도 후속 범위입니다.
+후속 범위는 게시자·이미지 서명과 provenance, 감사 가능한 quarantine·참조 검사·eviction, origin 인증 수단, 중앙 자동 경보입니다. 큰 모델의 rank별 `STAGE` 아티팩트 생성·배포, 노드 간 효율적인 전송과 결정론적 vLLM rank 결합은 신뢰 빌더와 독립 검증 설계 뒤에 추가합니다.
