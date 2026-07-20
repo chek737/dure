@@ -178,11 +178,13 @@ dure admin deployment prepare <deployment-id> \
 dure admin deployment preparation <preparation-id>
 ```
 
-API는 `POST /v1/admin/deployments/{deployment_id}/prepare`와 `GET /v1/admin/deployment-preparations/{preparation_id}`를 제공합니다. 요청 ID는 정규 UUID여야 하며 preview와 apply에 같은 값을 사용합니다. preview는 불변 계획과 노드 행만 저장하고 task를 0개 반환합니다. apply 직전에는 등록 매니페스트와 다이제스트 이미지, 승인·최근 온라인·신선한 인벤토리·디스크 여유, 배포와 노드 집합을 다시 검사합니다. 하나라도 달라지거나 불확실하면 어떤 노드의 작업도 새로 만들지 않습니다.
+API는 `POST /v1/admin/deployments/{deployment_id}/prepare`와 `GET /v1/admin/deployment-preparations/{preparation_id}`를 제공합니다. 요청 ID는 정규 UUID여야 하며 preview와 apply에 같은 값을 사용합니다. preview는 불변 계획과 노드 행만 저장하고 task를 0개 반환합니다. preview와 최초 apply 직전에는 등록 매니페스트와 다이제스트 이미지, 승인·최근 온라인·신선한 인벤토리·보수적인 디스크 여유, 배포와 노드 집합을 다시 검사합니다. 하나라도 달라지거나 불확실하면 어떤 노드의 작업도 새로 만들지 않습니다.
 
 적용은 먼저 모든 대상 노드에 `PREPARE_MODEL`을 큐잉합니다. 한 노드의 모델이 전체 청크·파일 해시와 marker-last 검사를 통과한 경우에만 같은 노드의 `PREPARE_IMAGE`를 만듭니다. 이미지 작업은 정확한 digest 참조를 inspect하고 없을 때만 pull한 뒤 다시 inspect하며, 컨테이너를 실행·중지·삭제하지 않습니다. 준비 상태는 `PREPARED`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `PARTIAL_FAILED`, `FAILED` 중 하나입니다.
 
 실패 뒤 같은 request ID와 `--apply`를 다시 사용하면 현재 실패 단계만 새 시도 번호로 재시도합니다. 모델이 실패한 노드는 모델부터 다시 시작하고 이미지 작업을 만들지 않으며, 모델 성공 뒤 이미지가 실패한 노드는 이미 검증된 모델을 반복하지 않습니다. 두 단계를 성공한 노드도 다시 실행하지 않습니다. task ID, preparation·노드·단계와 현재 시도 번호가 모두 일치하지 않는 늦은 완료·실패 보고는 새 상태를 바꾸지 못합니다.
+
+재시도 시 중앙은 부분 CAS·staging의 실제 할당량을 알 수 없어 최초의 전체 크기 최악 조건 디스크 검사를 반복하지 않습니다. 대신 승인·온라인·프로필 신선도·안정 하드웨어·활성 작업과 불변 아티팩트·런타임 결합을 다시 확인하고, Agent가 작업 시작 전에 실제 파일시스템별 남은 바이트를 계산합니다. 이 검사에서 부족하면 다운로드나 final 활성화 전에 실패하므로, 재시도 task 생성은 디스크 충분 증적이 아닙니다.
 
 정상 실행은 디스크 사전 검사, 청크 다운로드·전체 digest 검사, 파일 조립·전체 파일 해시 검사, `config.json` 양자화 일치, exact-tree 검사, marker-last 기록과 no-replace 활성화 순서로 진행합니다. 같은 digest의 검증된 청크·완성 파일·final은 다시 검사한 뒤 재사용합니다. `MODEL_STORE_DOWNLOAD_TIMEOUT`과 응답 body 중단, 파일·marker 조립 중단은 결정적 부분 파일에서 이어가지만, non-timeout DNS·TLS·connect 거부와 응답 계약·digest 오류는 청크 `.part`를 0바이트로 되돌리고 재시도합니다.
 
@@ -193,6 +195,38 @@ API는 `POST /v1/admin/deployments/{deployment_id}/prepare`와 `GET /v1/admin/de
 3. digest·파일 무결성 오류, path·target collision이면 자동 덮어쓰기나 삭제를 시도하지 않습니다. 정확한 매니페스트, origin object와 소유권을 먼저 조사합니다.
 4. staging이나 비활성 final을 수동 격리해야 하면 같은 digest 준비가 실행 중이 아니고 어떤 배포·벤치마크도 참조하지 않는지 확인합니다. 계산된 단일 경로만 같은 파일시스템의 별도 보존 위치로 원자적으로 옮기고 원본 증거를 남깁니다. 공유 CAS 청크는 모든 매니페스트와 진행 중 준비의 미참조를 증명할 수 없으면 옮기거나 삭제하지 않습니다.
 5. `/var/lib/dure/models`, `/var/lib/dure/model-store`나 wildcard를 대상으로 재귀 삭제하지 않습니다. 현재 공식 quarantine·eviction 명령은 없으며 후속 버전에서 감사·참조 검사를 포함해 추가합니다.
+
+### 단계별 실패 대응 런북
+
+먼저 `dure admin deployment preparation <preparation-id>`로 현재 노드, `MODEL` 또는 `IMAGE` 단계, task ID, 시도 번호와 실패 코드를 기록합니다. 로컬 시도 저널만 보거나 과거 task의 오류만 보고 판단하지 않습니다. 다음 표의 원인을 복구한 뒤, 불변 계획이 그대로인 경우에만 같은 명령과 request ID로 새 시도를 요청합니다.
+
+```bash
+dure admin deployment prepare <deployment-id> \
+  --request-id <기존-request-uuid> --apply
+```
+
+| 실패 단계 | 코드 분류 | 확인할 사항 | 복구·재시도 조건 |
+| --- | --- | --- | --- |
+| 중앙 사전검사 | `PREPARATION_RECOMMENDATION_REQUIRED`, `PREPARATION_RECOMMENDATION_MISSING`, `PREPARATION_RECOMMENDATION_INVALID`, `PREPARATION_RECOMMENDATION_STALE`, `PREPARATION_ASSIGNMENT_INVALID`, `PREPARATION_NODE_MISSING`, `PREPARATION_NODE_UNAPPROVED`, `PREPARATION_NODE_OFFLINE`, `PREPARATION_AGENT_UNSUPPORTED`, `PREPARATION_PROFILE_STALE`, `PREPARATION_PROFILE_INVALID`, `PREPARATION_INVENTORY_STALE`, `PREPARATION_WORKLOAD_ACTIVE`, `PREPARATION_RUNTIME_UNAVAILABLE`, `PREPARATION_NODE_BUSY`, `PREPARATION_ARTIFACT_STALE`, `PREPARATION_MANIFEST_REQUIRED`, `PREPARATION_MANIFEST_INVALID`, `PREPARATION_IMAGE_INVALID`, `PREPARATION_DISK_INSUFFICIENT` | 수락 추천과 세대, 대상 UUID, 승인·온라인·Agent 버전·프로필·인벤토리, 활성 작업, 매니페스트·다이제스트 이미지와 모델 저장소 용량을 확인합니다. | 일시 상태만 복구했고 저장 계획이 같으면 기존 request ID로 apply합니다. 추천·노드·매니페스트·이미지를 바꿔야 하면 새 추천·배포 세대와 request ID로 preview부터 다시 시작합니다. |
+| 중앙 요청·시도 결합 | `PREPARATION_REQUEST_INVALID`, `PREPARATION_REQUEST_CONFLICT`, `PREPARATION_PLAN_CONFLICT`, `PREPARATION_ATTEMPT_CONFLICT`, `DEPLOYMENT_NOT_FOUND`, `ARTIFACT_PREPARATION_NOT_FOUND` | request ID의 정규 UUID·기존 배포 결합, 저장 계획, 현재 task·시도 결합과 감사 이벤트를 확인합니다. | 데이터베이스 행을 직접 수정하거나 다른 계획에 기존 ID를 재사용하지 않습니다. 결합 충돌은 자동 반복하지 말고 서버 버전·트랜잭션 상태를 조사하며, 바뀐 계획에는 새 request ID를 사용합니다. |
+| 배포 소비 게이트 | `DEPLOYMENT_ARTIFACTS_NOT_PREPARED`, `DEPLOYMENT_PREPARATION_INVALID`, `DEPLOYMENT_MODEL_RELEASE_REVOKED` | 대상 노드별 모델·이미지 성공 증적, 세대·추천·매니페스트·런타임의 정확한 결합과 모델 릴리스 상태를 확인합니다. | 미완료 단계는 기존 준비를 apply해 재시도합니다. 손상된 증적이나 `REVOKED` 릴리스를 우회해 apply·restart·verify·rollback하지 않습니다. `DEPRECATED` 릴리스는 이미 성공한 증적의 소비와 검증된 세대 rollback에만 허용하며 새 준비·재시도에는 허용하지 않습니다. 긴급 stop 경로는 유지됩니다. |
+| Agent 계약·설정 | `PREPARATION_PAYLOAD_REJECTED`, `PREPARATION_NODE_MISMATCH`, `PREPARATION_BINDING_MISMATCH`, `PREPARATION_HISTORY_INVALID`, `PREPARATION_ORIGIN_UNAVAILABLE`, `PREPARATION_MANIFEST_UNAVAILABLE` | Agent·controller 버전, task의 노드·단계·시도 결합, `/etc/dure/agent.json`의 `artifact_origin`, 승인·자격 증명과 매니페스트 API 접근을 확인합니다. | secret을 로그에 남기지 말고 설정·버전·신원 원인을 해결합니다. 현재 결과를 수정 재전송하지 않고 기존 준비의 새 시도를 만듭니다. 불변 결합이 달라졌다면 새 준비 요청을 만듭니다. |
+| 모델 다운로드 | `MODEL_STORE_DOWNLOAD_TIMEOUT`, `MODEL_STORE_DOWNLOAD_INTERRUPTED`, `MODEL_STORE_DOWNLOAD_REJECTED`, `MODEL_STORE_DIGEST_MISMATCH` | 신뢰 origin의 DNS·TLS·연결과 range·길이 응답 계약, digest object의 원본 바이트를 확인합니다. | timeout·body 중단은 같은 digest를 재시도해 검증된 부분부터 잇습니다. 응답 거부·digest 불일치는 origin object 또는 매니페스트를 바로잡은 뒤 0바이트부터 다시 받습니다. |
+| 모델 로컬 저장 | `MODEL_STORE_INVALID`, `MODEL_STORE_ROOT_UNSAFE`, `MODEL_STORE_PATH_COLLISION`, `MODEL_STORE_LOCK_BUSY`, `MODEL_STORE_JOURNAL_CORRUPT`, `MODEL_STORE_CHUNK_COLLISION`, `MODEL_STORE_CHUNK_CORRUPT`, `MODEL_STORE_MANIFEST_MISMATCH`, `MODEL_STORE_CACHE_KIND_UNSUPPORTED`, `MODEL_STORE_FILE_INTEGRITY_FAILED`, `MODEL_STORE_TARGET_COLLISION`, `MODEL_STORE_DISK_INSUFFICIENT`, `MODEL_STORE_IO_FAILED`, `MODEL_STORE_ATOMIC_ACTIVATION_UNAVAILABLE` | 경로 소유권·symlink·동시 준비, exact digest의 CAS·staging·final, 파일시스템 공간·inode·I/O와 no-replace 지원을 확인합니다. | lock 경쟁은 기존 실행 종료 뒤 재시도합니다. 공간·호스트 문제를 복구하고, 충돌·오염은 참조를 조사해 단일 digest만 격리한 뒤 재시도합니다. 자동 덮어쓰기·재귀 삭제는 금지합니다. |
+| Docker 이미지 | `PREPARATION_RUNTIME_UNAVAILABLE`, `PREPARATION_IMAGE_PULL_FAILED`, `PREPARATION_IMAGE_INSPECT_FAILED`, `PREPARATION_IMAGE_DIGEST_MISMATCH` | Docker daemon·Agent 권한, `docker system df`, Docker 데이터 루트, registry·TLS·네트워크·인증, exact digest와 canonical `RepoDigests`를 확인합니다. | daemon·용량·registry 원인을 고친 뒤 기존 request ID로 apply하면 성공한 모델은 재사용하고 실패한 `IMAGE`만 다시 실행합니다. tag·digest 우회, 자동 prune, NVIDIA host driver 자동 변경은 하지 않습니다. |
+| 임대·취소·철회·결과 | `PREPARATION_LEASE_EXPIRED`, `PREPARATION_TASK_CANCELED`, `PREPARATION_NODE_REVOKED`, `PREPARATION_RESULT_REJECTED`, `PREPARATION_EXECUTION_FAILED` | 현재 임대와 Agent heartbeat, 호스트 작업의 잔존 여부, 노드 신뢰·자격 증명, Agent·controller 결과 스키마와 등록 매니페스트 증적을 확인합니다. | 아래 fencing 절차에 따라 과거 작업이 더 실행되지 않음을 확인하고 원인을 해결한 뒤 새 시도를 만듭니다. revoke 노드는 자격 증명 교체와 재승인 전에는 재시도하지 않습니다. |
+
+중앙 모델 디스크 검사는 이미지 pull 용량을 보증하지 않습니다. 중앙은 모델 매니페스트의 청크, 전체 조립본과 고정 여유 공간만 계산하며 OCI layer의 압축·unpack 크기, Docker 데이터 루트의 별도 파일시스템과 기존 layer 공유량을 알지 못합니다. 따라서 모델 사전검사를 통과해도 `PREPARATION_IMAGE_PULL_FAILED`가 날 수 있습니다. 운영자는 read-only `docker system df`와 exact digest inspect로 용량과 존재 여부를 확인하고, 수동 정리가 필요하면 Dure 및 다른 컨테이너가 참조하지 않는 정확한 이미지·layer만 대상으로 해야 합니다. `docker system prune` 같은 전역 정리를 자동 복구 절차로 사용하지 않습니다.
+
+### lease, revoke, 늦은 완료와 결과 거부
+
+1. Agent는 완료 결과를 로컬 pending report에 먼저 기록하고, 다음 task를 claim하기 전에 중앙 보고를 다시 시도합니다. 중앙이 완료를 반영했지만 응답만 유실된 같은 현재 시도의 재전송은 멱등 처리됩니다.
+2. 임대가 만료되면 중앙은 현재 시도를 `PREPARATION_LEASE_EXPIRED`로 실패 처리합니다. 이후 도착한 과거 완료는 새 상태를 변경하지 못합니다. Agent heartbeat·임대 갱신과 해당 host 작업의 종료를 확인한 뒤 같은 request ID로 apply해 새 시도를 만듭니다.
+3. 명시적 취소는 queued task를 `CANCELED`로 닫고, running task는 임대가 만료된 경우에만 만료 실패로 닫습니다. 활성 임대의 host 작업을 중앙 취소가 강제 종료한다고 가정하지 않습니다.
+4. 노드를 revoke하면 queued 준비는 취소되고 running 준비는 `PREPARATION_NODE_REVOKED`로 실패합니다. 기존 자격 증명과 늦은 보고는 권한을 회복하지 못합니다. 침해·오등록 원인을 조사하고 자격 증명을 교체한 뒤 중앙에서 다시 승인해야 합니다.
+5. task ID, preparation·노드·단계 또는 현재 시도 번호가 다른 늦은 완료·실패는 HTTP `409` 충돌 응답을 받고 최신 상태를 덮어쓰지 않습니다. 과거 결과를 새 시도에 복사하거나 중앙 행을 직접 수정하지 않습니다.
+6. `PREPARATION_RESULT_REJECTED`는 결과가 폐쇄형 스키마 또는 등록 매니페스트의 크기·파일 수와 맞지 않는 경우입니다. 중앙은 task·시도를 `FAILED`로 커밋하고 완료 요청에 HTTP `422`를 반환하므로 같은 시도의 JSON을 고쳐 재전송하지 않습니다. Agent·controller 버전, payload/result 결합과 매니페스트를 바로잡은 뒤 기존 준비를 apply해 새 시도로 재시도합니다.
+7. `PREPARATION_EXECUTION_FAILED`는 허용 목록 밖의 예외를 안전한 코드로 축약한 값입니다. URL·credential·원격 응답 본문을 중앙 결과에 복사하지 말고 Agent와 Docker·파일시스템 서비스 로그를 접근 통제된 환경에서 조사합니다.
 
 패키지 업그레이드는 `/var/lib/dure`를 `root:dure` `0750`으로 바로잡고 `/var/lib/dure/server`만 `dure` 계정에 쓰기를 허용합니다. 이 경로가 symlink이면 설치를 거부합니다. 중앙 서버의 로컬 SQLite 파일이나 기타 쓰기 상태를 상위 `/var/lib/dure`에 새로 만들지 말고 서버 전용 하위에 둡니다. PostgreSQL 운영에는 영향이 없습니다.
 

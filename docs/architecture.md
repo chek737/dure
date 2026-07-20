@@ -45,9 +45,9 @@ DISCOVERED → PROBING → ELIGIBLE → PLANNED → DOWNLOADING
 
 CPU 전용 노드는 중앙 제어면, 게이트웨이, 아티팩트 캐시, 관측성, 대기열, 전처리 같은 보조 역할의 후보가 될 수 있습니다. 현재 Dure 런타임은 GPU 노드가 Ray head여야 하며 CPU 노드에는 모델 레이어를 배정하지 않습니다.
 
-## 현재 로컬 모델 캐시 준비 계층
+## 현재 로컬 모델 캐시와 중앙 준비 계층
 
-`0.3.15`에는 정규 아티팩트 매니페스트를 로컬 `FULL_SNAPSHOT` 캐시로 materialize하는 노드 라이브러리가 있습니다. 아직 중앙 작업이나 공개 CLI에 연결되지 않았으므로 추천·수락·GPU 추가만으로 실행되지는 않습니다.
+`0.3.16`에는 정규 아티팩트 매니페스트를 로컬 `FULL_SNAPSHOT` 캐시로 materialize하는 노드 라이브러리와 이를 호출하는 중앙 준비 operation·관리자 CLI·Agent 작업이 있습니다. 추천과 수락은 여전히 호스트를 바꾸지 않으며, 운영자가 같은 준비 요청에 명시적으로 `--apply`를 지정한 뒤에만 `PREPARE_MODEL → PREPARE_IMAGE` 작업이 실행됩니다. GPU 노드 추가만으로 준비를 자동 시작하지 않습니다.
 
 ```text
 정규 매니페스트 + 검증된 TrustedHTTPSOrigin 객체
@@ -61,7 +61,7 @@ CPU 전용 노드는 중앙 제어면, 게이트웨이, 아티팩트 캐시, 관
              검증된 FULL_SNAPSHOT 캐시
 ```
 
-production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 활성 캐시와 숨은 staging은 `/var/lib/dure/models` 아래의 고정 경로를 사용합니다. 매니페스트 다이제스트가 캐시와 staging 이름을 결정하고 원격 task 입력은 호스트 경로를 지정하지 않습니다. 내부 `ContentAddressedModelStore` 생성자는 테스트와 로컬 임베딩을 위한 명시적 루트 override를 허용하지만 이를 원격 payload와 연결하면 안 됩니다. 현재 내부 Python API는 검증된 `TrustedHTTPSOrigin` 객체를 받지만 이를 노드 설정에서 구성하는 production 호출자는 아직 없습니다. 다음 중앙 준비 PR의 Agent handler가 노드 로컬 신뢰 설정만 사용하고 작업 payload의 URL·host·header·token을 거부해야 합니다. 같은 매니페스트의 실행은 하나의 artifact lock으로 직렬화하고, 여러 매니페스트가 공유하는 청크는 chunk lock과 전체 SHA-256 검사 뒤 재사용합니다.
+production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 활성 캐시와 숨은 staging은 `/var/lib/dure/models` 아래의 고정 경로를 사용합니다. 매니페스트 다이제스트가 캐시와 staging 이름을 결정하고 원격 task 입력은 호스트 경로를 지정하지 않습니다. 내부 `ContentAddressedModelStore` 생성자는 테스트와 로컬 임베딩을 위한 명시적 루트 override를 허용하지만 이를 원격 payload와 연결하면 안 됩니다. Agent handler는 노드 로컬 `artifact_origin` 신뢰 설정에서만 `TrustedHTTPSOrigin`을 구성하고 작업 payload의 URL·host·header·token을 거부합니다. 같은 매니페스트의 실행은 하나의 artifact lock으로 직렬화하고, 여러 매니페스트가 공유하는 청크는 chunk lock과 전체 SHA-256 검사 뒤 재사용합니다.
 
 로컬 상태는 `부분 다운로드 → 검증 CAS → assembling → marker-last 검증 staging → no-replace final` 순서로만 전진합니다. 다운로드·조립 중단은 결정적 부분 파일에서 재개합니다. 잘못된 CAS, 예상 밖 entry, symlink·hardlink·special file, marker·양자화 불일치와 기존 final 충돌은 보존한 채 실패하며 자동 재귀 삭제나 캐시 퇴출을 하지 않습니다. 반복 실패가 staging 디렉터리를 계속 늘리지 않도록 매니페스트마다 조립 영역을 하나만 사용합니다. 로컬 저널은 마지막 시도 상태일 뿐 중앙 진행률이나 `READY` 증적이 아닙니다. 특히 공유 CAS 청크는 전역 미참조를 증명할 수 없으면 수동으로 옮기거나 삭제해서는 안 되며, 감사 가능한 quarantine 명령은 후속 범위입니다.
 
@@ -152,13 +152,17 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 
 - `PROBE`
 - `BENCHMARK`
+- `PREPARE_MODEL`
+- `PREPARE_IMAGE`
 - `VERIFY`
 - `APPLY_DEPLOYMENT`
 - `START_DEPLOYMENT`
 - `STOP_DEPLOYMENT`
 - `RESTART_DEPLOYMENT`
 
-`PREPARE_MODEL`과 `PREPARE_IMAGE`는 현재 열거형에 없고 공개·관리자 준비 API나 CLI도 없습니다. 추천→수락→apply·rollback 흐름은 로컬 CAS materializer와 아직 연결되지 않았으며, `sha256-<manifesthex>` final 경로도 기존 세대 plan에 자동 주입되지 않습니다. `POST /v1/admin/benchmark-runs/prepare` 역시 모델 바이트를 준비하지 않고 DB의 벤치마크 실행 문맥만 고정합니다. 이 중앙 연결은 다음 준비 PR에서만 추가합니다.
+`PREPARE_MODEL`과 `PREPARE_IMAGE`는 일반 작업 생성 API로 만들 수 없습니다. 추천을 수락해 만든 세대에 대해 관리자 전용 deployment 준비 API가 먼저 불변 preview를 저장하고, 같은 요청에 명시적으로 `apply=true`를 지정한 뒤에만 노드별 모델 작업을 만듭니다. 모델 해시와 marker 검증이 성공한 노드에만 다이제스트 고정 이미지 작업을 이어서 만들며, 실패 시에는 성공한 단계를 보존하고 실패한 현재 단계만 새 시도 번호로 재시도합니다. 모든 노드의 두 단계가 성공해야 콘텐츠 주소 final 경로를 세대 plan에 주입해 일반 apply가 소비할 수 있습니다. 롤백은 과거의 정확한 성공 증적과 로컬 캐시·이미지만 사용하고 새 준비 작업이나 네트워크 복구를 만들지 않습니다.
+
+`POST /v1/admin/benchmark-runs/prepare`는 이 아티팩트 준비 API와 별개입니다. 벤치마크 실행 문맥만 고정하고 모델 바이트를 준비하지 않으며, 적용 시 대상 노드에 배포·준비·다른 벤치마크 작업이 있으면 실패 안전 방식으로 거부합니다.
 
 에이전트는 HTTPS 폴링으로 한 번에 하나의 작업을 5분 임대로 요청하고 실행 중 임대를 갱신합니다. 완료한 작업 ID와 결과는 로컬에 보관하므로 재전달된 작업은 가능한 한 변경을 반복하지 않고 이전 결과를 보고합니다. PostgreSQL 노드 행 잠금은 같은 노드의 요청을 직렬화합니다.
 
