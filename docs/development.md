@@ -33,6 +33,21 @@ git config core.hooksPath .githooks
 
 긴급 상황이 아닌 한 hook을 우회하지 않습니다. 우회했다면 누락된 검증을 즉시 실행하고 이유를 남깁니다.
 
+## GitHub 미러
+
+`madcamp-official/legendary-super-ultra-black-dragon`은 원본 저장소이고
+`chek737/dure`는 읽기용 미러입니다. `.github/workflows/mirror-repository.yml`은 원본의 push
+직후와 15분 주기로 대상 저장소의 일반 브랜치와 태그를 강제 동기화합니다. 원본에서 삭제한
+브랜치와 태그는 미러에서도 삭제됩니다.
+
+워크플로는 대상 저장소에 쓰기 권한을 가진 SSH deploy key의 비밀키를 원본 저장소의
+`DURE_MIRROR_SSH_KEY` Actions secret으로 사용합니다. 대응하는 공개키는 `chek737/dure`의
+write-enabled deploy key로만 등록합니다. 미러 저장소에서 직접 만든 commit, branch, tag는 다음
+동기화 때 덮어쓰거나 삭제되므로 모든 개발은 원본 저장소에서 진행합니다.
+
+GitHub가 별도로 관리하는 issue, pull request, release asset, repository setting, Actions secret,
+PR 내부 ref는 이 Git 미러의 범위에 포함되지 않습니다.
+
 ## 스키마와 릴리스 변경
 
 schema 변경마다 `src/dure/control/migrations/versions/` 아래에 새 Alembic revision을 만듭니다. 출시된 revision은 수정하지 않으며 새 database와 기존 database 모두에서 `dure-server --migrate`를 검증합니다.

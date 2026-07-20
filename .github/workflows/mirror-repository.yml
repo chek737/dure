@@ -1,0 +1,44 @@
+name: Mirror repository
+
+on:
+  push:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-chek737-dure
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    if: github.repository == 'madcamp-official/legendary-super-ultra-black-dragon'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure target deploy key
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.DURE_MIRROR_SSH_KEY }}
+        run: |
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$MIRROR_SSH_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 0600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts"
+
+      - name: Mirror branches and tags
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          git init --bare mirror.git
+          git -C mirror.git remote add source \
+            "https://github.com/${SOURCE_REPOSITORY}.git"
+          git -C mirror.git fetch --prune source \
+            '+refs/heads/*:refs/heads/*' \
+            '+refs/tags/*:refs/tags/*'
+          git -C mirror.git remote add target \
+            git@github.com:chek737/dure.git
+          git -C mirror.git push --atomic --prune target \
+            '+refs/heads/*:refs/heads/*' \
+            '+refs/tags/*:refs/tags/*'
