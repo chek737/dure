@@ -730,6 +730,260 @@ class Task(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class ArtifactPreparation(Base):
+    __tablename__ = "artifact_preparations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_artifact_preparation_id_length",
+        ),
+        CheckConstraint(
+            "length(request_id) = 36",
+            name="ck_artifact_preparation_request_id_length",
+        ),
+        CheckConstraint(
+            "length(request_digest) = 71 AND request_digest LIKE 'sha256:%'",
+            name="ck_artifact_preparation_request_digest_sha256",
+        ),
+        CheckConstraint(
+            "status IN ('PREPARED', 'QUEUED', 'RUNNING', 'SUCCEEDED', "
+            "'PARTIAL_FAILED', 'FAILED')",
+            name="ck_artifact_preparation_status",
+        ),
+        UniqueConstraint(
+            "request_id",
+            name="uq_artifact_preparations_request_id",
+        ),
+        UniqueConstraint(
+            "request_digest",
+            name="uq_artifact_preparations_request_digest",
+        ),
+        UniqueConstraint(
+            "deployment_id",
+            name="uq_artifact_preparations_deployment_id",
+        ),
+        Index("ix_artifact_preparations_status", "status"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    request_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    deployment_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "deployments.id",
+            ondelete="CASCADE",
+            name="fk_artifact_preparations_deployment_id",
+        ),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default="PREPARED", nullable=False
+    )
+    plan_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ArtifactPreparationNode(Base):
+    __tablename__ = "artifact_preparation_nodes"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_artifact_preparation_node_id_length",
+        ),
+        CheckConstraint(
+            "length(model_manifest_digest) = 71 "
+            "AND model_manifest_digest LIKE 'sha256:%'",
+            name="ck_artifact_preparation_node_manifest_digest_sha256",
+        ),
+        CheckConstraint(
+            "runtime_image LIKE '%@sha256:" + "_" * 64 + "'",
+            name="ck_artifact_preparation_node_runtime_image_digest",
+        ),
+        CheckConstraint(
+            "model_status IN ('PREPARED', 'QUEUED', 'RUNNING', "
+            "'SUCCEEDED', 'FAILED')",
+            name="ck_artifact_preparation_node_model_status",
+        ),
+        CheckConstraint(
+            "image_status IN ('PREPARED', 'QUEUED', 'RUNNING', "
+            "'SUCCEEDED', 'FAILED')",
+            name="ck_artifact_preparation_node_image_status",
+        ),
+        CheckConstraint(
+            "model_current_attempt >= 0",
+            name="ck_artifact_preparation_node_model_attempt_nonnegative",
+        ),
+        CheckConstraint(
+            "image_current_attempt >= 0",
+            name="ck_artifact_preparation_node_image_attempt_nonnegative",
+        ),
+        CheckConstraint(
+            "(model_status = 'PREPARED' AND model_current_attempt = 0) OR "
+            "(model_status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED') "
+            "AND model_current_attempt >= 1)",
+            name="ck_artifact_preparation_node_model_attempt_status",
+        ),
+        CheckConstraint(
+            "(image_status = 'PREPARED' AND image_current_attempt = 0) OR "
+            "(image_status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED') "
+            "AND image_current_attempt >= 1)",
+            name="ck_artifact_preparation_node_image_attempt_status",
+        ),
+        CheckConstraint(
+            "model_failure_code IS NULL OR "
+            "(model_status = 'FAILED' AND length(model_failure_code) > 0 "
+            "AND length(model_failure_code) <= 64)",
+            name="ck_artifact_preparation_node_model_failure_code",
+        ),
+        CheckConstraint(
+            "image_failure_code IS NULL OR "
+            "(image_status = 'FAILED' AND length(image_failure_code) > 0 "
+            "AND length(image_failure_code) <= 64)",
+            name="ck_artifact_preparation_node_image_failure_code",
+        ),
+        UniqueConstraint(
+            "preparation_id",
+            "node_id",
+            name="uq_artifact_preparation_nodes_preparation_node",
+        ),
+        Index("ix_artifact_preparation_nodes_node_id", "node_id"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    preparation_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_preparations.id",
+            ondelete="CASCADE",
+            name="fk_artifact_preparation_nodes_preparation_id",
+        ),
+        nullable=False,
+    )
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "nodes.id",
+            name="fk_artifact_preparation_nodes_node_id",
+        ),
+        nullable=False,
+    )
+    model_manifest_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifests.digest",
+            name="fk_artifact_preparation_nodes_manifest_digest",
+        ),
+        nullable=False,
+    )
+    runtime_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    model_status: Mapped[str] = mapped_column(
+        String(20), default="PREPARED", nullable=False
+    )
+    image_status: Mapped[str] = mapped_column(
+        String(20), default="PREPARED", nullable=False
+    )
+    model_current_attempt: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    image_current_attempt: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    model_failure_code: Mapped[str | None] = mapped_column(String(64))
+    image_failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ArtifactPreparationAttempt(Base):
+    __tablename__ = "artifact_preparation_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_artifact_preparation_attempt_id_length",
+        ),
+        CheckConstraint(
+            "stage IN ('MODEL', 'IMAGE')",
+            name="ck_artifact_preparation_attempt_stage",
+        ),
+        CheckConstraint(
+            "attempt_no >= 1",
+            name="ck_artifact_preparation_attempt_number_positive",
+        ),
+        CheckConstraint(
+            "status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', "
+            "'CANCELED')",
+            name="ck_artifact_preparation_attempt_status",
+        ),
+        CheckConstraint(
+            "(status IN ('QUEUED', 'RUNNING') AND completed_at IS NULL) OR "
+            "(status IN ('SUCCEEDED', 'FAILED', 'CANCELED') "
+            "AND completed_at IS NOT NULL)",
+            name="ck_artifact_preparation_attempt_completion",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR "
+            "(status IN ('FAILED', 'CANCELED') AND length(failure_code) > 0 "
+            "AND length(failure_code) <= 64)",
+            name="ck_artifact_preparation_attempt_failure_code",
+        ),
+        UniqueConstraint(
+            "preparation_node_id",
+            "stage",
+            "attempt_no",
+            name="uq_artifact_preparation_attempts_node_stage_number",
+        ),
+        UniqueConstraint(
+            "task_id",
+            name="uq_artifact_preparation_attempts_task_id",
+        ),
+        Index(
+            "ix_artifact_preparation_attempts_node_stage_status",
+            "preparation_node_id",
+            "stage",
+            "status",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    preparation_node_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_preparation_nodes.id",
+            ondelete="CASCADE",
+            name="fk_artifact_preparation_attempts_preparation_node_id",
+        ),
+        nullable=False,
+    )
+    stage: Mapped[str] = mapped_column(String(10), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "tasks.id",
+            name="fk_artifact_preparation_attempts_task_id",
+        ),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    result: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class BenchmarkRun(Base):
     __tablename__ = "benchmark_runs"
     __table_args__ = (
