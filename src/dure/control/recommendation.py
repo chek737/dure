@@ -219,8 +219,8 @@ def _inventory_nodes(
                 approved=node.approved,
                 online=node_status(node.last_seen, now) == "online",
                 profile_fresh=profile_fresh,
-                # Network/NCCL evidence is introduced by the benchmark evidence PR.
-                # Until then every central multi-node recommendation fails closed.
+                # Evidence storage and promotion gating exist, but the recommender does
+                # not yet bind that evidence to inventory nodes, so multi-node stays closed.
                 network_verified=False,
                 profile_error=profile_error,
             )

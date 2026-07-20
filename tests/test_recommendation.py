@@ -16,9 +16,17 @@ except ImportError:  # pragma: no cover
     TestClient = None
 
 from dure.control.api import create_app
+from dure.control.benchmark import (
+    BENCHMARK_POLICY_VERSION,
+    BENCHMARK_SUITE_ID,
+    benchmark_inventory_fingerprint,
+    promote_model_release,
+    register_benchmark_evidence,
+)
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.models import (
     AuditEvent,
+    BenchmarkEvidence,
     Deployment,
     ModelArtifact,
     ModelRelease,
@@ -48,6 +56,7 @@ COUNTED_MODELS = (
     RuntimeRelease,
     ModelRelease,
     PlacementProfileRecord,
+    BenchmarkEvidence,
     Deployment,
     Task,
     AuditEvent,
@@ -103,6 +112,7 @@ def _add_release(
     model_id: str = "qwen-test-awq",
     gpu_architectures: list[str] | None = None,
     placement_overrides: dict | None = None,
+    benchmark_nodes: list[Node] | None = None,
 ):
     artifact = create_model_artifact(
         session,
@@ -156,7 +166,49 @@ def _add_release(
     if status in {"VALIDATED", "ACTIVE", "DEPRECATED"}:
         transition_model_release(session, release.id, "VALIDATED")
     if status in {"ACTIVE", "DEPRECATED"}:
-        transition_model_release(session, release.id, "ACTIVE")
+        if benchmark_nodes is None:
+            benchmark_nodes = [
+                _add_node(session, f"benchmark-{key}-{index}", now=utcnow())
+                for index in range(placement.node_count)
+            ]
+        node_ids = [node.id for node in benchmark_nodes]
+        requires_network = (
+            placement.requires_network_evidence or placement.node_count > 1
+        )
+        register_benchmark_evidence(
+            session,
+            release_id=release.id,
+            placement_id=placement.id,
+            suite_id=BENCHMARK_SUITE_ID,
+            node_ids=node_ids,
+            inventory_fingerprint=benchmark_inventory_fingerprint(session, node_ids),
+            artifact_revision=artifact.revision,
+            artifact_manifest_digest=artifact.manifest_digest,
+            runtime_image=runtime.image,
+            dure_commit=_hex(f"dure-{key}", 40),
+            policy_version=BENCHMARK_POLICY_VERSION,
+            input_tokens=4096,
+            output_tokens=256,
+            concurrency=8,
+            warmup_requests=20,
+            request_count=200,
+            duration_seconds=900.0,
+            oom_count=0,
+            crash_count=0,
+            restart_count=0,
+            ttft_p95_ms=900.0,
+            tpot_p95_ms=90.0,
+            e2e_p95_ms=4500.0,
+            throughput_tps=12.0,
+            success_rate=1.0,
+            vram_headroom_pct=12.0,
+            quality_score=0.90,
+            network_bandwidth_mbps=20000.0 if requires_network else None,
+            network_rtt_ms=1.0 if requires_network else None,
+            packet_loss_pct=0.0 if requires_network else None,
+            nccl_all_reduce_ok=True if placement.requires_nccl else None,
+        )
+        promote_model_release(session, release.id)
     if status == "DEPRECATED":
         transition_model_release(session, release.id, "DEPRECATED")
     if status == "REVOKED":
@@ -258,10 +310,10 @@ class RecommendationServiceTests(unittest.TestCase):
                 <= codes
             )
 
-    def test_multinode_candidate_fails_closed_without_network_evidence(self):
+    def test_multinode_candidate_remains_fail_closed_until_evidence_is_linked(self):
         with self.factory() as session:
             nodes = [_add_node(session, f"node-{index}", now=self.now) for index in range(3)]
-            _add_release(
+            release, _ = _add_release(
                 session,
                 "pipeline",
                 quality_rank=72,
@@ -276,7 +328,16 @@ class RecommendationServiceTests(unittest.TestCase):
                     "max_rtt_ms": 5.0,
                     "max_packet_loss_pct": 0.1,
                 },
+                benchmark_nodes=nodes,
             )
+
+            self.assertEqual(release.status, "ACTIVE")
+            self.assertEqual(len(release.promotion_evidence_ids), 1)
+            evidence = session.get(BenchmarkEvidence, release.promotion_evidence_ids[0])
+            self.assertIsNotNone(evidence)
+            assert evidence is not None
+            self.assertEqual(evidence.status, "PASSED")
+            self.assertTrue(evidence.nccl_all_reduce_ok)
 
             result = recommend_deployment(
                 session,
