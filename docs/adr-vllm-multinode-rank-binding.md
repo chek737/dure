@@ -267,6 +267,10 @@ weight를 다시 해시하지 않으므로 `model_content_rehashed=false`로 기
 후속 `STAGE` 연결에서도 `TP=1`의 모든 stage 파일명이 `model-rank-0-*`가 되므로
 반드시 `stages/<pipeline-rank>` 디렉터리를 node별로 격리해야 합니다.
 
+## 후속 상태 메모
+
+0.3.19는 이 ADR이 후속으로 남긴 rank별 `STAGE` 다운로드·원자적 활성화와 `sharded_state` load를 구현했습니다. 각 노드는 서로 다른 복합 identity host 경로를 동일한 `/models/model`에 mount하며 원래의 UUID·주소·rank 규칙은 바꾸지 않습니다. 다만 추천의 자동 variant 선택, P2P 전송, `TP>1`, 자동 재배치와 무중단 전환은 여전히 이 ADR의 해결 범위 밖입니다. 위 0.3.18 문장은 당시 결정 범위를 보존한 기록입니다.
+
 ## 근거 자료
 
 - [vLLM 0.9.0 분산 추론 및 서빙 문서](https://docs.vllm.ai/en/v0.9.0/serving/distributed_serving.html)
