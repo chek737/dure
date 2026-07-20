@@ -78,6 +78,24 @@ def _parser() -> argparse.ArgumentParser:
     enrollment_sub = enrollment.add_subparsers(dest="enrollment_command", required=True)
     enrollment_create = enrollment_sub.add_parser("create")
     enrollment_create.add_argument("--expires-in", default="1h")
+    artifact_manifest = admin_sub.add_parser(
+        "artifact-manifest",
+        help="Register or inspect a normalized model artifact manifest",
+    )
+    artifact_manifest_sub = artifact_manifest.add_subparsers(
+        dest="artifact_manifest_command",
+        required=True,
+    )
+    artifact_manifest_register = artifact_manifest_sub.add_parser("register")
+    artifact_manifest_register.add_argument("artifact_id")
+    artifact_manifest_register.add_argument(
+        "--file",
+        type=Path,
+        required=True,
+        help="Normalized manifest JSON file",
+    )
+    artifact_manifest_show = artifact_manifest_sub.add_parser("show")
+    artifact_manifest_show.add_argument("artifact_id")
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
     deployment_create = deployment_sub.add_parser("create")
@@ -382,6 +400,17 @@ def _admin(args: argparse.Namespace) -> int:
         value = client.request("POST", "/v1/admin/enrollments", {"expires_in_seconds": _duration_seconds(args.expires_in)})
         print(value["token"])
         print(f"Expires: {value['expires_at']}", file=sys.stderr)
+        return 0
+    if args.admin_command == "artifact-manifest":
+        path = f"/v1/admin/model-artifacts/{args.artifact_id}/manifest"
+        if args.artifact_manifest_command == "register":
+            manifest = json.loads(args.file.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("artifact manifest JSON must be an object")
+            value = client.request("POST", path, manifest)
+        else:
+            value = client.request("GET", path)
+        print(json.dumps(value, indent=2, sort_keys=True))
         return 0
     if args.admin_command == "recommendation":
         path = f"/v1/admin/deployment-recommendations/{args.recommendation_id}"
