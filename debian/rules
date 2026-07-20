@@ -7,6 +7,7 @@ override_dh_auto_test:
 	PYTHONPATH=src python3 -m unittest -v \
 		tests.test_agent \
 		tests.test_core_package \
+		tests.test_diagnostics \
 		tests.test_join \
 		tests.test_orchestrator_identity \
 		tests.test_planner \

@@ -55,6 +55,41 @@ dure admin node approve <node-id>
 dure admin probe --nodes <node-id>
 ```
 
+## Codex-assisted capacity diagnosis
+
+Install and authenticate Codex on the admin computer only:
+
+```bash
+codex --version
+codex login status
+```
+
+Upgrade and restart Agents first so `PROBE` can report installed models and LLM workloads. Then run:
+
+```bash
+dure admin diagnose
+dure admin diagnose --nodes <node-a> <node-b> --output diagnosis.json
+```
+
+By default the command submits a `PROBE` task to every approved online node, waits up to 180
+seconds, fetches `GET /v1/admin/inventory`, and calls the local `codex exec`. Use `--no-refresh` to
+analyze the last stored profiles, `--timeout` to change the Agent wait, `--codex-timeout` to change
+the model wait, and `--model` to select a Codex model. `--json` prints the structured result.
+
+The report is advisory. It does not create or apply a deployment. Review these limitations before
+acting on it:
+
+- profiles from offline or stale nodes are never treated as immediately deployable;
+- multi-node Ray recommendations require measured RTT/bandwidth and firewall/NCCL validation;
+- incomplete model directories are reported but not considered reusable;
+- non-Dure LLM containers are observed by name, image and status only and are never stopped;
+- CPU-only nodes receive utility-role suggestions because the current Dure runtime uses a GPU Ray
+  head and does not assign model layers to CPU nodes.
+
+The inventory sent to the configured Codex provider contains hardware, network addresses, runtime,
+model paths/names, and container image/status metadata. It excludes admin/node bearer credentials,
+container environment values, container commands, model tokens, and prompt data.
+
 If a node is lost or untrusted:
 
 ```bash

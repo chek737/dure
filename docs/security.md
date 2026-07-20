@@ -31,6 +31,9 @@
 - Review hostname, GPU inventory, address, and operator ownership before approving a node.
 - Pin deployment images and model revisions; use the same tested runtime across a Ray pod.
 - Collect metadata and errors without logging prompts or credentials.
+- Treat `dure admin diagnose` as an explicit external-processing action: it sends the selected node
+  inventory to the admin computer's configured Codex provider, but never credentials, container
+  environment values, commands, or prompt data.
 - Back up PostgreSQL and test credential revocation and restore procedures.
 
 ## Pre-public-alpha gates

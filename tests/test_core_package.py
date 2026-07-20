@@ -25,11 +25,23 @@ class CorePackageTests(unittest.TestCase):
 
     def test_node_cli_and_agent_import_without_third_party_packages(self):
         result = self._run_without_site_packages(
-            "import dure.agent, dure.cli; print(dure.__version__)"
+            "import dure.agent, dure.cli, dure.diagnostics; print(dure.__version__)"
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "0.3.2")
+        self.assertEqual(result.stdout.strip(), "0.3.3")
+
+    def test_packaged_control_plane_uses_production_https(self):
+        values = {}
+        for line in (REPOSITORY_ROOT / "packaging" / "dure-client.env").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                values[key] = value
+
+        self.assertEqual(values["DURE_SERVER"], "https://api.dure.madcamp-kaist.org")
+        self.assertEqual(values["DURE_INSECURE"], "false")
 
     def test_server_reports_missing_optional_dependencies(self):
         result = self._run_without_site_packages(

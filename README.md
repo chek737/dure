@@ -19,6 +19,8 @@ This repository is an executable MVP. It is not yet a hardened public volunteer-
 - Resumable Hugging Face CLI download staging
 - Docker command execution for Ray head/workers and a vLLM API
 - Host GPU, container CUDA, Ray resource, HTTP health and served-model checks
+- Dure/Hugging Face/Ollama model inventory and Dure or common LLM container discovery
+- Codex-assisted central capacity diagnosis for GPU/Ray placement and CPU utility roles
 - Dry-run by default; mutation requires explicit flags
 
 ## Install for development
@@ -186,6 +188,19 @@ dure admin node approve <node-id>
 Central tasks are restricted to probe, verify, apply, start, stop, and restart operations;
 arbitrary remote shell commands are not accepted. Central deployments require an OCI
 digest-pinned image. The one-time enrollment-token endpoint remains for compatibility.
+
+On the admin computer, refresh approved online nodes and ask the locally authenticated Codex CLI
+for an advisory capacity report:
+
+```bash
+codex login status
+dure admin diagnose
+dure admin diagnose --nodes <node-id> <node-id> --json --output diagnosis.json
+```
+
+The command sends hardware, network, installed-model, and LLM-container metadata to the configured
+Codex provider. It never sends Dure credentials and does not apply the recommendation. Upgrade the
+Agents before diagnosis so their `PROBE` results include the new model and workload inventory.
 
 ## Tests
 

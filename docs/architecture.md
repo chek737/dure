@@ -42,6 +42,23 @@ Any blocking failure ────────────→ FAILED
 
 The server stores desired task state separately from the Agent's observed lifecycle state.
 
+## Capacity diagnosis
+
+`dure admin diagnose` queues only the existing closed-enum `PROBE` task on approved online nodes.
+The resulting profiles include hardware, Dure and Hugging Face model caches, Ollama model names,
+and a metadata-only view of Dure or common LLM containers. Container commands, environment values,
+mount contents, prompts, and credentials are not collected.
+
+The admin CLI reads `GET /v1/admin/inventory` and invokes `codex exec` locally on the operator's
+computer. Codex runs in an empty temporary directory with an ephemeral session, read-only sandbox,
+no project rules or user tool configuration, a non-inheriting shell environment, and a strict JSON
+output schema. This is an advisory control-plane operation: it cannot create a deployment or send a
+new task type to an Agent.
+
+CPU-only nodes are currently diagnosed for utility work such as the controller, gateway, artifact
+cache, observability, request queue, and preprocessing. The current runtime still requires a GPU
+node to be the Ray head for a Dure deployment.
+
 ## Task protocol
 
 Supported task types are `PROBE`, `VERIFY`, `APPLY_DEPLOYMENT`, `START_DEPLOYMENT`,

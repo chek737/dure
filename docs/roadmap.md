@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
 기준일: 2026-07-19
-현재 개발 브랜치: `version/0.3.0`
+현재 개발 브랜치: `version/0.3.3`
 
 ## 방향과 원칙
 
@@ -23,6 +23,8 @@ Dure의 다음 목표는 기능 수를 빠르게 늘리는 것이 아니라, 현
 
 우선순위 작업:
 
+- `dure admin diagnose`로 등록 노드의 하드웨어, 설치 모델, LLM 컨테이너 상태를 모아 Codex 기반
+  GPU/Ray 배치 및 CPU utility 역할 진단을 제공한다. 진단은 advisory이며 자동 적용하지 않는다.
 - 중앙 DB의 최신 `NodeProfile`을 이용해 `dure admin deployment create --nodes ...`를 구현하고
   수동 profile JSON 전달을 제거한다.
 - 패키지에 고정된 LAN IP/HTTP 설정을 릴리스 환경에서 생성되는 HTTPS controller 설정으로
