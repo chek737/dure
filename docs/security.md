@@ -53,22 +53,22 @@
 
 ## 콘텐츠 주소 캐시의 신뢰 경계
 
-노드 준비 라이브러리는 Dure 소유 고정 루트와 매니페스트 digest에서만 CAS·staging·final 경로를 계산합니다. 호출자가 임의 호스트 경로를 넘기는 인터페이스가 없고, HTTPS object URL도 검증된 `TrustedHTTPSOrigin` 객체와 청크 SHA-256으로만 만듭니다. userinfo·query·fragment, 허용되지 않은 redirect host·port, 모호한 길이·범위, 압축·chunked 응답을 거부합니다. 원본 토큰, cookie, 임의 헤더와 raw URL은 매니페스트·시도 저널·실패 결과에 저장하지 않습니다. 현재는 이 객체를 직접 받는 내부 Python API까지만 있으며, 노드 로컬 설정에서 구성하는 Agent handler는 다음 중앙 준비 PR 범위입니다.
+production 기본값에서 노드 준비 라이브러리는 Dure 소유 고정 루트와 매니페스트 digest로 CAS·staging·final 경로를 계산합니다. 내부 저장소 생성자는 테스트·로컬 임베딩용 루트 override를 허용하지만 원격 task payload와 연결하면 안 됩니다. 최초 HTTPS object URL은 검증된 `TrustedHTTPSOrigin` 객체와 청크 SHA-256으로 만들고 userinfo·query·fragment와 허용되지 않은 redirect host·port를 거부합니다. 허용 host의 redirect path는 신뢰 origin 경계에 속합니다. 모호한 길이·범위, 압축·chunked 응답도 거부합니다. 원본 토큰, cookie, 임의 헤더와 raw URL은 매니페스트·시도 저널·실패 결과에 저장하지 않습니다. 현재는 이 객체를 직접 받는 내부 Python API까지만 있으며, 노드 로컬 설정에서 구성하는 Agent handler는 다음 중앙 준비 PR 범위입니다.
 
 각 청크와 매니페스트에는 프로세스 잠금을 사용합니다. 기존 CAS는 크기·소유권·link 수·쓰기 권한·전체 SHA-256이 모두 맞을 때만 재사용합니다. 부분 다운로드는 이어받은 뒤 전체 청크 SHA-256을 다시 계산하고, 부분 조립은 재개할 prefix를 검증된 CAS 바이트와 직접 비교합니다. 파일·디렉터리 `fsync`, 전체 트리 검사와 v2 marker 기록 뒤 Linux no-replace rename을 사용하므로 marker 없는 staging이나 검증되지 않은 final을 READY로 해석하지 않습니다.
 
 실패 시의 기본 정책은 보존과 차단입니다.
 
-- 오염된 청크, staging, marker와 final을 덮어쓰거나 자동 삭제하지 않습니다.
+- 이미 게시된 CAS 청크, 비일시 staging 항목, marker와 final의 오염·충돌은 덮어쓰거나 자동 삭제하지 않습니다. 다운로드 응답 거부나 digest 불일치가 난 transient 청크 `.part`는 안전하게 0바이트로 되돌리고, marker 전용 `.part`는 같은 digest 재시도에서 검증 후 다시 씁니다.
 - 예상 밖 파일, symlink·hardlink·FIFO·장치, 경로 탈출과 group/world writable 경계를 거부합니다.
 - `config.json`은 최대 1MiB의 일반 JSON 객체로 읽고, 선언된 양자화 방식이 marker identity와 다르면 활성화하지 않습니다.
 - 중단 재시도는 매니페스트별 고정 staging 하나를 사용해 반복 실패에 따른 무한 디렉터리 누적을 막습니다.
 - 디스크 계산은 검증된 완성 파일과 부분 파일의 실제 할당량만 반영하고 기본 여유 공간을 남깁니다.
 - 자동 재귀 삭제, 자동 cache eviction과 공식 quarantine는 아직 없습니다. staging·비활성 final의 수동 격리도 모든 활성 참조가 없음을 확인한 정확한 digest 경로 하나로 제한합니다. 여러 매니페스트가 공유할 수 있는 CAS 청크는 전역 미참조를 증명할 수 없으면 옮기거나 삭제하지 않습니다.
 
-Agent와 생성 캐시는 유효 사용자 ID가 root인 실행 경계를 요구하고, root 소유이며 group/world writable이 아닌 부모·후보·marker만 신뢰합니다. 패키지는 `/var/lib/dure`를 `root:dure` 소유 `0750`으로 두고 서버 쓰기 상태만 `/var/lib/dure/server`의 `dure:dure` `0750`으로 분리합니다. 이는 비-root `dure` 서버 계정이 root Agent의 캐시 루트 이름을 교체하는 것을 막지만 로컬 root 침해를 방어하지는 않습니다. 기존 설치에서 중앙 서버가 로컬 파일을 써야 한다면 상위 디렉터리가 아니라 서버 전용 하위 경로를 사용해야 합니다. Dure는 NVIDIA host driver를 설치하거나 변경하지 않습니다.
+패키지의 production Agent는 root로 실행하므로 기본 경로의 생성 캐시는 root 소유가 됩니다. 준비 라이브러리 자체는 설정 루트와 가장 가까운 기존 조상을 현재 유효 사용자 소유로 요구하므로 테스트·로컬 임베딩 override에서는 반드시 root만 허용하는 것은 아닙니다. 인벤토리와 벤치마크는 `/var/lib/dure/models` 루트와 후보·`config.json`·marker를 현재 Agent 사용자 소유이며 group/world writable이 아닌 항목으로 검사하지만, 상위 `/var/lib/dure`를 매번 재검사하지는 않습니다. 패키지는 그 상위를 `root:dure` `0750`, 서버 쓰기 상태만 `/var/lib/dure/server`의 `dure:dure` `0750`으로 둡니다. 이는 비-root `dure` 서버 계정의 캐시 루트 교체를 막지만 로컬 root 침해를 방어하지는 않습니다. Dure는 NVIDIA host driver를 설치하거나 변경하지 않습니다.
 
-로컬 attempt journal은 마지막 폐쇄형 상태만 보존하고 URL·token·응답 본문·예외 원문을 기록하지 않습니다. 중앙 관측, 자동 경보, operation 진행률이나 `READY` 증적은 아직 없습니다.
+저널 경계가 정상일 때 로컬 attempt journal은 마지막 폐쇄형 상태만 보존하고 URL·token·응답 본문·예외 원문을 기록하지 않습니다. 루트·권한·저널 I/O 자체가 실패하면 원래 작업의 실패 상태도 남기지 못할 수 있습니다. 중앙 관측, 자동 경보, operation 진행률이나 `READY` 증적은 아직 없습니다.
 
 이 계층은 SHA-256 기대값과 받은 바이트의 일치만 증명합니다. 매니페스트 작성자, 모델 게시자, 라이선스, 악성 코드 부재나 origin 운영자를 인증하지 않습니다. 또한 `0.3.15`에는 중앙 준비 task·READY 증적·OCI 이미지 준비가 없으므로 중앙 배포 소비 권한으로 해석해서는 안 됩니다.
 

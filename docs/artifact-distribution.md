@@ -94,7 +94,7 @@ GET  /v1/admin/model-artifacts/{artifact_id}/manifest
 
 ## 노드 캐시 준비 계약
 
-현재 내부 준비 API는 생성 시 검증된 `TrustedHTTPSOrigin` 객체에서만 청크를 받습니다. object URL은 이 객체와 매니페스트의 청크 SHA-256으로 만들며, 매니페스트·중앙 DB·로컬 저널에는 raw URL이나 자격 증명을 넣지 않습니다. 리디렉션은 객체의 허용 host·port 안에서만 가능하고 query, fragment, userinfo, 압축 전송, `Transfer-Encoding`, 모호한 `Content-Length`와 범위가 다른 `Content-Range`를 거부합니다. 다만 이 객체를 노드 설정에서 만드는 production 연결은 아직 구현되지 않았습니다.
+현재 내부 준비 API는 생성 시 검증된 `TrustedHTTPSOrigin` 객체에서만 청크를 받습니다. 최초 object URL은 이 객체와 매니페스트의 청크 SHA-256으로 만듭니다. redirect는 query·fragment·userinfo 없이 객체의 허용 host·port 안에 있어야 하지만, 그 host의 redirect path 자체는 신뢰 origin의 범위입니다. 매니페스트·중앙 DB·로컬 저널에는 raw URL이나 자격 증명을 넣지 않습니다. 압축 전송, `Transfer-Encoding`, 모호한 `Content-Length`와 범위가 다른 `Content-Range`도 거부합니다. 다만 이 객체를 노드 설정에서 만드는 production 연결은 아직 구현되지 않았습니다.
 
 처리 순서는 다음과 같습니다.
 
@@ -114,16 +114,16 @@ GET  /v1/admin/model-artifacts/{artifact_id}/manifest
 
 실패는 검증되지 않은 캐시를 활성 상태로 보이게 하지 않습니다.
 
-- timeout·연결 중단은 검증 가능한 `.part`를 보존하고 제한 횟수 안에서 같은 offset부터 이어받습니다.
-- 응답 계약 위반이나 청크 digest 불일치는 해당 청크 부분 파일을 정확히 0바이트로 되돌린 뒤 제한 재시도하며, 최종 실패 코드는 원격 본문·URL·예외 원문 없이 기록합니다.
+- `MODEL_STORE_DOWNLOAD_TIMEOUT`과 응답 body를 읽던 중의 `MODEL_STORE_DOWNLOAD_INTERRUPTED`는 검증 가능한 `.part`를 보존하고 제한 횟수 안에서 같은 offset부터 이어받습니다.
+- 응답 계약 위반, non-timeout DNS·TLS·connect 거부 또는 청크 digest 불일치는 `MODEL_STORE_DOWNLOAD_REJECTED`나 `MODEL_STORE_DIGEST_MISMATCH`로 분류하고 해당 청크 부분 파일을 정확히 0바이트로 되돌린 뒤 제한 재시도합니다. 최종 실패 코드에는 원격 본문·URL·예외 원문을 넣지 않습니다.
 - 조립 중단은 매니페스트별 staging 하나와 파일별 결정적 부분 파일에 남습니다. 다음 호출은 기존 prefix를 CAS 바이트와 다시 비교한 뒤 이어 쓰므로 반복 실패마다 새 모델 크기만큼 디스크를 누적하지 않습니다.
 - CAS 충돌, 오염된 staging, 추가 파일, symlink·hardlink·special file, 잘못된 final은 보존한 채 실패합니다. 자동 덮어쓰기·재귀 삭제·캐시 퇴출은 하지 않습니다.
-- 디스크 부족은 가능하면 네트워크와 staging 생성 전에 거부하고, 쓰기 도중 부족해져도 marker나 final을 만들지 않습니다.
+- 디스크 부족은 가능하면 네트워크와 staging 생성 전에 거부합니다. 쓰기 도중 부족해지면 유효 marker나 final은 게시하지 않고, 파일·marker의 결정적 부분 파일만 남겨 다음 호출에서 검증한 뒤 재개합니다.
 - marker가 있는 staging은 marker-last 규칙에 따라 전체 트리와 식별자가 정확할 때만 활성화를 다시 시도합니다.
 
 디스크 사전 검사는 공간 예약이 아닙니다. 다른 프로세스나 동시 준비가 공간을 소비해 쓰기 중 `ENOSPC`가 발생할 수 있으며, 이 경우 marker와 final 없이 `MODEL_STORE_DISK_INSUFFICIENT`로 실패합니다. 공간을 확보한 뒤 같은 매니페스트 digest를 재시도합니다.
 
-시도 저널은 `/var/lib/dure/model-store/attempts/<manifesthex>/journal.json`에 남는 로컬 마지막 상태일 뿐입니다. 중앙 operation 진행률, 노드 `READY` 증적 또는 감사 로그가 아닙니다.
+저장소와 저널 경계 자체가 정상이라면 시도 저널은 `/var/lib/dure/model-store/attempts/<manifesthex>/journal.json`에 로컬 마지막 상태를 남깁니다. 루트·권한·저널 I/O 자체가 실패하면 원래 작업의 실패 저널도 기록하지 못할 수 있습니다. 어느 경우든 중앙 operation 진행률, 노드 `READY` 증적 또는 감사 로그가 아닙니다.
 
 현재 버전에는 참조 검사, quarantine 또는 삭제 CLI가 없습니다. 반복 실패를 복구할 때는 먼저 같은 매니페스트의 준비 실행이 없음을 확인하고 저널의 폐쇄형 실패 코드와 정확한 digest를 기록합니다. staging이나 비활성 final도 어떤 배포·벤치마크·준비가 참조하지 않는다는 사실을 확인한 뒤 정확한 단일 digest 경로만 별도 보존 위치로 옮겨야 합니다. CAS 청크는 여러 매니페스트가 공유하므로 모든 등록 매니페스트와 진행 중 준비의 미참조를 증명할 수 없다면 옮기거나 삭제하면 안 됩니다. glob, 상위 모델 루트, 실행 중인 캐시를 대상으로 재귀 삭제하면 안 됩니다. 감사와 전역 참조 검사를 포함한 공식 quarantine 명령은 후속 범위입니다.
 
@@ -132,7 +132,7 @@ GET  /v1/admin/model-artifacts/{artifact_id}/manifest
 ## 알려진 제한
 
 - Linux kernel이나 대상 파일시스템이 `renameat2(RENAME_NOREPLACE)`를 지원하지 않으면 `MODEL_STORE_ATOMIC_ACTIVATION_UNAVAILABLE`로 실패합니다. copy 또는 기존 대상 교체 fallback은 없습니다.
-- 디스크 사전 검사는 예약이 아니며, 검사 뒤 다른 쓰기가 공간을 소비하면 조립 중 `ENOSPC`로 실패할 수 있습니다.
+- 디스크 사전 검사는 예약이 아니며, 검사 뒤 다른 쓰기가 공간을 소비하면 조립 중 `ENOSPC`로 실패할 수 있습니다. 파일 또는 marker 부분 파일은 남을 수 있지만 유효 marker·final은 게시하지 않고 같은 digest 재시도에서 검증해 이어갑니다.
 - 검증된 CAS 청크는 준비 성공 뒤에도 유지됩니다. 자동 eviction이 없으므로 `FULL_SNAPSHOT`과 함께 추가 디스크 공간을 계속 차지할 수 있습니다.
 - attempt journal은 매니페스트별 append-only 감사 이력이 아니라 마지막 상태 한 건을 원자적으로 교체하는 로컬 진단값입니다.
 - 현재 HTTPS 전송기는 인증 token, cookie 또는 사용자 지정 header를 지원하지 않습니다. 별도 인증 정보 없이 네트워크와 TLS 경계에서 접근 가능한 신뢰 origin이 필요합니다.
