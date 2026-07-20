@@ -12,9 +12,16 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from . import __version__
+from .artifact_prepare import (
+    ArtifactPreparationExecutor,
+    is_artifact_preparation_task,
+    preparation_failure_code,
+    validate_preparation_history,
+    validate_preparation_result,
+)
 from .command import SubprocessRunner
 from .http import APIError, JSONClient
 from .model_cache import (
@@ -436,6 +443,9 @@ class TaskExecutor:
         runner=None,
         state_path: Path | None = None,
         benchmark_executor: SafeBenchmarkExecutor | None = None,
+        preparation_executor: ArtifactPreparationExecutor | None = None,
+        artifact_origin_config: object = None,
+        manifest_loader: Callable[[str], dict] | None = None,
         build_commit: str | None | object = _BUILD_COMMIT_UNSET,
     ) -> None:
         self.node_id = node_id
@@ -456,6 +466,12 @@ class TaskExecutor:
 
             benchmark_executor = SafeBenchmarkRuntime(runner=runner)
         self.benchmark_executor = benchmark_executor
+        self.preparation_executor = preparation_executor or ArtifactPreparationExecutor(
+            node_id,
+            runner=runner,
+            origin_config=artifact_origin_config,
+            manifest_loader=manifest_loader,
+        )
 
     def _profile(self):
         profile = NodeProbe(self.runner).collect()
@@ -524,6 +540,9 @@ class TaskExecutor:
         return payload, plan, assignment
 
     def execute(self, task: dict) -> dict:
+        task_type = task.get("type") if type(task) is dict else None
+        if is_artifact_preparation_task(task_type):
+            return self.preparation_executor.execute(task)
         try:
             kind = TaskType(task["type"])
         except (KeyError, ValueError) as exc:
@@ -660,9 +679,24 @@ class Agent:
             runner=runner,
             state_path=self.state_path,
             benchmark_executor=benchmark_executor,
+            artifact_origin_config=config.get("artifact_origin"),
+            manifest_loader=self._load_artifact_manifest,
             build_commit=self.build_commit,
         )
         self.running = True
+
+    def _load_artifact_manifest(self, task_id: str) -> dict:
+        response = self.client.request(
+            "GET",
+            f"/v1/agent/tasks/{task_id}/artifact-manifest",
+        )
+        if (
+            type(response) is not dict
+            or set(response) != {"manifest"}
+            or type(response["manifest"]) is not dict
+        ):
+            raise ValueError("artifact manifest response is invalid")
+        return response["manifest"]
 
     def stop(self, *_args) -> None:
         self.running = False
@@ -679,9 +713,37 @@ class Agent:
             return False
         task_id = task["id"]
         is_benchmark = task.get("type") == TaskType.BENCHMARK.value
+        is_preparation = is_artifact_preparation_task(task.get("type"))
         previous = self.history.get("completed", {}).get(task_id)
         if previous is not None:
-            if is_benchmark:
+            if is_preparation:
+                try:
+                    status_value, replay = validate_preparation_history(
+                        task,
+                        previous,
+                        self.executor.node_id,
+                    )
+                except Exception:
+                    status_value = "failed"
+                    replay = "PREPARATION_HISTORY_INVALID"
+                    self.history.setdefault("completed", {})[task_id] = {
+                        "status": status_value,
+                        "error": replay,
+                    }
+                    _atomic_json(self.history_path, self.history)
+                if status_value == "failed":
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/fail",
+                        {"error": replay},
+                    )
+                else:
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/complete",
+                        {"result": replay},
+                    )
+            elif is_benchmark:
                 try:
                     benchmark = _validated_benchmark_payload(
                         task.get("payload") or {}
@@ -786,6 +848,12 @@ class Agent:
         try:
             try:
                 result = self.executor.execute(task)
+                if is_preparation:
+                    result = validate_preparation_result(
+                        task,
+                        result,
+                        self.executor.node_id,
+                    )
             except Exception as exc:
                 if is_benchmark and getattr(exc, "defer_benchmark", False) is True:
                     LOG.warning(
@@ -796,6 +864,13 @@ class Agent:
                     if is_benchmark:
                         error = _benchmark_failure_code(exc)
                         LOG.error("BENCHMARK task %s failed with %s", task_id, error)
+                    elif is_preparation:
+                        error = preparation_failure_code(exc)
+                        LOG.error(
+                            "artifact preparation task %s failed with %s",
+                            task_id,
+                            error,
+                        )
                     else:
                         LOG.exception("task %s failed", task_id)
                         error = str(exc)[:8192]
