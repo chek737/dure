@@ -112,9 +112,22 @@ dure admin verify <deployment-id> --nodes <ray-head-node-id> --api
 
 `start`, `stop`, `restart`는 동일한 deployment ID와 명시적 node 목록을 요구합니다. bulk 요청은 노드마다 독립 task를 만들므로 부분 실패를 확인해야 하며 all-or-nothing으로 가정해서는 안 됩니다.
 
+## 모델 레지스트리 운영
+
+관리자 API는 모델 아티팩트, 런타임 릴리스, 모델 릴리스와 배치 프로필을 별도로 관리합니다.
+
+- `POST /v1/admin/model-artifacts`: 변경 불가능한 모델 리비전과 매니페스트 다이제스트 등록
+- `POST /v1/admin/runtime-releases`: OCI 다이제스트로 고정한 vLLM 런타임 등록
+- `POST /v1/admin/model-releases`: 아티팩트와 런타임 조합 생성
+- `POST /v1/admin/model-releases/{id}/placements`: `DRAFT` 릴리스에 형식화된 배치·SLO 정책 추가
+- `POST /v1/admin/model-releases/{id}/transition`: 허용된 상태 전이 수행
+- `GET /v1/admin/model-releases`: 릴리스와 배치 프로필 조회
+
+모든 경로는 관리자 전달자 인증을 요구합니다. 모델 리비전, 매니페스트, 런타임 이미지가 고정되지 않으면 등록할 수 없고, 허용 목록 밖의 Docker 인자·환경 변수·마운트·호스트 경로는 요청 단계에서 거부됩니다. 레지스트리 등록이나 상태 전이만으로 에이전트 작업 또는 호스트 변경이 발생하지 않습니다.
+
 ## 계획된 모델 추천과 단계적 전환
 
-정책 기반 `recommend`, 모델 레지스트리, 세대별 단계적 전환은 아직 구현되지 않았습니다. 구현된 뒤의 운영 원칙은 다음과 같습니다.
+모델 레지스트리는 구현되었지만 정책 기반 `recommend`, 벤치마크 승격 게이트와 세대별 단계적 전환은 아직 구현되지 않았습니다. 후속 구현의 운영 원칙은 다음과 같습니다.
 
 1. 최신 `PROBE`로 인벤토리를 갱신합니다.
 2. 추천의 후보, 탈락 사유, 모델 리비전, 이미지 다이제스트, 네트워크 사전 조건을 검토합니다.
