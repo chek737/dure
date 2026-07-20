@@ -45,6 +45,7 @@ MODEL_STORE_FAILURE_CODES = frozenset(
         "MODEL_STORE_IO_FAILED",
         "MODEL_STORE_DISK_INSUFFICIENT",
         "MODEL_STORE_DOWNLOAD_TIMEOUT",
+        "MODEL_STORE_DOWNLOAD_INTERRUPTED",
         "MODEL_STORE_DOWNLOAD_REJECTED",
         "MODEL_STORE_DIGEST_MISMATCH",
     }
@@ -75,6 +76,7 @@ class ModelStoreError(RuntimeError):
         "MODEL_STORE_IO_FAILED": "model store I/O failed",
         "MODEL_STORE_DISK_INSUFFICIENT": "model store has insufficient disk space",
         "MODEL_STORE_DOWNLOAD_TIMEOUT": "model store download timed out",
+        "MODEL_STORE_DOWNLOAD_INTERRUPTED": "model store download was interrupted",
         "MODEL_STORE_DOWNLOAD_REJECTED": "model store download response was rejected",
         "MODEL_STORE_DIGEST_MISMATCH": "model store content digest did not match",
     }
@@ -250,6 +252,10 @@ class ContentAddressedModelStore:
         hexadecimal = _digest_hex(digest, field="chunk_digest")
         return self.chunk_root / hexadecimal[:2] / hexadecimal
 
+    def chunk_partial_path(self, digest: str) -> Path:
+        path = self.chunk_path(digest)
+        return path.with_name(f"{path.name}.part")
+
     def ensure_chunk_directory(self, digest: str) -> Path:
         self.initialize()
         directory = self.chunk_path(digest).parent
@@ -323,7 +329,11 @@ class ContentAddressedModelStore:
         return self._lock("chunk", chunk_digest, blocking=blocking)
 
     def _verified_chunk_without_lock(
-        self, chunk_digest: str, expected_size: int
+        self,
+        chunk_digest: str,
+        expected_size: int,
+        *,
+        allowed_link_counts: frozenset[int] = frozenset({1}),
     ) -> Path | None:
         if (
             type(expected_size) is not int
@@ -349,10 +359,34 @@ class ContentAddressedModelStore:
             return None
         except OSError as exc:
             raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+        if path_state.st_nlink == 2 and allowed_link_counts == frozenset({1}):
+            partial = self.chunk_partial_path(chunk_digest)
+            try:
+                partial_state = partial.lstat()
+            except FileNotFoundError:
+                partial_state = None
+            except OSError as exc:
+                raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+            if (
+                partial_state is not None
+                and stat.S_ISREG(partial_state.st_mode)
+                and partial_state.st_dev == path_state.st_dev
+                and partial_state.st_ino == path_state.st_ino
+                and partial_state.st_nlink == 2
+            ):
+                self._verified_chunk_without_lock(
+                    chunk_digest,
+                    expected_size,
+                    allowed_link_counts=frozenset({2}),
+                )
+                self._unlink_verified_partial(partial)
+                return self._verified_chunk_without_lock(
+                    chunk_digest, expected_size
+                )
         if (
             not stat.S_ISREG(path_state.st_mode)
             or path_state.st_uid != os.geteuid()
-            or path_state.st_nlink != 1
+            or path_state.st_nlink not in allowed_link_counts
             or path_state.st_mode & 0o022
             or path_state.st_size != expected_size
         ):
@@ -367,7 +401,7 @@ class ContentAddressedModelStore:
                 or before.st_dev != path_state.st_dev
                 or before.st_ino != path_state.st_ino
                 or before.st_uid != os.geteuid()
-                or before.st_nlink != 1
+                or before.st_nlink not in allowed_link_counts
                 or before.st_mode & 0o022
                 or before.st_size != expected_size
             ):
@@ -418,6 +452,141 @@ class ContentAddressedModelStore:
     ) -> Path | None:
         with self.chunk_lock(chunk_digest, blocking=blocking):
             return self._verified_chunk_without_lock(chunk_digest, expected_size)
+
+    def open_chunk_partial(
+        self, chunk_digest: str, expected_size: int
+    ) -> tuple[Path, int, int]:
+        if (
+            type(expected_size) is not int
+            or not 1 <= expected_size <= MAX_TRACKED_BYTES
+        ):
+            raise ModelStoreError("MODEL_STORE_INVALID")
+        self.ensure_chunk_directory(chunk_digest)
+        path = self.chunk_partial_path(chunk_digest)
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | _CLOEXEC | _NOFOLLOW,
+                0o600,
+            )
+            observed = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or observed.st_mode & 0o077
+                or observed.st_size > expected_size
+            ):
+                raise ModelStoreError("MODEL_STORE_CHUNK_COLLISION")
+            return path, descriptor, observed.st_size
+        except ModelStoreError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR}:
+                raise ModelStoreError("MODEL_STORE_CHUNK_COLLISION") from exc
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+
+    def _unlink_verified_partial(self, path: Path) -> None:
+        try:
+            path.unlink()
+            _fsync_directory(path.parent)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+
+    def publish_chunk_partial(
+        self, chunk_digest: str, expected_size: int
+    ) -> Path:
+        """Publish an already fsynced and verified ``.part`` without overwrite.
+
+        The caller must hold the matching chunk lock.  This method revalidates
+        both paths so a collision is preserved for operator inspection.
+        """
+
+        partial = self.chunk_partial_path(chunk_digest)
+        final = self.chunk_path(chunk_digest)
+        try:
+            partial_state = partial.lstat()
+        except FileNotFoundError as exc:
+            raise ModelStoreError("MODEL_STORE_CHUNK_COLLISION") from exc
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+        if (
+            not stat.S_ISREG(partial_state.st_mode)
+            or partial_state.st_uid != os.geteuid()
+            or partial_state.st_nlink not in {1, 2}
+            or partial_state.st_mode & 0o077
+            or partial_state.st_size != expected_size
+        ):
+            raise ModelStoreError("MODEL_STORE_CHUNK_COLLISION")
+
+        try:
+            final_state = final.lstat()
+        except FileNotFoundError:
+            final_state = None
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+
+        if final_state is not None:
+            same_publication = (
+                stat.S_ISREG(final_state.st_mode)
+                and final_state.st_dev == partial_state.st_dev
+                and final_state.st_ino == partial_state.st_ino
+                and final_state.st_nlink == partial_state.st_nlink == 2
+            )
+            if same_publication:
+                self._verified_chunk_without_lock(
+                    chunk_digest,
+                    expected_size,
+                    allowed_link_counts=frozenset({2}),
+                )
+                self._unlink_verified_partial(partial)
+                verified = self._verified_chunk_without_lock(
+                    chunk_digest, expected_size
+                )
+                if verified is None:  # pragma: no cover - lock excludes Dure races
+                    raise ModelStoreError("MODEL_STORE_IO_FAILED")
+                return verified
+
+            if partial_state.st_nlink != 1:
+                raise ModelStoreError("MODEL_STORE_CHUNK_COLLISION")
+
+            verified = self._verified_chunk_without_lock(
+                chunk_digest, expected_size
+            )
+            if verified is None:  # pragma: no cover - lstat observed it above
+                raise ModelStoreError("MODEL_STORE_IO_FAILED")
+            self._unlink_verified_partial(partial)
+            return verified
+
+        if partial_state.st_nlink != 1:
+            raise ModelStoreError("MODEL_STORE_CHUNK_COLLISION")
+
+        try:
+            os.link(partial, final, follow_symlinks=False)
+            _fsync_directory(final.parent)
+        except FileExistsError:
+            verified = self._verified_chunk_without_lock(
+                chunk_digest, expected_size
+            )
+            if verified is None:  # pragma: no cover - EEXIST guarantees an entry
+                raise ModelStoreError("MODEL_STORE_IO_FAILED")
+            self._unlink_verified_partial(partial)
+            return verified
+        except OSError as exc:
+            raise ModelStoreError("MODEL_STORE_IO_FAILED") from exc
+
+        self._unlink_verified_partial(partial)
+        verified = self._verified_chunk_without_lock(chunk_digest, expected_size)
+        if verified is None:  # pragma: no cover - published under the chunk lock
+            raise ModelStoreError("MODEL_STORE_IO_FAILED")
+        return verified
 
     def attempt_journal_path(self, manifest_digest: str) -> Path:
         hexadecimal = _digest_hex(manifest_digest, field="manifest_digest")
