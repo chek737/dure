@@ -465,6 +465,371 @@ class ArtifactFileChunk(Base):
     length_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class StageArtifactVariant(Base):
+    __tablename__ = "stage_artifact_variants"
+    __table_args__ = (
+        CheckConstraint(
+            "length(artifact_set_digest) = 71 "
+            "AND artifact_set_digest LIKE 'sha256:%'",
+            name="ck_stage_variant_set_sha256",
+        ),
+        CheckConstraint(
+            "length(contract_identity_digest) = 71 "
+            "AND contract_identity_digest LIKE 'sha256:%'",
+            name="ck_stage_variant_contract_sha256",
+        ),
+        CheckConstraint(
+            "length(source_manifest_digest) = 71 "
+            "AND source_manifest_digest LIKE 'sha256:%'",
+            name="ck_stage_variant_source_sha256",
+        ),
+        CheckConstraint(
+            "runtime_image LIKE '%@sha256:" + "_" * 64 + "'",
+            name="ck_stage_variant_runtime_digest",
+        ),
+        CheckConstraint(
+            "vllm_version = '0.9.0'",
+            name="ck_stage_variant_vllm_version",
+        ),
+        CheckConstraint(
+            "length(exporter_build_digest) = 71 "
+            "AND exporter_build_digest LIKE 'sha256:%'",
+            name="ck_stage_variant_exporter_sha256",
+        ),
+        CheckConstraint(
+            "architecture = 'Qwen2ForCausalLM'",
+            name="ck_stage_variant_architecture",
+        ),
+        CheckConstraint(
+            "quantization = 'awq'",
+            name="ck_stage_variant_quantization",
+        ),
+        CheckConstraint(
+            "tensor_parallel_size = 1",
+            name="ck_stage_variant_tp_supported",
+        ),
+        CheckConstraint(
+            "pipeline_parallel_size > 0 AND pipeline_parallel_size <= 64",
+            name="ck_stage_variant_pp_range",
+        ),
+        CheckConstraint(
+            "rank_count = tensor_parallel_size * pipeline_parallel_size",
+            name="ck_stage_variant_rank_count",
+        ),
+        CheckConstraint(
+            "loader_format = 'VLLM_SHARDED_STATE_V1'",
+            name="ck_stage_variant_loader_format",
+        ),
+        CheckConstraint(
+            "status IN ('DRAFT', 'VALIDATED', 'REVOKED')",
+            name="ck_stage_variant_status",
+        ),
+        CheckConstraint(
+            "length(canonical_identity_json) > 0",
+            name="ck_stage_variant_identity_json_nonempty",
+        ),
+        CheckConstraint(
+            "(status = 'DRAFT' AND validated_at IS NULL AND revoked_at IS NULL) OR "
+            "(status = 'VALIDATED' AND validated_at IS NOT NULL AND revoked_at IS NULL) OR "
+            "(status = 'REVOKED' AND revoked_at IS NOT NULL)",
+            name="ck_stage_variant_status_timestamps",
+        ),
+        UniqueConstraint(
+            "artifact_set_digest",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            name="uq_stage_variant_set_topology",
+        ),
+        UniqueConstraint(
+            "contract_identity_digest",
+            name="uq_stage_variant_contract_identity",
+        ),
+        Index("ix_stage_variants_source_manifest", "source_manifest_digest"),
+        Index("ix_stage_variants_runtime_release", "runtime_release_id"),
+        Index("ix_stage_variants_status", "status"),
+    )
+    artifact_set_digest: Mapped[str] = mapped_column(String(71), primary_key=True)
+    contract_identity_digest: Mapped[str] = mapped_column(
+        String(71), nullable=False
+    )
+    source_manifest_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifests.digest",
+            name="fk_stage_variant_source_manifest",
+        ),
+        nullable=False,
+    )
+    runtime_release_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "runtime_releases.id",
+            name="fk_stage_variant_runtime_release",
+        ),
+        nullable=False,
+    )
+    runtime_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    vllm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    exporter_build_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    architecture: Mapped[str] = mapped_column(String(100), nullable=False)
+    quantization: Mapped[str] = mapped_column(String(40), nullable=False)
+    tensor_parallel_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    pipeline_parallel_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    rank_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    loader_format: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="DRAFT", nullable=False)
+    canonical_identity_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class StageArtifactRank(Base):
+    __tablename__ = "stage_artifact_ranks"
+    __table_args__ = (
+        CheckConstraint("length(id) = 36", name="ck_stage_rank_id_length"),
+        CheckConstraint(
+            "rank >= 0 AND rank = pipeline_rank * tensor_parallel_size + tensor_rank",
+            name="ck_stage_rank_linear_coordinate",
+        ),
+        CheckConstraint(
+            "pipeline_rank >= 0 AND pipeline_rank < pipeline_parallel_size",
+            name="ck_stage_rank_pipeline_range",
+        ),
+        CheckConstraint(
+            "tensor_rank >= 0 AND tensor_rank < tensor_parallel_size",
+            name="ck_stage_rank_tensor_range",
+        ),
+        CheckConstraint(
+            "tensor_parallel_size = 1 AND pipeline_parallel_size > 0",
+            name="ck_stage_rank_supported_topology",
+        ),
+        CheckConstraint(
+            "length(manifest_digest) = 71 AND manifest_digest LIKE 'sha256:%'",
+            name="ck_stage_rank_manifest_sha256",
+        ),
+        CheckConstraint(
+            "tensor_key_count > 0",
+            name="ck_stage_rank_tensor_count_positive",
+        ),
+        CheckConstraint(
+            "length(tensor_keys_digest) = 71 "
+            "AND tensor_keys_digest LIKE 'sha256:%'",
+            name="ck_stage_rank_tensor_keys_sha256",
+        ),
+        CheckConstraint(
+            "weight_size_bytes > 0",
+            name="ck_stage_rank_weight_size_positive",
+        ),
+        ForeignKeyConstraint(
+            ["variant_id", "tensor_parallel_size", "pipeline_parallel_size"],
+            [
+                "stage_artifact_variants.artifact_set_digest",
+                "stage_artifact_variants.tensor_parallel_size",
+                "stage_artifact_variants.pipeline_parallel_size",
+            ],
+            ondelete="CASCADE",
+            name="fk_stage_rank_variant_topology",
+        ),
+        UniqueConstraint(
+            "variant_id",
+            "rank",
+            name="uq_stage_rank_variant_rank",
+        ),
+        UniqueConstraint(
+            "variant_id",
+            "pipeline_rank",
+            "tensor_rank",
+            name="uq_stage_rank_variant_coordinate",
+        ),
+        UniqueConstraint(
+            "variant_id",
+            "manifest_digest",
+            name="uq_stage_rank_variant_manifest",
+        ),
+        UniqueConstraint(
+            "variant_id",
+            "rank",
+            "manifest_digest",
+            "tensor_keys_digest",
+            name="uq_stage_rank_evidence_identity",
+        ),
+        Index("ix_stage_ranks_manifest_digest", "manifest_digest"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    variant_id: Mapped[str] = mapped_column(String(71), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    pipeline_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    tensor_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    tensor_parallel_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    pipeline_parallel_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifests.digest",
+            name="fk_stage_rank_manifest",
+        ),
+        nullable=False,
+    )
+    tensor_key_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    tensor_keys_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    weight_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StageArtifactValidationEvidence(Base):
+    __tablename__ = "stage_artifact_validation_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "length(identity_digest) = 71 AND identity_digest LIKE 'sha256:%'",
+            name="ck_stage_evidence_identity_sha256",
+        ),
+        CheckConstraint(
+            "length(validation_run_id) = 36",
+            name="ck_stage_evidence_run_id_length",
+        ),
+        CheckConstraint(
+            "registration_sequence > 0",
+            name="ck_stage_evidence_sequence_positive",
+        ),
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_stage_evidence_schema_version",
+        ),
+        CheckConstraint(
+            "kind IN ('SYNTHETIC', 'GPU_EXPORT_LOAD')",
+            name="ck_stage_evidence_kind",
+        ),
+        CheckConstraint(
+            "status IN ('PASSED', 'FAILED', 'NOT_RUN')",
+            name="ck_stage_evidence_status",
+        ),
+        CheckConstraint(
+            "length(validator_version) > 0",
+            name="ck_stage_evidence_validator_nonempty",
+        ),
+        CheckConstraint(
+            "length(validator_build_digest) = 71 "
+            "AND validator_build_digest LIKE 'sha256:%'",
+            name="ck_stage_evidence_validator_sha256",
+        ),
+        CheckConstraint(
+            "(status = 'PASSED' AND rank_count > 0 AND failure_code IS NULL) OR "
+            "(status IN ('FAILED', 'NOT_RUN') AND rank_count >= 0 "
+            "AND failure_code IS NOT NULL)",
+            name="ck_stage_evidence_result_shape",
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR failure_code IN ("
+            "'STAGE_EXPORT_FAILED', 'STAGE_LOAD_FAILED', "
+            "'STAGE_TENSOR_COVERAGE_INVALID', 'STAGE_MANIFEST_MISMATCH', "
+            "'STAGE_TOPOLOGY_MISMATCH', 'STAGE_GPU_NOT_AVAILABLE', "
+            "'STAGE_VALIDATION_NOT_RUN')",
+            name="ck_stage_evidence_failure_code",
+        ),
+        CheckConstraint(
+            "length(canonical_evidence_json) > 0",
+            name="ck_stage_evidence_json_nonempty",
+        ),
+        UniqueConstraint(
+            "variant_id",
+            "registration_sequence",
+            name="uq_stage_evidence_variant_sequence",
+        ),
+        UniqueConstraint(
+            "variant_id",
+            "validation_run_id",
+            name="uq_stage_evidence_variant_run",
+        ),
+        UniqueConstraint(
+            "identity_digest",
+            "variant_id",
+            name="uq_stage_evidence_identity_variant",
+        ),
+        Index(
+            "ix_stage_evidence_variant_kind_sequence",
+            "variant_id",
+            "kind",
+            "registration_sequence",
+        ),
+    )
+    identity_digest: Mapped[str] = mapped_column(String(71), primary_key=True)
+    variant_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "stage_artifact_variants.artifact_set_digest",
+            ondelete="CASCADE",
+            name="fk_stage_evidence_variant",
+        ),
+        nullable=False,
+    )
+    validation_run_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    registration_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    validator_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    validator_build_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    rank_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    canonical_evidence_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StageArtifactValidationRank(Base):
+    __tablename__ = "stage_artifact_validation_ranks"
+    __table_args__ = (
+        CheckConstraint(
+            "rank >= 0",
+            name="ck_stage_evidence_rank_nonnegative",
+        ),
+        CheckConstraint(
+            "length(manifest_digest) = 71 AND manifest_digest LIKE 'sha256:%'",
+            name="ck_stage_evidence_rank_manifest_sha256",
+        ),
+        CheckConstraint(
+            "length(tensor_keys_digest) = 71 "
+            "AND tensor_keys_digest LIKE 'sha256:%'",
+            name="ck_stage_evidence_rank_keys_sha256",
+        ),
+        CheckConstraint(
+            "loaded_tensor_count > 0",
+            name="ck_stage_evidence_rank_tensor_count",
+        ),
+        CheckConstraint(
+            "loaded_weight_size_bytes > 0",
+            name="ck_stage_evidence_rank_weight_size",
+        ),
+        ForeignKeyConstraint(
+            ["evidence_id", "variant_id"],
+            [
+                "stage_artifact_validation_evidence.identity_digest",
+                "stage_artifact_validation_evidence.variant_id",
+            ],
+            ondelete="CASCADE",
+            name="fk_stage_evidence_rank_evidence",
+        ),
+        ForeignKeyConstraint(
+            ["variant_id", "rank", "manifest_digest", "tensor_keys_digest"],
+            [
+                "stage_artifact_ranks.variant_id",
+                "stage_artifact_ranks.rank",
+                "stage_artifact_ranks.manifest_digest",
+                "stage_artifact_ranks.tensor_keys_digest",
+            ],
+            name="fk_stage_evidence_rank_stage",
+        ),
+    )
+    evidence_id: Mapped[str] = mapped_column(String(71), primary_key=True)
+    rank: Mapped[int] = mapped_column(Integer, primary_key=True)
+    variant_id: Mapped[str] = mapped_column(String(71), nullable=False)
+    manifest_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    tensor_keys_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    loaded_tensor_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    loaded_weight_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class RuntimeRelease(Base):
     __tablename__ = "runtime_releases"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
