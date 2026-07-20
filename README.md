@@ -2,9 +2,6 @@
 
 **Dure — Pool compute. Share intelligence.**
 
-Madcamp `26s-w3-c2-05` project repository, formerly named
-`legendary-super-ultra-black-dragon`.
-
 Dure is an early Linux CLI and node agent for building resource-aware community LLM infrastructure. It inventories a node, classifies useful roles, creates a model deployment plan, prepares model artifacts and containers, joins a Ray cluster, and verifies GPU/Ray/vLLM readiness.
 
 This repository is an executable MVP. It is not yet a hardened public volunteer-computing platform.
