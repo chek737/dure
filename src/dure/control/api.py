@@ -14,7 +14,19 @@ from sqlalchemy.orm import Session
 from dure import __version__
 
 from .db import Base, make_engine, make_session_factory, session_dependency
+from .benchmark import (
+    BENCHMARK_POLICY_VERSION,
+    BENCHMARK_SUITE_ID,
+    BenchmarkIdentityMismatchError,
+    BenchmarkNotFoundError,
+    BenchmarkPromotionError,
+    benchmark_context,
+    benchmark_evidence_dict,
+    promote_model_release,
+    register_benchmark_evidence,
+)
 from .models import (
+    BenchmarkEvidence,
     Deployment,
     ModelArtifact,
     ModelRelease,
@@ -171,10 +183,85 @@ class DeploymentRecommendationCreate(StrictBody):
         return self
 
 
+class BenchmarkContextRequest(StrictBody):
+    release_id: str
+    placement_id: str
+    node_ids: list[str] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_identities(self):
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("node_ids must not contain duplicates")
+        for value in (self.release_id, self.placement_id, *self.node_ids):
+            try:
+                if str(uuid.UUID(value)) != value:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise ValueError("benchmark identities must be canonical UUIDs") from exc
+        return self
+
+
+class BenchmarkEvidenceCreate(StrictBody):
+    release_id: str
+    placement_id: str
+    suite_id: Literal["dure-serving-slo-v1"] = BENCHMARK_SUITE_ID
+    node_ids: list[str] = Field(min_length=1, max_length=64)
+    inventory_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    artifact_revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    artifact_manifest_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    runtime_image: str = Field(min_length=1, max_length=512)
+    dure_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    policy_version: Literal["benchmark-gate-v1"] = BENCHMARK_POLICY_VERSION
+    input_tokens: int = Field(gt=0)
+    output_tokens: int = Field(gt=0)
+    concurrency: int = Field(gt=0)
+    warmup_requests: int = Field(ge=0)
+    request_count: int = Field(gt=0)
+    duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    oom_count: int = Field(default=0, ge=0)
+    crash_count: int = Field(default=0, ge=0)
+    restart_count: int = Field(default=0, ge=0)
+    ttft_p95_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    tpot_p95_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    e2e_p95_ms: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    throughput_tps: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    success_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
+    vram_headroom_pct: float = Field(ge=0, le=100, allow_inf_nan=False)
+    quality_score: float = Field(ge=0, le=1, allow_inf_nan=False)
+    network_bandwidth_mbps: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    network_rtt_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    packet_loss_pct: float | None = Field(
+        default=None, ge=0, le=100, allow_inf_nan=False
+    )
+    nccl_all_reduce_ok: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_identities(self):
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("node_ids must not contain duplicates")
+        for value in (self.release_id, self.placement_id, *self.node_ids):
+            try:
+                if str(uuid.UUID(value)) != value:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise ValueError("benchmark identities must be canonical UUIDs") from exc
+        return self
+
+
 def _bearer(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bearer authentication required")
     return authorization[7:]
+
+
+def _promotion_error_detail(exc: BenchmarkPromotionError) -> dict:
+    return {
+        "code": exc.code,
+        "message": str(exc),
+        "details": exc.details,
+    }
 
 
 def _task_dict(task: Task) -> dict:
@@ -281,6 +368,8 @@ def _model_release_dict(session: Session, release: ModelRelease) -> dict:
         "id": release.id,
         "status": release.status,
         "quality_rank": release.quality_rank,
+        "promotion_evidence_ids": release.promotion_evidence_ids,
+        "promotion_evidence_digest": release.promotion_evidence_digest,
         "artifact": _artifact_dict(artifact),
         "runtime": _runtime_release_dict(runtime),
         "placements": [_placement_dict(item) for item in placements],
@@ -500,6 +589,12 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     ):
         try:
             release = transition_model_release(session, release_id, body.status)
+        except BenchmarkNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except BenchmarkPromotionError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _promotion_error_detail(exc)
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"release": _model_release_dict(session, release)}
@@ -518,6 +613,82 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    @app.post("/v1/admin/benchmark-context", dependencies=[Depends(admin_auth)])
+    def benchmark_context_get(
+        body: BenchmarkContextRequest,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return {"context": benchmark_context(session, **body.model_dump())}
+        except BenchmarkNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except BenchmarkIdentityMismatchError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except BenchmarkPromotionError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _promotion_error_detail(exc)
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    @app.post("/v1/admin/benchmark-evidence", dependencies=[Depends(admin_auth)])
+    def benchmark_evidence_create(
+        body: BenchmarkEvidenceCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = register_benchmark_evidence(session, **body.model_dump())
+        except BenchmarkNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except (BenchmarkIdentityMismatchError, BenchmarkPromotionError) as exc:
+            detail = (
+                _promotion_error_detail(exc)
+                if isinstance(exc, BenchmarkPromotionError)
+                else str(exc)
+            )
+            raise HTTPException(status.HTTP_409_CONFLICT, detail) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return {"evidence": benchmark_evidence_dict(record)}
+
+    @app.get("/v1/admin/benchmark-evidence", dependencies=[Depends(admin_auth)])
+    def benchmark_evidence_list(
+        release_id: str | None = None,
+        session: Session = Depends(get_session),
+    ):
+        statement = select(BenchmarkEvidence).order_by(
+            BenchmarkEvidence.created_at.desc(), BenchmarkEvidence.id
+        )
+        if release_id is not None:
+            statement = statement.where(BenchmarkEvidence.release_id == release_id)
+        records = session.scalars(statement.limit(200))
+        return {"evidence": [benchmark_evidence_dict(item) for item in records]}
+
+    @app.post(
+        "/v1/admin/model-releases/{release_id}/promote",
+        dependencies=[Depends(admin_auth)],
+    )
+    def model_release_promote(
+        release_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            release, evidence_ids, changed = promote_model_release(session, release_id)
+        except BenchmarkNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except BenchmarkPromotionError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _promotion_error_detail(exc)
+            ) from exc
+        return {
+            "release": _model_release_dict(session, release),
+            "qualification": {
+                "evidence_ids": evidence_ids,
+                "evidence_digest": release.promotion_evidence_digest,
+            },
+            "changed": changed,
+        }
 
     @app.post("/v1/admin/deployments", dependencies=[Depends(admin_auth)])
     def deployment_create(body: DeploymentCreate, session: Session = Depends(get_session)):
