@@ -43,12 +43,41 @@ MODELS: dict[str, ModelSpec] = {
         min_gpu_memory_gib=24,
         default_max_model_len=8192,
         layer_count=80,
+        min_gpu_nodes=3,
+        max_gpu_nodes=3,
+    ),
+    "qwen3-235b-a22b-awq": ModelSpec(
+        model_id="qwen3-235b-a22b-awq",
+        repository="QuantTrio/Qwen3-235B-A22B-Instruct-2507-AWQ",
+        quantization="awq",
+        checkpoint_gib=115.55,
+        min_gpu_memory_gib=24,
+        default_max_model_len=8192,
+        layer_count=94,
+        min_gpu_nodes=7,
+        max_gpu_nodes=7,
     ),
 }
 
 
 def _gpu_for(profile: NodeProfile, gpu_index: int):
     return next(gpu for gpu in profile.gpus if gpu.index == gpu_index)
+
+
+def matching_installed_model(profile: NodeProfile, model: ModelSpec):
+    family = model.model_id.removesuffix("-awq").lower()
+    repository = model.repository.lower()
+    return next(
+        (
+            item
+            for item in profile.installed_models
+            if item.complete
+            and item.path
+            and (item.model_id.lower() == repository or family in item.model_id.lower())
+            and (not item.quantization or item.quantization.lower() == model.quantization.lower())
+        ),
+        None,
+    )
 
 
 def classify_node(profile: NodeProfile) -> tuple[str, list[str]]:
@@ -107,7 +136,11 @@ def build_plan(
 
     healthy: list[tuple[NodeProfile, int]] = []
     for profile in profiles:
-        node_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
+        node_gpus = [
+            gpu
+            for gpu in profile.gpus
+            if gpu.healthy and (gpu.memory_used_mib is None or gpu.memory_used_mib <= 1024)
+        ]
         if node_gpus:
             # The MVP launches one Ray container per node. Prefer the largest GPU
             # until multi-GPU-per-node assignments are implemented explicitly.
@@ -131,7 +164,7 @@ def build_plan(
         if model_id not in MODELS:
             raise ValueError(f"unknown model: {model_id}")
         model = MODELS[model_id]
-        required_stages = 3 if model_id == "qwen2.5-72b-awq" else 1
+        required_stages = model.min_gpu_nodes
         eligible = [
             item
             for item in healthy
@@ -163,6 +196,7 @@ def build_plan(
                 layer_start=start,
                 layer_end=end,
                 role="ray-head" if rank == 0 else "ray-worker",
+                node_address=profile.network.addresses[0] if profile.network.addresses else None,
             )
         )
 
@@ -176,6 +210,22 @@ def build_plan(
         warnings.append("Selected nodes use different NVIDIA driver versions")
     if stages > 1:
         warnings.append("Network bandwidth and RTT must be benchmarked before serving traffic")
+    installed = [matching_installed_model(profile, model) for profile, _ in selected]
+    installed_paths = {item.path for item in installed if item is not None and item.path}
+    if len(installed) == len(selected) and all(installed) and len(installed_paths) == 1:
+        model_path = next(iter(installed_paths))
+        revisions = {item.revision for item in installed if item and item.revision}
+        model_revision = next(iter(revisions)) if len(revisions) == 1 else None
+    else:
+        model_path = f"/var/lib/dure/models/{model.model_id}"
+        model_revision = None
+        for profile, _ in selected:
+            if matching_installed_model(profile, model) is None and (
+                profile.disk_free_mib / 1024 < model.checkpoint_gib * 1.25
+            ):
+                warnings.append(
+                    f"{profile.node_id} lacks local disk headroom; provide a complete shared model path"
+                )
 
     deployment_id = f"{_safe_id(model.model_id)}-{int(time.time())}"
     return DeploymentPlan(
@@ -188,8 +238,8 @@ def build_plan(
         ray_head_node_id=head_profile.node_id,
         ray_head_address=f"{head_ip}:{ray_port}",
         network_interface=interface,
-        model_revision=None,
-        model_path=f"/var/lib/dure/models/{model.model_id}",
+        model_revision=model_revision,
+        model_path=model_path,
         assignments=assignments,
         max_model_len=model.default_max_model_len,
         warnings=warnings,

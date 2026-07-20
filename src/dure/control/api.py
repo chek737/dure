@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dure import __version__
+from dure.capacity import build_capacity_plan
 
 from .db import Base, make_engine, make_session_factory, session_dependency
 from .models import Deployment, Node, NodeProfileRecord, Task, TaskType, utcnow
@@ -221,6 +222,31 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 for node in session.scalars(select(Node).order_by(Node.display_name))
             ],
         }
+
+    @app.get("/v1/admin/capacity", dependencies=[Depends(admin_auth)])
+    def capacity(
+        objective: str = "balanced",
+        reserve_gpus: int = 0,
+        session: Session = Depends(get_session),
+    ):
+        if reserve_gpus < 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "reserve_gpus cannot be negative")
+        profiles = {
+            profile.node_id: profile for profile in session.scalars(select(NodeProfileRecord))
+        }
+        snapshot = {
+            "generated_at": utcnow().isoformat(),
+            "nodes": [
+                _node_dict(node, profiles.get(node.id))
+                for node in session.scalars(select(Node).order_by(Node.display_name))
+            ],
+        }
+        try:
+            return build_capacity_plan(
+                snapshot, objective=objective, reserve_gpus=reserve_gpus
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     @app.get("/v1/admin/nodes/{node_id}", dependencies=[Depends(admin_auth)])
     def node_detail(node_id: str, session: Session = Depends(get_session)):

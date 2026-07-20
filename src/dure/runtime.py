@@ -104,6 +104,9 @@ class ContainerRuntime:
         else:
             ray_command.append(f"--address={plan.ray_head_address}")
         ray_command.extend(["--min-worker-port=20000", "--max-worker-port=21000"])
+        ray_command.append(
+            "--resources=" + json.dumps({f"dure_node_uuid:{assignment.node_id}": 1})
+        )
 
         argv = [
             self.engine,
@@ -234,7 +237,17 @@ class ModelStore:
     def ensure(self, plan: DeploymentPlan, *, accept_download: bool) -> CheckResult:
         target = Path(plan.model_path)
         if (target / "config.json").is_file():
-            return CheckResult("model", True, f"Model is available: {target}")
+            from .probe import NodeProbe
+
+            artifact = NodeProbe(self.runner, model_roots=[target]).artifact_state(target)
+            if artifact["complete"]:
+                return CheckResult("model", True, f"Model is readable and complete: {target}")
+            return CheckResult(
+                "model",
+                False,
+                f"Model artifact is incomplete or unreadable: {target} "
+                f"({artifact['readable_files']}/{artifact['expected_files']} readable)",
+            )
         if not accept_download:
             return CheckResult(
                 "model",
@@ -278,6 +291,11 @@ class ModelStore:
             return CheckResult("model", False, result.stderr or result.stdout)
         if not (temporary / "config.json").is_file():
             return CheckResult("model", False, "Downloaded model is missing config.json")
+        from .probe import NodeProbe
+
+        artifact = NodeProbe(self.runner, model_roots=[temporary]).artifact_state(temporary)
+        if not artifact["complete"]:
+            return CheckResult("model", False, "Downloaded model artifact is incomplete or unreadable")
         if target.exists():
             return CheckResult("model", False, f"Target appeared during download: {target}")
         os.replace(temporary, target)

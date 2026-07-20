@@ -31,7 +31,23 @@ class AgentRunner:
         if command[:4] == ("docker", "stop", "--time", "30"):
             return CommandResult(command, 0, "owned-container")
         if command[:2] == ("docker", "exec") and "ray.cluster_resources" in command[-1]:
-            return CommandResult(command, 0, json.dumps({"GPU": 1}))
+            return CommandResult(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "resources": {"GPU": 1},
+                        "nodes": [
+                            {
+                                "address": "192.168.0.10",
+                                "alive": True,
+                                "gpu": 1,
+                                "resources": {},
+                            }
+                        ],
+                    }
+                ),
+            )
         return CommandResult(command, 0, "ok")
 
 
@@ -44,6 +60,7 @@ class AgentTaskExecutorTests(unittest.TestCase):
             model_path = Path(temporary) / "model"
             model_path.mkdir()
             (model_path / "config.json").write_text("{}", encoding="utf-8")
+            (model_path / "model.safetensors").write_bytes(b"weights")
             state_path = Path(temporary) / "state.json"
             plan = build_plan([node_profile], image="registry/vllm@sha256:" + "a" * 64)
             plan.model_path = str(model_path)

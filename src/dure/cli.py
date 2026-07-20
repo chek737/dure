@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
@@ -81,7 +82,9 @@ def _parser() -> argparse.ArgumentParser:
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
     deployment_create = deployment_sub.add_parser("create")
-    deployment_create.add_argument("--profile", type=Path, action="append", required=True)
+    deployment_source = deployment_create.add_mutually_exclusive_group(required=True)
+    deployment_source.add_argument("--profile", type=Path, action="append")
+    deployment_source.add_argument("--nodes", nargs="+", help="Approved online node UUIDs")
     deployment_create.add_argument("--model", default="auto")
     deployment_create.add_argument("--image", required=True)
     deployment_create.add_argument("--network-interface")
@@ -101,6 +104,28 @@ def _parser() -> argparse.ArgumentParser:
     admin_verify.add_argument("--api", action="store_true")
     tasks = admin_sub.add_parser("tasks")
     tasks.add_argument("--watch", action="store_true")
+    capacity = admin_sub.add_parser(
+        "capacity", help="Build a deterministic advisory plan from central inventory"
+    )
+    capacity.add_argument("--nodes", nargs="+", help="Limit planning to approved node UUIDs")
+    capacity.add_argument(
+        "--objective",
+        choices=("quality", "balanced", "throughput", "reuse-first"),
+        default="balanced",
+    )
+    capacity.add_argument("--reserve-gpus", type=int, default=0)
+    capacity.add_argument("--refresh", action="store_true", help="Run PROBE before planning")
+    capacity.add_argument("--timeout", type=float, default=180)
+    capacity.add_argument(
+        "--refresh-interval",
+        type=float,
+        default=300,
+        help="Seconds between PROBE refreshes while watching",
+    )
+    capacity.add_argument("--watch", action="store_true", help="Print a new plan when capacity changes")
+    capacity.add_argument("--interval", type=float, default=5, help="Watch interval in seconds")
+    capacity.add_argument("--output", type=Path)
+    capacity.add_argument("--json", action="store_true")
     diagnose = admin_sub.add_parser("diagnose", help="Ask local Codex to assess central inventory")
     diagnose.add_argument("--nodes", nargs="+", help="Limit diagnosis to approved node UUIDs")
     diagnose.add_argument("--no-refresh", action="store_true", help="Use stored profiles without PROBE tasks")
@@ -171,6 +196,41 @@ def _load_profiles(paths: list[Path]) -> list[NodeProfile]:
     if not paths:
         return [NodeProbe().collect()]
     return [NodeProfile.from_dict(json.loads(path.read_text(encoding="utf-8"))) for path in paths]
+
+
+def _profiles_from_inventory(inventory: dict, node_ids: list[str]) -> list[NodeProfile]:
+    by_id = {item.get("id"): item for item in inventory.get("nodes", [])}
+    profiles: list[NodeProfile] = []
+    for node_id in dict.fromkeys(node_ids):
+        item = by_id.get(node_id)
+        if item is None or not item.get("approved"):
+            raise ValueError(f"unknown, pending, or revoked node: {node_id}")
+        if item.get("connectivity") != "online":
+            raise ValueError(f"node is not online: {node_id}")
+        if not isinstance(item.get("profile"), dict):
+            raise ValueError(f"node has no profile: {node_id}")
+        profile = NodeProfile.from_dict(item["profile"])
+        profile.node_id = node_id
+        if profile.profile_schema_version < 2 or any(
+            gpu.memory_used_mib is None for gpu in profile.gpus
+        ):
+            raise ValueError(
+                f"node profile lacks dynamic GPU usage; upgrade and probe the node: {node_id}"
+            )
+        if profile.has_healthy_gpu and (
+            not profile.runtime.engine_ready or not profile.runtime.nvidia_runtime
+        ):
+            raise ValueError(f"node GPU container runtime is not ready: {node_id}")
+        profile_age = item.get("profile_updated_at") or profile.observed_at
+        if profile_age:
+            observed = datetime.fromisoformat(str(profile_age).replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - observed).total_seconds()
+            if age > 900:
+                raise ValueError(f"node profile is stale; probe the node first: {node_id}")
+        profiles.append(profile)
+    return profiles
 
 
 def _plan(args: argparse.Namespace) -> int:
@@ -322,7 +382,11 @@ def _admin(args: argparse.Namespace) -> int:
         print(f"Expires: {value['expires_at']}", file=sys.stderr)
         return 0
     if args.admin_command == "deployment":
-        profiles = _load_profiles(args.profile)
+        if args.profile:
+            profiles = _load_profiles(args.profile)
+        else:
+            inventory = client.request("GET", "/v1/admin/inventory")
+            profiles = _profiles_from_inventory(inventory, args.nodes)
         plan = build_plan(profiles, model_id=args.model, image=args.image, network_interface=args.network_interface)
         if plan is None:
             raise ValueError("no eligible GPU deployment could be planned")
@@ -354,6 +418,57 @@ def _admin(args: argparse.Namespace) -> int:
             if not args.watch:
                 return 0
             time.sleep(5)
+    if args.admin_command == "capacity":
+        from .capacity import build_capacity_plan, render_capacity_plan
+        from .diagnostics import refresh_node_profiles, select_inventory_nodes
+
+        if args.interval <= 0 or args.refresh_interval <= 0:
+            raise ValueError("--interval and --refresh-interval must be positive")
+        last_revision = None
+        last_refresh = None
+        while True:
+            inventory = select_inventory_nodes(
+                client.request("GET", "/v1/admin/inventory"), args.nodes
+            )
+            now = time.monotonic()
+            if args.refresh and (
+                last_refresh is None
+                or (args.watch and now - last_refresh >= args.refresh_interval)
+            ):
+                online = [
+                    item["id"]
+                    for item in inventory["nodes"]
+                    if item["connectivity"] == "online"
+                ]
+                refresh_node_profiles(client, online, timeout=args.timeout)
+                inventory = select_inventory_nodes(
+                    client.request("GET", "/v1/admin/inventory"), args.nodes
+                )
+                last_refresh = time.monotonic()
+            plan = build_capacity_plan(
+                inventory, objective=args.objective, reserve_gpus=args.reserve_gpus
+            )
+            if plan["capacity_revision"] != last_revision:
+                if args.output:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(
+                        json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                if args.json:
+                    print(
+                        json.dumps(plan, sort_keys=True)
+                        if args.watch
+                        else json.dumps(plan, indent=2, sort_keys=True)
+                    )
+                else:
+                    print(render_capacity_plan(plan))
+                last_revision = plan["capacity_revision"]
+            if not args.watch:
+                return 0
+            try:
+                time.sleep(args.interval)
+            except KeyboardInterrupt:
+                return 0
     if args.admin_command == "diagnose":
         from .diagnostics import (
             CodexDiagnoser,

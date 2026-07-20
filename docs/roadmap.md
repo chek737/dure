@@ -1,7 +1,7 @@
 # Dure 개발 로드맵
 
-기준일: 2026-07-19
-현재 개발 브랜치: `version/0.3.3`
+기준일: 2026-07-20
+현재 개발 브랜치: `version/0.3.5`
 
 ## 방향과 원칙
 
@@ -23,6 +23,13 @@ Dure의 다음 목표는 기능 수를 빠르게 늘리는 것이 아니라, 현
 
 우선순위 작업:
 
+- `dure admin capacity`가 등록된 최신 profile만으로 GPU 수에 맞는 quality/balanced/throughput/
+  reuse-first 후보를 결정론적으로 계산한다. GPU 증감은 live PP 변경이 아니라 새 generation으로
+  대응하며, 점유 중인 비-Dure GPU는 자동 배치에서 제외한다.
+- GPU memory/utilization, host Ray/vLLM process, 커스텀 모델 경로, shard 실제 read를 PROBE에
+  포함하고 profile schema version으로 구형 Agent의 불확실성을 표시한다.
+- Ray readiness가 `GPU >= world_size`가 아니라 정확한 GPU 수, IP membership과
+  `dure_node_uuid:<uuid>` resource 집합을 검증하도록 한다.
 - `dure admin diagnose`로 등록 노드의 하드웨어, 설치 모델, LLM 컨테이너 상태를 모아 Codex 기반
   GPU/Ray 배치 및 CPU utility 역할 진단을 제공한다. 진단은 advisory이며 자동 적용하지 않는다.
 - 중앙 DB의 최신 `NodeProfile`을 이용해 `dure admin deployment create --nodes ...`를 구현하고
@@ -40,6 +47,9 @@ Exit criteria:
 - 새 노드가 패키지 설치 후 `sudo dure join`만으로 pending 목록에 나타난다.
 - 승인되지 않은 노드는 task를 한 건도 받을 수 없다.
 - 등록된 노드 UUID만으로 3노드 72B 배포 계획을 생성할 수 있다.
+- GPU가 7→6→3→2→1대로 바뀌는 fixture에서 안전한 대체 layout을 재계산하고, 실행 중 PP를
+  제자리에서 축소하지 않는다.
+- 누락되거나 읽을 수 없는 shard와 예상 밖 Ray GPU 노드가 readiness를 통과하지 못한다.
 - 72B pod가 24시간 연속 동작하고 중앙 stop/restart 후 동일 generation으로 복구된다.
 - PostgreSQL 백업에서 노드·deployment·task 이력을 복원할 수 있다.
 - main 병합 전에 CI와 실제 3노드 acceptance checklist가 모두 통과한다.

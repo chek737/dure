@@ -29,6 +29,15 @@ def diagnosis_result() -> dict:
         "deployment_recommendations": [],
         "cpu_recommendations": [],
         "existing_model_findings": [],
+        "elasticity_recommendations": [
+            {
+                "trigger": "one GPU leaves",
+                "impact": "pipeline unavailable",
+                "action": "route to a ready replica and plan a new generation",
+                "automatic": False,
+                "safety_gate": "operator approval",
+            }
+        ],
         "warnings": [],
         "next_steps": ["Benchmark the network."],
     }

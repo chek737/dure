@@ -70,6 +70,17 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(node["profile"]["cpu_count"], joined_profile.cpu_count)
         self.assertIn("profile_updated_at", node)
 
+        capacity = self.client.get(
+            "/v1/admin/capacity?objective=balanced", headers=self.admin
+        )
+        self.assertEqual(capacity.status_code, 200)
+        self.assertEqual(capacity.json()["summary"]["available_gpu_nodes"], 1)
+        self.assertIn("capacity_revision", capacity.json())
+        self.assertEqual(
+            self.client.get("/v1/admin/capacity?objective=invalid", headers=self.admin).status_code,
+            400,
+        )
+
     def test_tokenless_join_heartbeats_pending_then_admin_approves(self):
         joined = self.client.post("/v1/nodes/join", json={
             "install_id": "install-open-join",

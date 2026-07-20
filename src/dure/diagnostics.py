@@ -26,6 +26,7 @@ DIAGNOSIS_SCHEMA = {
         "deployment_recommendations",
         "cpu_recommendations",
         "existing_model_findings",
+        "elasticity_recommendations",
         "warnings",
         "next_steps",
     ],
@@ -125,6 +126,21 @@ DIAGNOSIS_SCHEMA = {
                 },
             },
         },
+        "elasticity_recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["trigger", "impact", "action", "automatic", "safety_gate"],
+                "properties": {
+                    "trigger": {"type": "string"},
+                    "impact": {"type": "string"},
+                    "action": {"type": "string"},
+                    "automatic": {"type": "boolean"},
+                    "safety_gate": {"type": "string"},
+                },
+            },
+        },
         "warnings": {"type": "array", "items": {"type": "string"}},
         "next_steps": {"type": "array", "items": {"type": "string"}},
     },
@@ -150,6 +166,8 @@ def diagnostic_prompt(inventory: dict) -> str:
             "- Multi-node recommendations must require RTT, bandwidth, firewall, and NCCL validation before apply.",
             "- Do not invent benchmark results. Reduce confidence when measurements are absent.",
             "- Do not recommend stopping or replacing non-Dure workloads automatically.",
+            "- Include GPU join and leave scenarios. Never resize a live pipeline in place: stage a new generation, verify it, then switch traffic after approval.",
+            "- A lost member makes its pipeline pod unavailable; prefer a ready replica or smaller fallback while replanning.",
             "",
             "Supported deterministic Dure model catalog:",
             json.dumps(catalog, sort_keys=True),
@@ -318,6 +336,12 @@ def render_diagnosis(diagnosis: dict) -> str:
             f"(GPU nodes: {nodes})"
         )
         lines.append(f"  {deployment['rationale']}")
+    lines.extend(["", "GPU elasticity:"])
+    if not diagnosis["elasticity_recommendations"]:
+        lines.append("- None")
+    for recommendation in diagnosis["elasticity_recommendations"]:
+        mode = "automatic" if recommendation["automatic"] else "approval required"
+        lines.append(f"- {recommendation['trigger']}: {recommendation['action']} [{mode}]")
     if diagnosis["cpu_recommendations"]:
         lines.extend(["", "CPU node roles:"])
         for recommendation in diagnosis["cpu_recommendations"]:

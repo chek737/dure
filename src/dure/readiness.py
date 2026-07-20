@@ -9,6 +9,53 @@ from .command import Runner, SubprocessRunner
 from .models import CheckResult, DeploymentPlan, NodeProfile
 
 
+def validate_ray_snapshot(plan: DeploymentPlan, snapshot: dict) -> CheckResult:
+    resources = snapshot.get("resources", {})
+    gpu_count = float(resources.get("GPU", 0))
+    if gpu_count != plan.world_size:
+        return CheckResult(
+            "ray-cluster",
+            False,
+            f"GPU resources must match exactly: {gpu_count:g}/{plan.world_size}",
+        )
+
+    expected_addresses = [item.node_address for item in plan.assignments]
+    expected_resources = {f"dure_node_uuid:{item.node_id}" for item in plan.assignments}
+    actual_resources = {
+        key
+        for item in snapshot.get("nodes", [])
+        if item.get("alive") and float(item.get("gpu", 0)) > 0
+        for key in item.get("resources", {})
+        if str(key).startswith("dure_node_uuid:")
+    }
+    if actual_resources and actual_resources != expected_resources:
+        return CheckResult(
+            "ray-cluster",
+            False,
+            "Ray Dure node identity mismatch: "
+            f"expected={sorted(expected_resources)}, actual={sorted(actual_resources)}",
+        )
+    if all(expected_addresses):
+        actual_addresses = [
+            str(item.get("address"))
+            for item in snapshot.get("nodes", [])
+            if item.get("alive") and float(item.get("gpu", 0)) > 0
+        ]
+        if sorted(actual_addresses) != sorted(str(item) for item in expected_addresses):
+            return CheckResult(
+                "ray-cluster",
+                False,
+                "Ray GPU membership mismatch: "
+                f"expected={sorted(str(item) for item in expected_addresses)}, "
+                f"actual={sorted(actual_addresses)}",
+            )
+    return CheckResult(
+        "ray-cluster",
+        True,
+        f"Exact GPU resources and membership verified: {gpu_count:g}/{plan.world_size}",
+    )
+
+
 class ReadinessVerifier:
     def __init__(self, runner: Runner | None = None, engine: str = "docker") -> None:
         self.runner = runner or SubprocessRunner()
@@ -54,7 +101,11 @@ class ReadinessVerifier:
         code = (
             "import json,ray; "
             f"ray.init(address='{plan.ray_head_address}',logging_level='ERROR'); "
-            "print(json.dumps(ray.cluster_resources(),sort_keys=True)); ray.shutdown()"
+            "print(json.dumps({'resources':ray.cluster_resources(),'nodes':["
+            "{'address':n.get('NodeManagerAddress'),'alive':n.get('Alive'),"
+            "'gpu':n.get('Resources',{}).get('GPU',0),'resources':n.get('Resources',{})} "
+            "for n in ray.nodes()]},"
+            "sort_keys=True)); ray.shutdown()"
         )
         result = self.runner.run(
             [self.engine, "exec", name, "python3", "-c", code], timeout=45
@@ -62,16 +113,10 @@ class ReadinessVerifier:
         if not result.ok:
             return CheckResult("ray-cluster", False, result.stderr or result.stdout)
         try:
-            resources = json.loads(result.stdout.splitlines()[-1])
+            snapshot = json.loads(result.stdout.splitlines()[-1])
         except (json.JSONDecodeError, IndexError):
             return CheckResult("ray-cluster", False, f"Invalid Ray resource response: {result.stdout}")
-        gpu_count = float(resources.get("GPU", 0))
-        ok = gpu_count >= plan.world_size
-        return CheckResult(
-            "ray-cluster",
-            ok,
-            f"GPU resources: {gpu_count:g}/{plan.world_size}; {json.dumps(resources, sort_keys=True)}",
-        )
+        return validate_ray_snapshot(plan, snapshot)
 
     def api(self, url: str = "http://127.0.0.1:8000") -> CheckResult:
         try:

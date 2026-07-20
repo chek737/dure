@@ -57,6 +57,19 @@ dure admin probe --nodes <node-id>
 
 ## Codex-assisted capacity diagnosis
 
+Generate the deterministic baseline first. This command refreshes approved online nodes, excludes
+occupied or unobserved GPUs, and recalculates the proposed layout when GPU supply changes:
+
+```bash
+dure admin capacity --refresh --objective balanced
+dure admin capacity --objective quality --reserve-gpus 1 --json --output capacity.json
+dure admin capacity --watch --refresh --interval 5 --refresh-interval 300
+```
+
+Capacity output is advisory. A join or leave never changes a running pipeline in place; create and
+verify a replacement generation before switching traffic. To include custom or shared model paths
+in Agent inventory, set `DURE_MODEL_ROOTS` in the Agent service environment and restart the Agent.
+
 Install and authenticate Codex on the admin computer only:
 
 ```bash

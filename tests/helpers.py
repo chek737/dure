@@ -11,6 +11,7 @@ def profile(
     gpu_index: int = 0,
     address: str = "192.168.0.10",
     driver: str = "610.43.02",
+    gpu_memory_used_mib: int | None = 0,
 ) -> NodeProfile:
     gpus = []
     if gpu_memory_mib is not None:
@@ -22,6 +23,8 @@ def profile(
                 driver_version=driver,
                 memory_mib=gpu_memory_mib,
                 compute_capability="8.6",
+                memory_used_mib=gpu_memory_used_mib,
+                utilization_percent=0,
             )
         )
     return NodeProfile(
@@ -69,4 +72,3 @@ class FakeRunner:
         if value is None:
             return CommandResult(command, 0, "")
         return CommandResult(command, *value)
-

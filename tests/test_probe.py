@@ -14,7 +14,7 @@ class ProbeTests(unittest.TestCase):
     def test_parses_nvidia_smi_and_runtime(self):
         gpu_query = (
             "nvidia-smi",
-            "--query-gpu=index,name,uuid,driver_version,memory.total",
+            "--query-gpu=index,name,uuid,driver_version,memory.total,memory.used,utilization.gpu",
             "--format=csv,noheader,nounits",
         )
         cap_query = (
@@ -28,7 +28,7 @@ class ProbeTests(unittest.TestCase):
                 gpu_query: CommandResult(
                     gpu_query,
                     0,
-                    "0, NVIDIA GeForce RTX 3090, GPU-123, 610.43.02, 24576",
+                    "0, NVIDIA GeForce RTX 3090, GPU-123, 610.43.02, 24576, 1024, 12",
                 ),
                 cap_query: CommandResult(cap_query, 0, "0, 8.6"),
                 ("docker", "version"): CommandResult(("docker", "version"), 0, "ok"),
@@ -46,6 +46,9 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(len(result.gpus), 1)
         self.assertEqual(result.gpus[0].memory_mib, 24576)
         self.assertEqual(result.gpus[0].compute_capability, "8.6")
+        self.assertEqual(result.gpus[0].memory_used_mib, 1024)
+        self.assertEqual(result.gpus[0].memory_free_mib, 23552)
+        self.assertEqual(result.gpus[0].utilization_percent, 12)
         self.assertTrue(result.runtime.engine_ready)
         self.assertTrue(result.runtime.nvidia_runtime)
         self.assertTrue(result.runtime.ray_available)
@@ -69,6 +72,7 @@ class ProbeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (model_path / "model.safetensors").write_bytes(b"weights")
             incomplete = model_root / "partial-model"
             incomplete.mkdir()
             containers = "\n".join(
@@ -125,11 +129,60 @@ class ProbeTests(unittest.TestCase):
         value = NodeProbe(FakeRunner()).collect().to_dict()
         value.pop("installed_models")
         value.pop("workloads")
+        value.pop("profile_schema_version")
+        value.pop("observed_at")
 
         restored = NodeProfile.from_dict(value)
 
         self.assertEqual(restored.installed_models, [])
         self.assertEqual(restored.workloads, [])
+        self.assertEqual(restored.profile_schema_version, 1)
+
+    def test_sharded_model_requires_every_file_to_be_readable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            model_path = model_root / "sharded"
+            model_path.mkdir(parents=True)
+            (model_path / "config.json").write_text(
+                json.dumps({"_name_or_path": "Example/Sharded-AWQ"}), encoding="utf-8"
+            )
+            (model_path / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "a": "model-00001-of-00002.safetensors",
+                            "b": "model-00002-of-00002.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_path / "model-00001-of-00002.safetensors").write_bytes(b"x")
+
+            result = NodeProbe(FakeRunner(), model_roots=[model_root]).collect()
+
+        model = next(item for item in result.installed_models if item.model_id == "Example/Sharded-AWQ")
+        self.assertFalse(model.complete)
+        self.assertEqual(model.expected_files, 2)
+        self.assertEqual(model.present_files, 1)
+        self.assertEqual(model.readable_files, 1)
+
+    def test_model_index_rejects_paths_outside_the_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            model_path = model_root / "unsafe"
+            model_path.mkdir(parents=True)
+            (model_path / "config.json").write_text("{}", encoding="utf-8")
+            (model_path / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"a": "../../outside.safetensors"}}),
+                encoding="utf-8",
+            )
+
+            result = NodeProbe(FakeRunner(), model_roots=[model_root]).collect()
+
+        model = next(item for item in result.installed_models if item.model_id == "unsafe")
+        self.assertFalse(model.complete)
+        self.assertEqual(model.verification, "invalid-index")
 
 
 if __name__ == "__main__":

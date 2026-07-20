@@ -1,8 +1,11 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from dure.command import CommandResult
 from dure.planner import build_plan
-from dure.runtime import ContainerRuntime
+from dure.runtime import ContainerRuntime, ModelStore
 
 from .helpers import FakeRunner, profile
 
@@ -51,6 +54,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run[entrypoint + 1], "ray")
         image = run.index("registry.example/vllm@sha256:abc")
         self.assertEqual(run[image + 1 : image + 4], ("start", "--block", "--head"))
+        resource = next(item for item in run if item.startswith("--resources="))
+        self.assertIn(f"dure_node_uuid:{node.node_id}", resource)
 
     def test_api_container_uses_vllm_entrypoint(self):
         node = profile("camp-7", address="192.168.0.228")
@@ -78,6 +83,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run[entrypoint + 1], "vllm")
         image = run.index("registry.example/vllm@sha256:abc")
         self.assertEqual(run[image + 1 : image + 3], ("serve", "/models/model"))
+
+    def test_model_store_rejects_incomplete_indexed_model(self):
+        node = profile("gpu")
+        plan = build_plan([node], model_id="qwen2.5-14b-awq")
+        assert plan is not None
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "model"
+            target.mkdir()
+            (target / "config.json").write_text("{}", encoding="utf-8")
+            (target / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"a": "missing.safetensors"}}),
+                encoding="utf-8",
+            )
+            plan.model_path = str(target)
+
+            result = ModelStore(FakeRunner()).ensure(plan, accept_download=False)
+
+        self.assertFalse(result.ok)
+        self.assertIn("incomplete or unreadable", result.detail)
 
 
 if __name__ == "__main__":

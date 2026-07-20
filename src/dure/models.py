@@ -13,6 +13,14 @@ class GPUProfile:
     memory_mib: int
     compute_capability: str | None = None
     healthy: bool = True
+    memory_used_mib: int | None = None
+    utilization_percent: int | None = None
+
+    @property
+    def memory_free_mib(self) -> int | None:
+        if self.memory_used_mib is None:
+            return None
+        return max(0, self.memory_mib - self.memory_used_mib)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "GPUProfile":
@@ -51,6 +59,11 @@ class InstalledModelProfile:
     quantization: str | None = None
     size_mib: int | None = None
     complete: bool = True
+    expected_files: int | None = None
+    present_files: int | None = None
+    readable_files: int | None = None
+    storage: str | None = None
+    verification: str = "metadata-only"
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "InstalledModelProfile":
@@ -67,6 +80,10 @@ class WorkloadProfile:
     generation: str | None = None
     model_id: str | None = None
     dure_managed: bool = False
+    source: str = "container"
+    pid: int | None = None
+    gpu_uuid: str | None = None
+    gpu_memory_mib: int | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "WorkloadProfile":
@@ -95,6 +112,8 @@ class NodeProfile:
     installed_models: list[InstalledModelProfile] = field(default_factory=list)
     workloads: list[WorkloadProfile] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
+    profile_schema_version: int = 2
+    observed_at: str | None = None
 
     @property
     def total_gpu_memory_mib(self) -> int:
@@ -110,6 +129,8 @@ class NodeProfile:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "NodeProfile":
         data = dict(value)
+        if "profile_schema_version" not in data:
+            data["profile_schema_version"] = 1
         data["gpus"] = [GPUProfile.from_dict(item) for item in data.get("gpus", [])]
         data["network"] = NetworkProfile.from_dict(data.get("network", {}))
         data["runtime"] = RuntimeProfile.from_dict(data.get("runtime", {}))
@@ -131,6 +152,8 @@ class ModelSpec:
     min_gpu_memory_gib: float
     default_max_model_len: int
     layer_count: int
+    min_gpu_nodes: int = 1
+    max_gpu_nodes: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -145,6 +168,7 @@ class NodeAssignment:
     layer_start: int
     layer_end: int
     role: str = "ray-worker"
+    node_address: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

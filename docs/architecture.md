@@ -59,6 +59,21 @@ CPU-only nodes are currently diagnosed for utility work such as the controller, 
 cache, observability, request queue, and preprocessing. The current runtime still requires a GPU
 node to be the Ray head for a Dure deployment.
 
+`dure admin capacity` is the deterministic layer below the Codex explanation. It excludes pending,
+offline, occupied, runtime-blocked, or dynamically unobserved GPUs; reuses complete readable model
+artifacts; and emits layouts for quality, balance, throughput, or cache reuse. An operator may also
+reserve spare GPUs. The result is advisory and contains no executable commands.
+
+GPU supply is reconciled by generation rather than by changing a live pipeline. A newly joined GPU
+is probed and quarantined until its runtime, artifacts, network, and GPU pass validation. A lost
+pipeline member makes that pod unavailable. Dure then calculates a replacement generation or uses
+an already-ready replica; it never silently reduces `pipeline_parallel_size` in place.
+
+Node profiles use a versioned inventory schema. Current profiles include live GPU memory and
+utilization, metadata-only host/container LLM processes, and indexed model artifact counts. Model
+completeness requires every declared shard to exist and pass a small actual read. Extra shared model
+roots can be configured with `DURE_MODEL_ROOTS`.
+
 ## Task protocol
 
 Supported task types are `PROBE`, `VERIFY`, `APPLY_DEPLOYMENT`, `START_DEPLOYMENT`,
@@ -70,6 +85,8 @@ instead of repeating a mutation. PostgreSQL row locks serialize claims for a nod
 
 Plans use server-issued node UUIDs. The controller can normalize a legacy hostname assignment only
 when it resolves to exactly one approved node. Central images must be pinned by OCI digest.
+New Ray containers also advertise `dure_node_uuid:<uuid>` custom resources. Readiness requires the
+exact planned GPU count and membership, so an extra or duplicate active Ray node does not pass.
 
 ## Trust boundaries
 
