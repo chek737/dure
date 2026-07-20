@@ -52,10 +52,12 @@ def profile(
 
 
 class FakeRunner:
-    def __init__(self, responses=None, executables=None):
+    def __init__(self, responses=None, executables=None, response_factory=None):
         self.responses = responses or {}
         self.executables = set(executables or [])
+        self.response_factory = response_factory
         self.calls: list[tuple[str, ...]] = []
+        self.limited_output_calls: list[tuple[tuple[str, ...], int]] = []
 
     def exists(self, executable: str) -> bool:
         return executable in self.executables
@@ -64,9 +66,36 @@ class FakeRunner:
         command = tuple(argv)
         self.calls.append(command)
         value = self.responses.get(command)
+        if value is None and command == (
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ):
+            return CommandResult(command, 0, "")
+        if (
+            value is None
+            and command[:3] == ("docker", "container", "ls")
+            and command[-1:] == ("{{.ID}}\t{{.Names}}",)
+            and any(part.startswith("name=") for part in command)
+        ):
+            return CommandResult(command, 0, "")
+        if value is None and self.response_factory is not None:
+            value = self.response_factory(command)
         if isinstance(value, CommandResult):
             return value
         if value is None:
             return CommandResult(command, 0, "")
         return CommandResult(command, *value)
 
+    def run_limited_output(
+        self, argv, *, timeout=15, max_output_bytes, env=None
+    ):
+        command = tuple(argv)
+        self.limited_output_calls.append((command, max_output_bytes))
+        result = self.run(argv, timeout=timeout, env=env)
+        size = len(result.stdout.encode("utf-8")) + len(result.stderr.encode("utf-8"))
+        if size > max_output_bytes:
+            return CommandResult(
+                command, 125, stderr="command output limit exceeded"
+            )
+        return result
