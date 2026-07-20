@@ -22,9 +22,12 @@ from dure.control.benchmark import (
 from dure.control.models import (
     ArtifactManifest,
     ArtifactPreparation,
+    ArtifactPreparationAttempt,
+    ArtifactPreparationNode,
     Deployment,
     DeploymentOperation,
     Node,
+    NodeArtifactCache,
     NodeProfileRecord,
     Task,
     utcnow,
@@ -159,7 +162,7 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         key: str,
         *,
         disk_free_mib: int = 80000,
-        agent_version: str = "0.3.16",
+        agent_version: str = "0.3.20",
     ) -> list[dict]:
         enrolled = []
         for index in range(count):
@@ -204,7 +207,9 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         manifest: dict | None = None,
         register_manifest: bool = True,
         disk_free_mib: int = 80000,
-        agent_version: str = "0.3.16",
+        agent_version: str = "0.3.20",
+        stage_variant_status: str | None = None,
+        expect_selection: bool = True,
     ) -> dict:
         enrolled = self._enroll_nodes(
             node_count,
@@ -332,6 +337,39 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             release_id = release.id
             runtime_image = runtime.image
 
+        context = {
+            "artifact_id": artifact_id,
+            "release_id": release_id,
+            "enrolled": enrolled,
+            "manifest": manifest_value,
+            "manifest_digest": manifest_digest,
+            "runtime_image": runtime_image,
+        }
+        if stage_variant_status is not None:
+            if node_count != 2 or stage_variant_status not in {
+                "DRAFT",
+                "VALIDATED",
+                "REVOKED",
+            }:
+                raise AssertionError("stage seed requires two nodes and a known status")
+            stage = self._create_stage_variant(
+                context, validate=stage_variant_status != "DRAFT"
+            )
+            context["stage_variant"] = stage["variant"]
+            if stage_variant_status == "REVOKED":
+                endpoint = (
+                    "/v1/admin/stage-artifact-variants/"
+                    + stage["variant"]["artifact_set_digest"]
+                    + "/transition"
+                )
+                revoked = self.client.post(
+                    endpoint,
+                    headers=self.admin,
+                    json={"status": "REVOKED"},
+                )
+                self.assertEqual(revoked.status_code, 200, revoked.text)
+                context["stage_variant"] = revoked.json()["variant"]
+
         recommendation_response = self.client.post(
             "/v1/admin/deployment-recommendations",
             headers=self.admin,
@@ -347,6 +385,10 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             recommendation_response.text,
         )
         recommendation = recommendation_response.json()["recommendation"]
+        if not expect_selection:
+            self.assertIsNone(recommendation["selected"])
+            context["recommendation"] = recommendation
+            return context
         self.assertIsNotNone(recommendation["selected"])
         accepted_response = self.client.post(
             f"/v1/admin/deployment-recommendations/{recommendation['id']}/accept",
@@ -364,15 +406,9 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                 self.assertIsNotNone(record)
                 session.delete(record)
                 session.commit()
-        return {
-            "artifact_id": artifact_id,
-            "release_id": release_id,
-            "deployment": accepted_response.json()["deployment"],
-            "enrolled": enrolled,
-            "manifest": manifest_value,
-            "manifest_digest": manifest_digest,
-            "runtime_image": runtime_image,
-        }
+        context["recommendation"] = recommendation
+        context["deployment"] = accepted_response.json()["deployment"]
+        return context
 
     def _create_stage_variant(
         self,
@@ -698,11 +734,143 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         self.assertNotIn(
             "stage_artifact", apply_task["payload"]["plan"]
         )
-        self.assertNotIn(
-            "model_cache_kind", apply_task["payload"]["plan"]
+        self.assertEqual(
+            apply_task["payload"]["plan"]["model_cache_kind"],
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
         )
         self.assertFalse(apply_task["payload"]["accept_model_download"])
         self.assertFalse(apply_task["payload"]["pull_image"])
+
+    def test_latest_image_and_ready_cache_gate_all_deployment_consumers(self):
+        context = self._seed_accepted_generation("cache-gates")
+        prepared = self._prepare(
+            context,
+            str(uuid.uuid4()),
+            apply=True,
+        )
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        model_task = self._claim(context["enrolled"][0])
+        self._complete(model_task, context["enrolled"][0], context)
+        image_task = self._claim(context["enrolled"][0])
+        self._complete(image_task, context["enrolled"][0], context)
+
+        node_id = context["enrolled"][0]["node_id"]
+        with self.factory() as session:
+            cache = session.scalar(
+                select(NodeArtifactCache).where(
+                    NodeArtifactCache.node_id == node_id,
+                    NodeArtifactCache.cache_kind
+                    == MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                )
+            )
+            self.assertIsNotNone(cache)
+            self.assertEqual(cache.status, "READY")
+            record = session.scalar(
+                select(ArtifactPreparationNode)
+                .join(
+                    ArtifactPreparation,
+                    ArtifactPreparation.id
+                    == ArtifactPreparationNode.preparation_id,
+                )
+                .where(
+                    ArtifactPreparation.deployment_id
+                    == context["deployment"]["id"],
+                    ArtifactPreparationNode.node_id == node_id,
+                )
+            )
+            self.assertIsNotNone(record)
+            image_attempt = session.scalar(
+                select(ArtifactPreparationAttempt).where(
+                    ArtifactPreparationAttempt.preparation_node_id
+                    == record.id,
+                    ArtifactPreparationAttempt.stage == "IMAGE",
+                    ArtifactPreparationAttempt.attempt_no
+                    == record.image_current_attempt,
+                )
+            )
+            self.assertIsNotNone(image_attempt)
+            persisted_image_task = session.get(Task, image_attempt.task_id)
+            self.assertIsNotNone(persisted_image_task)
+            original_result = copy.deepcopy(persisted_image_task.result)
+            corrupted_result = copy.deepcopy(original_result)
+            corrupted_result["image_id"] = "sha256:" + "0" * 64
+            persisted_image_task.result = corrupted_result
+            session.commit()
+
+        stale_image = self.client.post(
+            "/v1/admin/tasks",
+            headers=self.admin,
+            json={
+                "node_ids": [node_id],
+                "type": "APPLY_DEPLOYMENT",
+                "deployment_id": context["deployment"]["id"],
+                "options": {"serve": False},
+            },
+        )
+        self._failure_code(stale_image, "DEPLOYMENT_PREPARATION_INVALID")
+
+        with self.factory() as session:
+            persisted_image_task = session.get(Task, image_task["id"])
+            persisted_image_task.result = original_result
+            session.commit()
+
+        verification = self.client.post(
+            "/v1/admin/tasks",
+            headers=self.admin,
+            json={
+                "node_ids": [node_id],
+                "type": "VERIFY",
+                "deployment_id": context["deployment"]["id"],
+                "options": {"api": False},
+            },
+        )
+        self.assertEqual(verification.status_code, 200, verification.text)
+        verify_task = self._claim(context["enrolled"][0])
+        self.assertEqual(verify_task["type"], "VERIFY")
+        failed = self.client.post(
+            f"/v1/agent/tasks/{verify_task['id']}/fail",
+            headers=context["enrolled"][0]["headers"],
+            json={"error": "runtime verification failed"},
+        )
+        self.assertEqual(failed.status_code, 200, failed.text)
+
+        with self.factory() as session:
+            cache = session.scalar(
+                select(NodeArtifactCache).where(
+                    NodeArtifactCache.node_id == node_id,
+                    NodeArtifactCache.cache_kind
+                    == MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                )
+            )
+            self.assertEqual(cache.status, "CORRUPT")
+            task_count = session.scalar(select(func.count()).select_from(Task))
+
+        for task_type, options in (
+            ("APPLY_DEPLOYMENT", {"serve": False}),
+            ("START_DEPLOYMENT", {"serve": False}),
+            ("RESTART_DEPLOYMENT", {"serve": False}),
+            ("VERIFY", {"api": False}),
+        ):
+            with self.subTest(task_type=task_type):
+                rejected = self.client.post(
+                    "/v1/admin/tasks",
+                    headers=self.admin,
+                    json={
+                        "node_ids": [node_id],
+                        "type": task_type,
+                        "deployment_id": context["deployment"]["id"],
+                        "options": options,
+                    },
+                )
+                self._failure_code(
+                    rejected, "DEPLOYMENT_ARTIFACT_CACHE_NOT_READY"
+                )
+
+        with self.factory() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(Task)),
+                task_count,
+            )
 
     def test_exact_validated_stage_digest_binds_rank_tasks_and_preserves_retry_evidence(
         self,
@@ -711,18 +879,18 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             "stage-success",
             node_count=2,
             agent_version="0.3.19",
+            stage_variant_status="VALIDATED",
         )
-        unused = self._create_stage_variant(
-            context, exporter_character="6"
+        selected_digest = context["stage_variant"]["artifact_set_digest"]
+        self.assertEqual(
+            context["recommendation"]["selected"]["model_cache_kind"],
+            MODEL_CACHE_KIND_STAGE,
         )
-        selected = self._create_stage_variant(
-            context,
-            changed_rank=0,
-            exporter_character="8",
-        )
-        selected_digest = selected["variant"]["artifact_set_digest"]
-        self.assertNotEqual(
-            selected_digest, unused["variant"]["artifact_set_digest"]
+        self.assertEqual(
+            context["recommendation"]["selected"]["stage_artifact"][
+                "artifact_set_digest"
+            ],
+            selected_digest,
         )
 
         request_id = str(uuid.uuid4())
@@ -754,9 +922,12 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         omitted_replay = self._prepare(
             context, request_id, apply=False
         )
-        self._failure_code(
-            omitted_replay, "PREPARATION_REQUEST_CONFLICT"
+        self.assertEqual(omitted_replay.status_code, 200, omitted_replay.text)
+        self.assertEqual(
+            omitted_replay.json()["preparation"]["id"],
+            preview.json()["preparation"]["id"],
         )
+        self.assertEqual(omitted_replay.json()["tasks"], [])
 
         applied = self._prepare(
             context,
@@ -1040,9 +1211,9 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             "stage-rb",
             node_count=2,
             agent_version="0.3.19",
+            stage_variant_status="VALIDATED",
         )
-        selected = self._create_stage_variant(context)
-        selected_digest = selected["variant"]["artifact_set_digest"]
+        selected_digest = context["stage_variant"]["artifact_set_digest"]
         preview = self._prepare(
             context,
             str(uuid.uuid4()),
@@ -1170,11 +1341,16 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                     r"^sha256:[0-9a-f]{64}$",
                 )
 
-    def test_stage_prepare_rejects_missing_draft_and_revoked_variants(self):
+    def test_stage_prepare_rejects_delivery_override_and_revoked_selection(self):
         context = self._seed_accepted_generation(
-            "stage-state-gates",
+            "stage-miss",
             node_count=2,
             agent_version="0.3.19",
+            manifest=_oversized_manifest(4, chunk_character="a"),
+        )
+        self.assertEqual(
+            context["recommendation"]["selected"]["model_cache_kind"],
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
         )
         unavailable = self._prepare(
             context,
@@ -1183,24 +1359,38 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             artifact_set_digest=_digest("a"),
         )
         self._failure_code(
-            unavailable, "PREPARATION_STAGE_VARIANT_UNAVAILABLE"
+            unavailable, "PREPARATION_STAGE_VARIANT_MISMATCH"
         )
 
-        stage = self._create_stage_variant(
-            context,
-            validate=False,
-            exporter_character="b",
+        draft_context = self._seed_accepted_generation(
+            "stage-draft",
+            node_count=2,
+            agent_version="0.3.19",
+            stage_variant_status="DRAFT",
+            manifest=_oversized_manifest(4, chunk_character="b"),
         )
-        digest = stage["variant"]["artifact_set_digest"]
+        self.assertEqual(
+            draft_context["recommendation"]["selected"]["model_cache_kind"],
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
         draft = self._prepare(
-            context,
+            draft_context,
             str(uuid.uuid4()),
             apply=False,
-            artifact_set_digest=digest,
+            artifact_set_digest=draft_context["stage_variant"][
+                "artifact_set_digest"
+            ],
         )
-        self._failure_code(draft, "PREPARATION_STAGE_VARIANT_INVALID")
+        self._failure_code(draft, "PREPARATION_STAGE_VARIANT_MISMATCH")
 
-        self._validate_stage_variant(stage)
+        revoked_context = self._seed_accepted_generation(
+            "stage-revoke",
+            node_count=2,
+            agent_version="0.3.19",
+            stage_variant_status="VALIDATED",
+            manifest=_oversized_manifest(4, chunk_character="c"),
+        )
+        digest = revoked_context["stage_variant"]["artifact_set_digest"]
         revoked = self.client.post(
             "/v1/admin/stage-artifact-variants/"
             + digest
@@ -1210,13 +1400,12 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         )
         self.assertEqual(revoked.status_code, 200, revoked.text)
         revoked_prepare = self._prepare(
-            context,
+            revoked_context,
             str(uuid.uuid4()),
             apply=False,
-            artifact_set_digest=digest,
         )
         self._failure_code(
-            revoked_prepare, "PREPARATION_STAGE_VARIANT_INVALID"
+            revoked_prepare, "PREPARATION_INVENTORY_STALE"
         )
 
         with self.factory() as session:
@@ -1230,36 +1419,40 @@ class ArtifactPreparationControlTests(unittest.TestCase):
                 session.scalar(select(func.count()).select_from(Task)), 0
             )
 
-    def test_stage_prepare_requires_agent_0_3_19_or_newer(self):
+    def test_stage_candidate_falls_back_to_full_for_agent_0_3_18(self):
         context = self._seed_accepted_generation(
             "stage-old",
             node_count=2,
             agent_version="0.3.18",
+            stage_variant_status="VALIDATED",
         )
-        stage = self._create_stage_variant(context)
+        self.assertEqual(
+            context["recommendation"]["selected"]["model_cache_kind"],
+            MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        )
+        stage_candidate = next(
+            candidate
+            for candidate in context["recommendation"]["candidates"]
+            if candidate.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
+        )
+        self.assertFalse(stage_candidate["feasible"])
+        self.assertIn(
+            "STAGE_AGENT_VERSION",
+            {item["code"] for item in stage_candidate["rejections"]},
+        )
         response = self._prepare(
             context,
             str(uuid.uuid4()),
             apply=False,
-            artifact_set_digest=stage["variant"][
-                "artifact_set_digest"
-            ],
         )
-        self._failure_code(response, "PREPARATION_AGENT_UNSUPPORTED")
-        self.assertEqual(
-            response.json()["detail"]["details"]["minimum_version"],
-            "0.3.19",
-        )
-        self.assertEqual(
-            response.json()["detail"]["details"]["node_ids"],
-            sorted(item["node_id"] for item in context["enrolled"]),
-        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["tasks"], [])
         with self.factory() as session:
             self.assertEqual(
                 session.scalar(
                     select(func.count()).select_from(ArtifactPreparation)
                 ),
-                0,
+                1,
             )
             self.assertEqual(
                 session.scalar(select(func.count()).select_from(Task)), 0
@@ -1365,14 +1558,14 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         )
         self.assertNotIn(secret, completed.text)
 
-    def test_missing_manifest_is_rejected_without_tasks_or_preparation(self):
+    def test_removed_manifest_invalidates_inventory_without_tasks_or_preparation(self):
         context = self._seed_accepted_generation(
             "missing-manifest", register_manifest=False
         )
 
         response = self._prepare(context, str(uuid.uuid4()), apply=False)
 
-        self._failure_code(response, "PREPARATION_MANIFEST_REQUIRED")
+        self._failure_code(response, "PREPARATION_INVENTORY_STALE")
         with self.factory() as session:
             self.assertEqual(
                 session.scalar(select(func.count()).select_from(Task)), 0
@@ -1658,17 +1851,28 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             "disk-gate",
             manifest=_oversized_manifest(too_large),
             disk_free_mib=2,
+            expect_selection=False,
         )
-        node_id = disk_context["enrolled"][0]["node_id"]
-        disk_response = self._prepare(
-            disk_context, str(uuid.uuid4()), apply=False
+        full_candidate = next(
+            candidate
+            for candidate in disk_context["recommendation"]["candidates"]
+            if candidate.get("model_cache_kind")
+            == MODEL_CACHE_KIND_FULL_SNAPSHOT
         )
-        self._failure_code(
-            disk_response, "PREPARATION_DISK_INSUFFICIENT"
+        self.assertFalse(full_candidate["feasible"])
+        self.assertIn(
+            "DISK_SPACE",
+            {item["code"] for item in full_candidate["rejections"]},
         )
 
-        # A separate accepted generation is not needed for the active-task
-        # boundary: the oversized generation's node remains otherwise valid.
+        # The selector rejects an undersized generation before acceptance. Use
+        # an independently accepted generation for the active-task/operation
+        # preparation boundaries.
+        busy_context = self._seed_accepted_generation(
+            "busy-gates",
+            manifest=_oversized_manifest(4, chunk_character="e"),
+        )
+        node_id = busy_context["enrolled"][0]["node_id"]
         busy_task = self.client.post(
             "/v1/admin/tasks",
             headers=self.admin,
@@ -1680,7 +1884,7 @@ class ArtifactPreparationControlTests(unittest.TestCase):
         )
         self.assertEqual(busy_task.status_code, 200, busy_task.text)
         busy_response = self._prepare(
-            disk_context, str(uuid.uuid4()), apply=False
+            busy_context, str(uuid.uuid4()), apply=False
         )
         self._failure_code(busy_response, "PREPARATION_NODE_BUSY")
 
@@ -1697,21 +1901,21 @@ class ArtifactPreparationControlTests(unittest.TestCase):
             operation = DeploymentOperation(
                 id=operation_id,
                 request_digest="sha256:" + "9" * 64,
-                lineage_id=disk_context["deployment"]["id"],
-                deployment_id=disk_context["deployment"]["id"],
+                lineage_id=busy_context["deployment"]["id"],
+                deployment_id=busy_context["deployment"]["id"],
                 kind="APPLY",
                 status="PARTIAL_FAILED",
                 phase="APPLY",
                 node_ids=[node_id],
                 serve=False,
                 api=False,
-                active_lineage_id=disk_context["deployment"]["id"],
+                active_lineage_id=busy_context["deployment"]["id"],
             )
             session.add(operation)
             session.commit()
 
         operation_response = self._prepare(
-            disk_context, str(uuid.uuid4()), apply=False
+            busy_context, str(uuid.uuid4()), apply=False
         )
         self._failure_code(operation_response, "PREPARATION_NODE_BUSY")
         self.assertEqual(

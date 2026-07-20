@@ -23,10 +23,23 @@ from dure.artifact_prepare import (
 from dure.model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
 )
 from dure.models import DeploymentPlan, NodeProfile
+from dure.stage_cache import (
+    STAGE_CACHE_VERIFICATION_VERSION,
+    StageCacheError,
+    StageCacheIdentity,
+)
 from dure.task import TaskStatus, TaskType
 
+from .cache_lifecycle import (
+    ArtifactCacheIdentity,
+    ArtifactCacheLifecycleError,
+    record_preparation_success,
+    record_verification_failure,
+    require_ready_cache,
+)
 from .models import (
     ArtifactManifest,
     ArtifactPreparation,
@@ -217,16 +230,39 @@ def _stage_preparation_projection(
     *,
     artifact_set_digest: str | None,
 ) -> dict[str, Any] | None:
-    """Bind one explicitly requested validated stage variant to node ranks.
+    """Revalidate the delivery mode already fixed by the accepted generation.
 
-    PR7 deliberately does not choose a preferred variant during recommendation.
-    Omitting ``artifact_set_digest`` therefore preserves the existing FULL
-    snapshot path.  Once a digest is supplied, every mismatch is terminal for
-    that immutable preparation request; callers must never fall back to FULL.
+    The optional request digest is only an equality assertion for compatibility
+    with the PR7 CLI.  It can no longer change a FULL generation into STAGE or
+    select a different STAGE variant after recommendation acceptance.
     """
 
-    if artifact_set_digest is None:
+    plan = deployment.plan
+    plan_cache_kind = plan.get("model_cache_kind")
+    plan_stage = plan.get("stage_artifact")
+    if plan_cache_kind != MODEL_CACHE_KIND_STAGE:
+        if artifact_set_digest is not None:
+            raise ArtifactPreparationError(
+                "the accepted generation does not select a stage artifact",
+                code="PREPARATION_STAGE_VARIANT_MISMATCH",
+                details={"deployment_id": deployment.id},
+            )
         return None
+    selected_digest = (
+        plan_stage.get("artifact_set_digest")
+        if type(plan_stage) is dict
+        else None
+    )
+    if artifact_set_digest is not None and artifact_set_digest != selected_digest:
+        raise ArtifactPreparationError(
+            "the requested stage artifact differs from the accepted generation",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            details={
+                "deployment_id": deployment.id,
+                "artifact_set_digest": artifact_set_digest,
+            },
+        )
+    artifact_set_digest = selected_digest
     if (
         type(artifact_set_digest) is not str
         or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_set_digest) is None
@@ -253,7 +289,6 @@ def _stage_preparation_projection(
             details={"artifact_set_digest": artifact_set_digest},
         ) from exc
 
-    plan = deployment.plan
     assignments = plan.get("assignments")
     expected_contract = {
         "artifact_set_digest": artifact_set_digest,
@@ -268,6 +303,25 @@ def _stage_preparation_projection(
     if (
         type(projection) is not dict
         or any(projection.get(key) != value for key, value in expected_contract.items())
+        or type(plan_stage) is not dict
+        or any(
+            plan_stage.get(key) != projection.get(key)
+            for key in (
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "loader_format",
+            )
+        )
+        or selected.get("model_cache_kind") != MODEL_CACHE_KIND_STAGE
+        or selected.get("stage_artifact") != plan_stage
         or projection.get("architecture") != "Qwen2ForCausalLM"
         or plan.get("execution_backend") != "VLLM_RAY_PP_V1"
         or type(assignments) is not list
@@ -320,6 +374,9 @@ def _stage_preparation_projection(
             or tensor_rank != 0
             or assignment is None
             or assignment.get("expected_runtime_rank") != expected_rank
+            or assignment.get("stage_manifest_digest") != manifest_digest
+            or assignment.get("stage_tensor_keys_digest")
+            != stage.get("tensor_keys_digest")
             or type(node_id) is not str
             or node_id in seen_nodes
             or type(manifest_digest) is not str
@@ -747,17 +804,36 @@ def _request_identity(
     *,
     stage_artifact_set_digest: str | None,
 ) -> dict[str, Any]:
+    plan_cache_kind = deployment.plan.get("model_cache_kind")
+    plan_stage = deployment.plan.get("stage_artifact")
+    selected_stage_digest = (
+        plan_stage.get("artifact_set_digest")
+        if plan_cache_kind == MODEL_CACHE_KIND_STAGE and type(plan_stage) is dict
+        else None
+    )
+    if stage_artifact_set_digest is not None and (
+        selected_stage_digest is None
+        or stage_artifact_set_digest != selected_stage_digest
+    ):
+        raise ArtifactPreparationError(
+            "the requested stage artifact differs from the accepted generation",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            details={"deployment_id": deployment.id},
+        )
     value = {
         "schema_version": 1,
         "deployment_id": deployment.id,
         "generation": deployment.generation,
         "source_recommendation_id": deployment.source_recommendation_id,
         "plan": deployment.plan,
-        "cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        "cache_kind": (
+            MODEL_CACHE_KIND_STAGE
+            if selected_stage_digest is not None
+            else MODEL_CACHE_KIND_FULL_SNAPSHOT
+        ),
     }
-    if stage_artifact_set_digest is not None:
-        value["cache_kind"] = MODEL_CACHE_KIND_STAGE
-        value["stage_artifact_set_digest"] = stage_artifact_set_digest
+    if selected_stage_digest is not None:
+        value["stage_artifact_set_digest"] = selected_stage_digest
     return value
 
 
@@ -836,6 +912,127 @@ def _plan_snapshot(
     if stage_projection is not None:
         value["stage_artifact"] = copy.deepcopy(stage_projection)
     return value
+
+
+def _artifact_cache_identity(
+    snapshot: dict[str, Any], node_id: str
+) -> ArtifactCacheIdentity:
+    """Derive the exact central cache identity from an immutable preparation."""
+
+    artifact = snapshot.get("artifact")
+    stage_artifact = snapshot.get("stage_artifact")
+    if type(artifact) is not dict:
+        raise ArtifactPreparationError(
+            "preparation artifact identity is invalid",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+        )
+    if stage_artifact is None:
+        manifest_digest = artifact.get("manifest_digest")
+        return ArtifactCacheIdentity(
+            cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            cache_identity_digest=manifest_digest,
+            manifest_digest=manifest_digest,
+            source_manifest_digest=manifest_digest,
+            verification_version=MODEL_CACHE_VERIFICATION_VERSION,
+        )
+    if type(stage_artifact) is not dict:
+        raise ArtifactPreparationError(
+            "preparation STAGE identity is invalid",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+        )
+    bindings = stage_artifact.get("node_bindings")
+    binding = next(
+        (
+            item
+            for item in bindings
+            if type(item) is dict and item.get("node_id") == node_id
+        ),
+        None,
+    ) if type(bindings) is list else None
+    if binding is None:
+        raise ArtifactPreparationError(
+            "preparation STAGE rank binding is missing",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+            details={"node_id": node_id},
+        )
+    try:
+        physical_identity = StageCacheIdentity(
+            repository=artifact["repository"],
+            revision=artifact["revision"],
+            manifest_digest=binding["manifest_digest"],
+            quantization=artifact["quantization"],
+            artifact_set_digest=stage_artifact["artifact_set_digest"],
+            contract_identity_digest=stage_artifact[
+                "contract_identity_digest"
+            ],
+            source_manifest_digest=stage_artifact["source_manifest_digest"],
+            runtime_image=stage_artifact["runtime_image"],
+            vllm_version=stage_artifact["vllm_version"],
+            exporter_build_digest=stage_artifact["exporter_build_digest"],
+            architecture=stage_artifact["architecture"],
+            loader_format=stage_artifact["loader_format"],
+            tensor_parallel_size=stage_artifact["tensor_parallel_size"],
+            pipeline_parallel_size=stage_artifact["pipeline_parallel_size"],
+            pipeline_rank=binding["pipeline_rank"],
+            tensor_rank=binding["tensor_rank"],
+            tensor_keys_digest=binding["tensor_keys_digest"],
+        )
+    except (KeyError, TypeError, ValueError, StageCacheError) as exc:
+        raise ArtifactPreparationError(
+            "preparation STAGE cache identity is invalid",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+            details={"node_id": node_id},
+        ) from exc
+    return ArtifactCacheIdentity(
+        cache_kind=MODEL_CACHE_KIND_STAGE,
+        cache_identity_digest=physical_identity.cache_identity_digest,
+        manifest_digest=physical_identity.manifest_digest,
+        source_manifest_digest=physical_identity.source_manifest_digest,
+        verification_version=STAGE_CACHE_VERIFICATION_VERSION,
+        artifact_set_digest=physical_identity.artifact_set_digest,
+        pipeline_rank=physical_identity.pipeline_rank,
+        tensor_rank=physical_identity.tensor_rank,
+        tensor_parallel_size=physical_identity.tensor_parallel_size,
+        pipeline_parallel_size=physical_identity.pipeline_parallel_size,
+        tensor_keys_digest=physical_identity.tensor_keys_digest,
+    )
+
+
+def record_deployment_cache_verification_failure(
+    session: Session,
+    deployment: Deployment,
+    *,
+    node_id: str,
+    task_id: str,
+) -> bool:
+    """Fail closed for a node-local deployment verification failure.
+
+    Legacy deployments have no controller-owned preparation/cache contract and
+    are intentionally left unchanged. A missing cache record must not hide the
+    original rollout failure, so callers receive ``False`` instead.
+    """
+
+    if deployment.source_recommendation_id is None:
+        return False
+    preparation = session.scalar(
+        select(ArtifactPreparation).where(
+            ArtifactPreparation.deployment_id == deployment.id
+        )
+    )
+    if preparation is None or type(preparation.plan_snapshot) is not dict:
+        return False
+    try:
+        identity = _artifact_cache_identity(preparation.plan_snapshot, node_id)
+        record_verification_failure(
+            session,
+            node_id=node_id,
+            identity=identity,
+            source_id=task_id,
+            source_task_id=task_id,
+        )
+    except (ArtifactCacheLifecycleError, ArtifactPreparationError):
+        return False
+    return True
 
 
 def _active_attempts(session: Session, preparation_id: str) -> bool:
@@ -1738,7 +1935,43 @@ def finish_preparation_task(
         record.model_status = "FAILED" if failure_code else "SUCCEEDED"
         record.model_failure_code = failure_code
         if failure_code is None:
-            _queue_attempt(session, preparation, record, stage="IMAGE")
+            try:
+                # Persist the terminal MODEL projection before the lifecycle
+                # helper re-reads and fences the exact current attempt.  Its
+                # cache/event writes live in a savepoint so any registry race
+                # can be converted into a committed closed failure without a
+                # half-written READY record.
+                session.flush()
+                with session.begin_nested():
+                    identity = _artifact_cache_identity(
+                        preparation.plan_snapshot, record.node_id
+                    )
+                    record_preparation_success(
+                        session,
+                        attempt_id=attempt.id,
+                        identity=identity,
+                    )
+            except (ArtifactCacheLifecycleError, ArtifactPreparationError) as exc:
+                failure_code = "PREPARATION_RESULT_REJECTED"
+                validated_result = None
+                locked_task.status = TaskStatus.FAILED.value
+                locked_task.result = None
+                locked_task.error = failure_code
+                attempt.status = "FAILED"
+                attempt.failure_code = failure_code
+                attempt.result = None
+                record.model_status = "FAILED"
+                record.model_failure_code = failure_code
+                result_rejection = ArtifactPreparationError(
+                    "preparation success could not be bound to an exact READY cache",
+                    code=failure_code,
+                    details={
+                        "task_id": locked_task.id,
+                        "cache_failure_code": getattr(exc, "code", None),
+                    },
+                )
+            else:
+                _queue_attempt(session, preparation, record, stage="IMAGE")
     else:
         record.image_status = "FAILED" if failure_code else "SUCCEEDED"
         record.image_failure_code = failure_code
@@ -2028,6 +2261,7 @@ def effective_deployment_plan(
     deployment: Deployment,
     *,
     require_prepared: bool = True,
+    lock_ready_caches: bool = True,
 ) -> dict[str, Any]:
     if deployment.source_recommendation_id is None:
         return deployment.plan
@@ -2340,6 +2574,24 @@ def effective_deployment_plan(
                     "node_id": record.node_id,
                 },
             )
+        try:
+            cache_identity = _artifact_cache_identity(snapshot, record.node_id)
+            require_ready_cache(
+                session,
+                node_id=record.node_id,
+                identity=cache_identity,
+                lock=lock_ready_caches,
+            )
+        except (ArtifactCacheLifecycleError, ArtifactPreparationError) as exc:
+            raise ArtifactPreparationError(
+                "the exact node artifact cache is not READY",
+                code="DEPLOYMENT_ARTIFACT_CACHE_NOT_READY",
+                details={
+                    "deployment_id": deployment.id,
+                    "node_id": record.node_id,
+                    "cache_failure_code": getattr(exc, "code", None),
+                },
+            ) from exc
         for stage, attempt_no in (
             ("MODEL", record.model_current_attempt),
             ("IMAGE", record.image_current_attempt),
