@@ -71,6 +71,7 @@ from .service import (
     complete_benchmark_task,
     transition_model_release,
 )
+from .recommendation import RecommendationNodeNotFoundError, recommend_deployment
 
 
 class StrictBody(BaseModel):
@@ -305,6 +306,26 @@ class BenchmarkTaskResult(StrictBody):
         "quality-eval",
     ]
     metrics: BenchmarkTaskMetrics
+
+
+class DeploymentRecommendationCreate(StrictBody):
+    node_ids: list[str] = Field(default_factory=list, max_length=256)
+    all_online: bool = False
+    objective: Literal["quality-first"] = "quality-first"
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        if bool(self.node_ids) == self.all_online:
+            raise ValueError("choose exactly one of node_ids or all_online")
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("node_ids must not contain duplicates")
+        for node_id in self.node_ids:
+            try:
+                if str(uuid.UUID(node_id)) != node_id:
+                    raise ValueError
+            except (AttributeError, ValueError) as exc:
+                raise ValueError("node_ids must be canonical UUIDs") from exc
+        return self
 
 
 def _bearer(authorization: str | None) -> str:
@@ -861,6 +882,21 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             },
             "changed": changed,
         }
+
+    @app.post(
+        "/v1/admin/deployment-recommendations",
+        dependencies=[Depends(admin_auth)],
+    )
+    def deployment_recommendation_create(
+        body: DeploymentRecommendationCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return recommend_deployment(session, **body.model_dump())
+        except RecommendationNodeNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     @app.post("/v1/admin/deployments", dependencies=[Depends(admin_auth)])
     def deployment_create(body: DeploymentCreate, session: Session = Depends(get_session)):
