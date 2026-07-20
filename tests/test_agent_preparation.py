@@ -18,6 +18,7 @@ from dure.artifact_prepare import (
     trusted_origin_from_config,
 )
 from dure.command import CommandResult
+from dure.http import APIError
 from dure.model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_VERIFICATION_VERSION,
@@ -203,6 +204,29 @@ class FakeAgentClient:
         if path.endswith("/artifact-manifest"):
             return {"manifest": copy.deepcopy(self.manifest)}
         return {}
+
+
+class FailingReportAgentClient(FakeAgentClient):
+    def __init__(
+        self,
+        task: dict,
+        report_errors: list[APIError],
+        manifest: dict | None = None,
+    ) -> None:
+        super().__init__(task, manifest)
+        self.report_errors = list(report_errors)
+        self.claim_count = 0
+
+    def request(self, method, path, payload=None):
+        if path == "/v1/agent/tasks/claim":
+            self.claim_count += 1
+        if (
+            path.endswith(("/complete", "/fail"))
+            and self.report_errors
+        ):
+            self.requests.append((method, path, payload))
+            raise self.report_errors.pop(0)
+        return super().request(method, path, payload)
 
 
 class AgentPreparationTests(unittest.TestCase):
@@ -535,6 +559,111 @@ class AgentPreparationTests(unittest.TestCase):
             ]
             self.assertEqual(len(completions), 2)
             self.assertEqual(completions[0][2], completions[1][2])
+
+    def test_agent_retries_pending_report_before_claim_without_reexecution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preparer = FakeModelPreparer()
+            client = FailingReportAgentClient(
+                model_task(),
+                [APIError("temporary report failure", status_code=503)],
+            )
+            agent = Agent(
+                {
+                    "server": "https://controller.example.test",
+                    "node_id": NODE_ID,
+                    "credential": "agent-secret",
+                    "state_file": str(root / "state.json"),
+                },
+                history_path=root / "history.json",
+            )
+            agent.client = client
+            agent.executor = TaskExecutor(
+                NODE_ID,
+                preparation_executor=ArtifactPreparationExecutor(
+                    NODE_ID,
+                    origin=ORIGIN,
+                    model_preparer=preparer,
+                    manifest_loader=lambda task_id: copy.deepcopy(MANIFEST),
+                ),
+            )
+
+            with self.assertRaises(APIError):
+                agent.once()
+            failed_report_history = json.loads(
+                (root / "history.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                failed_report_history["completed"][TASK_ID]["status"],
+                "complete",
+            )
+            self.assertEqual(
+                failed_report_history["pending_reports"][TASK_ID]["status"],
+                "complete",
+            )
+
+            self.assertTrue(agent.once())
+
+            completions = [
+                request
+                for request in client.requests
+                if request[1].endswith("/complete")
+            ]
+            persisted = json.loads(
+                (root / "history.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(preparer.calls), 1)
+            self.assertEqual(client.claim_count, 1)
+            self.assertEqual(len(completions), 2)
+            self.assertEqual(completions[0][2], completions[1][2])
+            self.assertEqual(agent.history["pending_reports"], {})
+            self.assertEqual(persisted["pending_reports"], {})
+
+    def test_agent_drops_terminally_rejected_pending_failure_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preparer = FakeModelPreparer(exception=RuntimeError("failure"))
+            client = FailingReportAgentClient(
+                model_task(),
+                [
+                    APIError("temporary report transport failure"),
+                    APIError("terminal report rejection", status_code=422),
+                ],
+            )
+            agent = Agent(
+                {
+                    "server": "https://controller.example.test",
+                    "node_id": NODE_ID,
+                    "credential": "agent-secret",
+                    "state_file": str(root / "state.json"),
+                },
+                history_path=root / "history.json",
+            )
+            agent.client = client
+            agent.executor = TaskExecutor(
+                NODE_ID,
+                preparation_executor=ArtifactPreparationExecutor(
+                    NODE_ID,
+                    origin=ORIGIN,
+                    model_preparer=preparer,
+                    manifest_loader=lambda task_id: copy.deepcopy(MANIFEST),
+                ),
+            )
+
+            with self.assertRaises(APIError):
+                agent.once()
+            self.assertIn(TASK_ID, agent.history["pending_reports"])
+            self.assertTrue(agent.once())
+
+            failures = [
+                request
+                for request in client.requests
+                if request[1].endswith("/fail")
+            ]
+            self.assertEqual(len(preparer.calls), 1)
+            self.assertEqual(client.claim_count, 1)
+            self.assertEqual(len(failures), 2)
+            self.assertEqual(agent.history["pending_reports"], {})
 
     def test_agent_redacts_unexpected_exception_and_replays_only_closed_code(self):
         with tempfile.TemporaryDirectory() as temporary:
