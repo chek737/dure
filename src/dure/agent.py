@@ -22,6 +22,12 @@ from .artifact_prepare import (
     validate_preparation_history,
     validate_preparation_result,
 )
+from .cache_quarantine import (
+    ARTIFACT_CACHE_QUARANTINE_FAILURE_CODES,
+    ArtifactCacheQuarantineExecutor,
+    artifact_cache_quarantine_failure_code,
+    validate_artifact_cache_quarantine_result,
+)
 from .command import SubprocessRunner
 from .http import APIError, JSONClient
 from .model_cache import (
@@ -453,6 +459,7 @@ class TaskExecutor:
         state_path: Path | None = None,
         benchmark_executor: SafeBenchmarkExecutor | None = None,
         preparation_executor: ArtifactPreparationExecutor | None = None,
+        quarantine_executor: ArtifactCacheQuarantineExecutor | None = None,
         artifact_origin_config: object = None,
         manifest_loader: Callable[[str], dict] | None = None,
         build_commit: str | None | object = _BUILD_COMMIT_UNSET,
@@ -480,6 +487,10 @@ class TaskExecutor:
             runner=runner,
             origin_config=artifact_origin_config,
             manifest_loader=manifest_loader,
+        )
+        self.quarantine_executor = quarantine_executor or ArtifactCacheQuarantineExecutor(
+            node_id,
+            runner=runner,
         )
 
     def _profile(self):
@@ -565,6 +576,8 @@ class TaskExecutor:
         payload = task.get("payload") or {}
         if kind == TaskType.PROBE:
             return {"profile": self._profile().to_dict()}
+        if kind == TaskType.QUARANTINE_ARTIFACT_CACHE:
+            return self.quarantine_executor.execute(task)
         if kind == TaskType.BENCHMARK:
             benchmark = _validated_benchmark_payload(payload)
             if not benchmark.apply:
@@ -893,6 +906,9 @@ class Agent:
         task_id = task["id"]
         is_benchmark = task.get("type") == TaskType.BENCHMARK.value
         is_preparation = is_artifact_preparation_task(task.get("type"))
+        is_quarantine = (
+            task.get("type") == TaskType.QUARANTINE_ARTIFACT_CACHE.value
+        )
         previous = self.history.get("completed", {}).get(task_id)
         if previous is not None:
             if is_preparation:
@@ -1007,6 +1023,50 @@ class Agent:
                                 f"/v1/agent/tasks/{task_id}/complete",
                                 {"result": result},
                             )
+            elif is_quarantine:
+                if type(previous) is not dict or previous.get("status") == "failed":
+                    error = (
+                        previous.get("error")
+                        if type(previous) is dict
+                        else None
+                    )
+                    if error not in ARTIFACT_CACHE_QUARANTINE_FAILURE_CODES:
+                        error = "CACHE_QUARANTINE_EXECUTION_FAILED"
+                        self.history.setdefault("completed", {})[task_id] = {
+                            "status": "failed",
+                            "error": error,
+                        }
+                        _atomic_json(self.history_path, self.history)
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/fail",
+                        {"error": error},
+                    )
+                else:
+                    try:
+                        result = validate_artifact_cache_quarantine_result(
+                            task,
+                            previous.get("result", previous),
+                            self.executor.node_id,
+                        )
+                    except Exception:
+                        error = "CACHE_QUARANTINE_EXECUTION_FAILED"
+                        self.history.setdefault("completed", {})[task_id] = {
+                            "status": "failed",
+                            "error": error,
+                        }
+                        _atomic_json(self.history_path, self.history)
+                        self.client.request(
+                            "POST",
+                            f"/v1/agent/tasks/{task_id}/fail",
+                            {"error": error},
+                        )
+                    else:
+                        self.client.request(
+                            "POST",
+                            f"/v1/agent/tasks/{task_id}/complete",
+                            {"result": result},
+                        )
             elif previous.get("status") == "failed":
                 self.client.request("POST", f"/v1/agent/tasks/{task_id}/fail", {"error": previous["error"]})
             else:
@@ -1033,6 +1093,12 @@ class Agent:
                         result,
                         self.executor.node_id,
                     )
+                elif is_quarantine:
+                    result = validate_artifact_cache_quarantine_result(
+                        task,
+                        result,
+                        self.executor.node_id,
+                    )
             except Exception as exc:
                 if is_benchmark and getattr(exc, "defer_benchmark", False) is True:
                     LOG.warning(
@@ -1047,6 +1113,13 @@ class Agent:
                         error = preparation_failure_code(exc)
                         LOG.error(
                             "artifact preparation task %s failed with %s",
+                            task_id,
+                            error,
+                        )
+                    elif is_quarantine:
+                        error = artifact_cache_quarantine_failure_code(exc)
+                        LOG.error(
+                            "artifact cache quarantine task %s failed with %s",
                             task_id,
                             error,
                         )

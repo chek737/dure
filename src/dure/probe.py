@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import platform
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from .command import Runner, SubprocessRunner
 from .model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_KIND_STAGE,
     MODEL_CACHE_MARKER_FILE,
     MODEL_CACHE_SCHEMA_V1,
@@ -20,6 +22,7 @@ from .model_cache import (
 )
 from .model_store import DURE_MODEL_STAGING_DIRECTORY
 from .models import (
+    ArtifactCacheObservation,
     GPUProfile,
     InstalledModelProfile,
     NetworkProfile,
@@ -37,6 +40,7 @@ DEFAULT_MODEL_ROOTS = (
     Path.home() / ".cache" / "huggingface" / "hub",
 )
 MAX_DISCOVERED_MODELS = 100
+MAX_ARTIFACT_CACHE_OBSERVATIONS = 256
 MAX_MODEL_CONFIG_BYTES = 1024 * 1024
 DURE_MODEL_METADATA_FILE = MODEL_CACHE_MARKER_FILE
 DURE_MODEL_METADATA_SCHEMA = MODEL_CACHE_SCHEMA_V1
@@ -112,6 +116,7 @@ class NodeProbe:
         runtime = self._probe_runtime()
         network = self._probe_network()
         installed_models = self._probe_models()
+        cache_observations, cache_scan_complete = self._probe_artifact_caches()
         workloads = self._probe_workloads(runtime)
 
         if not gpus:
@@ -142,6 +147,8 @@ class NodeProbe:
             network=network,
             runtime=runtime,
             installed_models=installed_models,
+            artifact_cache_observations=cache_observations,
+            artifact_cache_scan_complete=cache_scan_complete,
             workloads=workloads,
             issues=issues,
         )
@@ -496,6 +503,142 @@ class NodeProbe:
         for model in models[:MAX_DISCOVERED_MODELS]:
             unique[(model.source, model.model_id, model.path)] = model
         return list(unique.values())
+
+    @staticmethod
+    def _canonical_cache_digest(name: str) -> str | None:
+        match = re.fullmatch(r"sha256-([0-9a-f]{64})", name)
+        return f"sha256:{match.group(1)}" if match is not None else None
+
+    def _probe_artifact_cache_root(
+        self,
+        root: Path,
+        cache_kind: str,
+    ) -> tuple[list[ArtifactCacheObservation], bool]:
+        try:
+            observed_root = root.lstat()
+        except FileNotFoundError:
+            return [], True
+        except OSError:
+            return [], False
+        if not stat.S_ISDIR(observed_root.st_mode) or not self._safe_model_directory(root):
+            return [], False
+        try:
+            canonical = heapq.nsmallest(
+                MAX_ARTIFACT_CACHE_OBSERVATIONS + 1,
+                (
+                    (candidate, digest)
+                    for candidate in root.iterdir()
+                    if (
+                        digest := self._canonical_cache_digest(candidate.name)
+                    )
+                    is not None
+                ),
+                key=lambda item: item[0].name,
+            )
+        except OSError:
+            return [], False
+        complete = len(canonical) <= MAX_ARTIFACT_CACHE_OBSERVATIONS
+        observations: list[ArtifactCacheObservation] = []
+        for candidate, cache_identity_digest in canonical[
+            :MAX_ARTIFACT_CACHE_OBSERVATIONS
+        ]:
+            if not self._safe_model_directory(candidate):
+                observations.append(
+                    ArtifactCacheObservation(
+                        cache_kind=cache_kind,
+                        cache_identity_digest=cache_identity_digest,
+                        condition="UNSAFE",
+                    )
+                )
+                continue
+            try:
+                marker = read_model_cache_marker(candidate / MODEL_CACHE_MARKER_FILE)
+            except ModelCacheMarkerError:
+                observations.append(
+                    ArtifactCacheObservation(
+                        cache_kind=cache_kind,
+                        cache_identity_digest=cache_identity_digest,
+                        condition="CORRUPT",
+                    )
+                )
+                continue
+            if marker.cache_kind != cache_kind:
+                observations.append(
+                    ArtifactCacheObservation(
+                        cache_kind=cache_kind,
+                        cache_identity_digest=cache_identity_digest,
+                        condition="CORRUPT",
+                    )
+                )
+                continue
+            if cache_kind == MODEL_CACHE_KIND_STAGE:
+                marker_identity = marker.cache_identity_digest
+                observations.append(
+                    ArtifactCacheObservation(
+                        cache_kind=cache_kind,
+                        cache_identity_digest=cache_identity_digest,
+                        condition=(
+                            "PRESENT"
+                            if marker_identity == cache_identity_digest
+                            else "IDENTITY_MISMATCH"
+                        ),
+                        manifest_digest=marker.manifest_digest,
+                        verification_version=marker.verification_version,
+                        artifact_set_digest=marker.artifact_set_digest,
+                        source_manifest_digest=marker.source_manifest_digest,
+                        pipeline_rank=marker.pipeline_rank,
+                        tensor_rank=marker.tensor_rank,
+                    )
+                )
+            else:
+                observations.append(
+                    ArtifactCacheObservation(
+                        cache_kind=cache_kind,
+                        cache_identity_digest=cache_identity_digest,
+                        condition=(
+                            "PRESENT"
+                            if marker.manifest_digest == cache_identity_digest
+                            else "IDENTITY_MISMATCH"
+                        ),
+                        manifest_digest=marker.manifest_digest,
+                        verification_version=marker.verification_version,
+                    )
+                )
+        return observations, complete
+
+    def _probe_artifact_caches(
+        self,
+    ) -> tuple[list[ArtifactCacheObservation], bool]:
+        observations: dict[tuple[str, str], ArtifactCacheObservation] = {}
+        complete = True
+        for root in self.model_roots:
+            if root.name == "hub":
+                continue
+            cache_kind = (
+                MODEL_CACHE_KIND_STAGE
+                if root == DURE_STAGE_ROOT or root.name == DURE_STAGE_ROOT.name
+                else MODEL_CACHE_KIND_FULL_SNAPSHOT
+            )
+            values, root_complete = self._probe_artifact_cache_root(
+                root, cache_kind
+            )
+            complete = complete and root_complete
+            for observation in values:
+                observations.setdefault(
+                    (
+                        observation.cache_kind,
+                        observation.cache_identity_digest,
+                    ),
+                    observation,
+                )
+        ordered = sorted(
+            observations.values(),
+            key=lambda item: (item.cache_kind, item.cache_identity_digest),
+        )
+        if len(ordered) > MAX_ARTIFACT_CACHE_OBSERVATIONS:
+            complete = False
+            ordered = ordered[:MAX_ARTIFACT_CACHE_OBSERVATIONS]
+        return ordered, complete
 
     @staticmethod
     def _labels(value: str) -> dict[str, str]:

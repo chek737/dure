@@ -18,6 +18,10 @@ VLLM_RAY_PP_RUNTIME_VERSION = "0.9.0"
 VLLM_STAGE_ARCHITECTURE = "Qwen2ForCausalLM"
 VLLM_STAGE_LOADER_FORMAT = "VLLM_SHARDED_STATE_V1"
 _SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+ARTIFACT_CACHE_CONDITIONS = frozenset(
+    {"PRESENT", "UNSAFE", "CORRUPT", "IDENTITY_MISMATCH"}
+)
+MAX_ARTIFACT_CACHE_OBSERVATIONS = 256
 _PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -129,6 +133,104 @@ class InstalledModelProfile:
         return cls(**value)
 
 
+@dataclass(frozen=True)
+class ArtifactCacheObservation:
+    """Bounded, metadata-only observation of one canonical Dure cache."""
+
+    cache_kind: str
+    cache_identity_digest: str
+    condition: str
+    manifest_digest: str | None = None
+    verification_version: int | None = None
+    artifact_set_digest: str | None = None
+    source_manifest_digest: str | None = None
+    pipeline_rank: int | None = None
+    tensor_rank: int | None = None
+
+    def validate(self) -> None:
+        if (
+            type(self.cache_kind) is not str
+            or self.cache_kind
+            not in {MODEL_CACHE_KIND_FULL_SNAPSHOT, MODEL_CACHE_KIND_STAGE}
+            or type(self.cache_identity_digest) is not str
+            or _SHA256_DIGEST.fullmatch(self.cache_identity_digest) is None
+            or type(self.condition) is not str
+            or self.condition not in ARTIFACT_CACHE_CONDITIONS
+        ):
+            raise ValueError("artifact cache observation identity is invalid")
+        detail = (
+            self.manifest_digest,
+            self.verification_version,
+            self.artifact_set_digest,
+            self.source_manifest_digest,
+            self.pipeline_rank,
+            self.tensor_rank,
+        )
+        if self.condition in {"UNSAFE", "CORRUPT"}:
+            if any(value is not None for value in detail):
+                raise ValueError(
+                    "unsafe or corrupt cache observations must not assert marker details"
+                )
+            return
+        if (
+            type(self.manifest_digest) is not str
+            or _SHA256_DIGEST.fullmatch(self.manifest_digest) is None
+            or type(self.verification_version) is not int
+            or self.verification_version != 1
+        ):
+            raise ValueError("artifact cache observation marker detail is invalid")
+        stage_detail = (
+            self.artifact_set_digest,
+            self.source_manifest_digest,
+            self.pipeline_rank,
+            self.tensor_rank,
+        )
+        if self.cache_kind == MODEL_CACHE_KIND_FULL_SNAPSHOT:
+            if any(value is not None for value in stage_detail):
+                raise ValueError(
+                    "full snapshot observations must not contain stage details"
+                )
+            return
+        if (
+            type(self.artifact_set_digest) is not str
+            or _SHA256_DIGEST.fullmatch(self.artifact_set_digest) is None
+            or type(self.source_manifest_digest) is not str
+            or _SHA256_DIGEST.fullmatch(self.source_manifest_digest) is None
+            or type(self.pipeline_rank) is not int
+            or self.pipeline_rank < 0
+            or type(self.tensor_rank) is not int
+            or self.tensor_rank < 0
+        ):
+            raise ValueError("stage cache observation detail is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        value = asdict(self)
+        return {key: item for key, item in value.items() if item is not None}
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ArtifactCacheObservation":
+        if type(value) is not dict or any(type(key) is not str for key in value):
+            raise ValueError("artifact cache observation must be an object")
+        allowed = {
+            "cache_kind",
+            "cache_identity_digest",
+            "condition",
+            "manifest_digest",
+            "verification_version",
+            "artifact_set_digest",
+            "source_manifest_digest",
+            "pipeline_rank",
+            "tensor_rank",
+        }
+        required = {"cache_kind", "cache_identity_digest", "condition"}
+        if not required <= set(value) or not set(value) <= allowed:
+            raise ValueError("artifact cache observation does not match the closed schema")
+        observation = cls(**value)
+        observation.validate()
+        return observation
+
+
 @dataclass
 class WorkloadProfile:
     name: str
@@ -165,6 +267,8 @@ class NodeProfile:
     network: NetworkProfile
     runtime: RuntimeProfile
     installed_models: list[InstalledModelProfile] = field(default_factory=list)
+    artifact_cache_observations: list[ArtifactCacheObservation] | None = None
+    artifact_cache_scan_complete: bool | None = None
     workloads: list[WorkloadProfile] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
 
@@ -177,6 +281,25 @@ class NodeProfile:
         return any(gpu.healthy for gpu in self.gpus)
 
     def to_dict(self) -> dict[str, Any]:
+        if (self.artifact_cache_observations is None) != (
+            self.artifact_cache_scan_complete is None
+        ):
+            raise ValueError(
+                "artifact cache observations and scan completeness must be reported together"
+            )
+        if (
+            self.artifact_cache_scan_complete is not None
+            and type(self.artifact_cache_scan_complete) is not bool
+        ):
+            raise ValueError("artifact cache scan_complete must be a strict boolean")
+        if (
+            self.artifact_cache_observations is not None
+            and len(self.artifact_cache_observations)
+            > MAX_ARTIFACT_CACHE_OBSERVATIONS
+        ):
+            raise ValueError(
+                "artifact cache observations exceed the maximum allowed count"
+            )
         value = asdict(self)
         if not self.network.default_interface_addresses:
             value["network"].pop("default_interface_addresses", None)
@@ -200,6 +323,14 @@ class NodeProfile:
             for key in stage_profile_fields:
                 if model.get(key) is None:
                     model.pop(key, None)
+        if self.artifact_cache_observations is None:
+            value.pop("artifact_cache_observations", None)
+            value.pop("artifact_cache_scan_complete", None)
+        else:
+            value["artifact_cache_observations"] = [
+                observation.to_dict()
+                for observation in self.artifact_cache_observations
+            ]
         return value
 
     @classmethod
@@ -211,6 +342,25 @@ class NodeProfile:
         data["installed_models"] = [
             InstalledModelProfile.from_dict(item) for item in data.get("installed_models", [])
         ]
+        has_observations = "artifact_cache_observations" in data
+        has_scan_complete = "artifact_cache_scan_complete" in data
+        if has_observations != has_scan_complete:
+            raise ValueError(
+                "artifact cache observations and scan completeness must be reported together"
+            )
+        if has_observations:
+            if type(data["artifact_cache_observations"]) is not list:
+                raise ValueError("artifact cache observations must be an array")
+            if len(data["artifact_cache_observations"]) > MAX_ARTIFACT_CACHE_OBSERVATIONS:
+                raise ValueError(
+                    "artifact cache observations exceed the maximum allowed count"
+                )
+            if type(data["artifact_cache_scan_complete"]) is not bool:
+                raise ValueError("artifact cache scan_complete must be a strict boolean")
+            data["artifact_cache_observations"] = [
+                ArtifactCacheObservation.from_dict(item)
+                for item in data["artifact_cache_observations"]
+            ]
         data["workloads"] = [
             WorkloadProfile.from_dict(item) for item in data.get("workloads", [])
         ]
@@ -382,7 +532,10 @@ class DeploymentPlan:
         if self.execution_backend is None:
             if (
                 self.runtime_vllm_version is not None
-                or self.model_cache_kind is not None
+                or self.model_cache_kind not in {
+                    None,
+                    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                }
                 or self.stage_artifact is not None
                 or strict_assignment_fields
             ):

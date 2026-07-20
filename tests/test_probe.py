@@ -11,7 +11,7 @@ from dure.model_cache import (
     build_model_cache_marker,
     build_stage_model_cache_marker,
 )
-from dure.models import NodeProfile
+from dure.models import ArtifactCacheObservation, NodeProfile
 from dure.probe import NodeProbe
 from dure.stage_cache import (
     StageCacheIdentity,
@@ -255,11 +255,167 @@ class ProbeTests(unittest.TestCase):
         value = NodeProbe(FakeRunner()).collect().to_dict()
         value.pop("installed_models")
         value.pop("workloads")
+        value.pop("artifact_cache_observations")
+        value.pop("artifact_cache_scan_complete")
 
         restored = NodeProfile.from_dict(value)
 
         self.assertEqual(restored.installed_models, [])
         self.assertEqual(restored.workloads, [])
+        self.assertIsNone(restored.artifact_cache_observations)
+        self.assertIsNone(restored.artifact_cache_scan_complete)
+
+    def test_cache_observations_are_closed_metadata_only_and_scan_is_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            cache_digest = "sha256:" + "b" * 64
+            cache_path = model_root / ("sha256-" + "b" * 64)
+            cache_path.mkdir(parents=True)
+            (cache_path / ".dure-model.json").write_text(
+                json.dumps(
+                    build_model_cache_marker(
+                        repository="Example/Full-AWQ",
+                        revision="a" * 40,
+                        manifest_digest=cache_digest,
+                        quantization="awq",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            # Large payloads are deliberately not opened or hashed by the probe.
+            (cache_path / "model.safetensors").write_bytes(b"not-hashed")
+
+            result = NodeProbe(FakeRunner(), model_roots=[model_root]).collect()
+
+        self.assertTrue(result.artifact_cache_scan_complete)
+        self.assertEqual(len(result.artifact_cache_observations or []), 1)
+        observation = result.artifact_cache_observations[0]
+        self.assertEqual(observation.condition, "PRESENT")
+        self.assertEqual(observation.cache_identity_digest, cache_digest)
+        self.assertEqual(
+            set(observation.to_dict()),
+            {
+                "cache_kind",
+                "cache_identity_digest",
+                "condition",
+                "manifest_digest",
+                "verification_version",
+            },
+        )
+        self.assertNotIn("path", observation.to_dict())
+
+    def test_cache_observation_distinguishes_unsafe_corrupt_and_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            model_root.mkdir()
+            unsafe = model_root / ("sha256-" + "1" * 64)
+            unsafe.mkdir(mode=0o777)
+            unsafe.chmod(0o777)
+            corrupt = model_root / ("sha256-" + "2" * 64)
+            corrupt.mkdir()
+            (corrupt / ".dure-model.json").write_text("not-json", encoding="utf-8")
+            mismatch = model_root / ("sha256-" + "3" * 64)
+            mismatch.mkdir()
+            (mismatch / ".dure-model.json").write_text(
+                json.dumps(
+                    build_model_cache_marker(
+                        repository="Example/Full-AWQ",
+                        revision="a" * 40,
+                        manifest_digest="sha256:" + "4" * 64,
+                        quantization="awq",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            result = NodeProbe(FakeRunner(), model_roots=[model_root]).collect()
+
+        conditions = {
+            item.cache_identity_digest: item.condition
+            for item in result.artifact_cache_observations or []
+        }
+        self.assertEqual(conditions["sha256:" + "1" * 64], "UNSAFE")
+        self.assertEqual(conditions["sha256:" + "2" * 64], "CORRUPT")
+        self.assertEqual(
+            conditions["sha256:" + "3" * 64], "IDENTITY_MISMATCH"
+        )
+        self.assertTrue(result.artifact_cache_scan_complete)
+
+    def test_cache_scan_marks_truncated_inventory_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            model_root.mkdir()
+            stage_root = model_root / "stages"
+            stage_root.mkdir()
+            for number in range(129):
+                (model_root / f"sha256-{number:064x}").mkdir()
+            for number in range(128):
+                (stage_root / f"sha256-{number + 129:064x}").mkdir()
+
+            result = NodeProbe(
+                FakeRunner(), model_roots=[model_root, stage_root]
+            ).collect()
+
+        self.assertFalse(result.artifact_cache_scan_complete)
+        self.assertEqual(len(result.artifact_cache_observations or []), 256)
+
+    def test_profile_rejects_more_than_256_valid_cache_observations(self):
+        value = NodeProbe(FakeRunner()).collect().to_dict()
+        value["artifact_cache_observations"] = [
+            {
+                "cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                "cache_identity_digest": f"sha256:{number:064x}",
+                "condition": "UNSAFE",
+            }
+            for number in range(257)
+        ]
+        value["artifact_cache_scan_complete"] = False
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "artifact cache observations exceed the maximum allowed count",
+        ):
+            NodeProfile.from_dict(value)
+
+    def test_profile_rejects_non_string_cache_observation_enums(self):
+        value = NodeProbe(FakeRunner()).collect().to_dict()
+        observation = {
+            "cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            "cache_identity_digest": "sha256:" + "b" * 64,
+            "condition": "UNSAFE",
+        }
+        value["artifact_cache_observations"] = [observation]
+        value["artifact_cache_scan_complete"] = True
+
+        for field in ("cache_kind", "condition"):
+            with self.subTest(field=field):
+                invalid = dict(value)
+                invalid["artifact_cache_observations"] = [
+                    {**observation, field: [observation[field]]}
+                ]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "artifact cache observation identity is invalid",
+                ):
+                    NodeProfile.from_dict(invalid)
+
+    def test_profile_serialization_rejects_more_than_256_cache_observations(self):
+        profile = NodeProbe(FakeRunner()).collect()
+        profile.artifact_cache_observations = [
+            ArtifactCacheObservation(
+                cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                cache_identity_digest=f"sha256:{number:064x}",
+                condition="UNSAFE",
+            )
+            for number in range(257)
+        ]
+        profile.artifact_cache_scan_complete = False
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "artifact cache observations exceed the maximum allowed count",
+        ):
+            profile.to_dict()
 
     def test_v2_full_snapshot_and_stage_markers_are_distinct(self):
         with tempfile.TemporaryDirectory() as temporary:
