@@ -6,7 +6,9 @@ from datetime import timedelta
 from functools import partial
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -46,12 +48,19 @@ from .models import (
     utcnow,
 )
 from .service import (
+    MAX_ARTIFACT_FILE_BYTES,
+    MAX_ARTIFACT_MANIFEST_CHUNKS,
+    MAX_ARTIFACT_MANIFEST_FILES,
+    MAX_ARTIFACT_PATH_LENGTH,
+    ArtifactManifestConflictError,
+    ArtifactManifestNotFoundError,
     BENCHMARK_TASK_FAILURE_CODES,
     BenchmarkRunError,
     BenchmarkRunNotFoundError,
     authenticate_node,
     apply_benchmark_run,
     approve_node,
+    artifact_manifest_dict,
     benchmark_run_dict,
     cancel_task,
     claim_enrollment,
@@ -65,6 +74,7 @@ from .service import (
     fail_benchmark_task,
     finish_task,
     get_benchmark_run,
+    get_artifact_manifest,
     join_node,
     node_status,
     revoke_node,
@@ -74,6 +84,7 @@ from .service import (
     add_placement_profile,
     RegistryConflictError,
     prepare_benchmark_run,
+    register_artifact_manifest,
     complete_benchmark_task,
     transition_model_release,
 )
@@ -160,6 +171,31 @@ class ModelArtifactCreate(StrictBody):
     default_max_model_len: int = Field(gt=0)
     layer_count: int = Field(gt=0)
     license_id: str
+
+
+class ArtifactManifestChunkCreate(StrictBody):
+    ordinal: int = Field(ge=0, lt=MAX_ARTIFACT_MANIFEST_CHUNKS)
+    offset_bytes: int = Field(ge=0, le=MAX_ARTIFACT_FILE_BYTES)
+    length_bytes: int = Field(gt=0, le=MAX_ARTIFACT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class ArtifactManifestFileCreate(StrictBody):
+    path: str = Field(min_length=1, max_length=MAX_ARTIFACT_PATH_LENGTH)
+    kind: Literal["REGULAR"]
+    size_bytes: int = Field(ge=0, le=MAX_ARTIFACT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    chunks: list[ArtifactManifestChunkCreate] = Field(
+        max_length=MAX_ARTIFACT_MANIFEST_CHUNKS
+    )
+
+
+class ArtifactManifestCreate(StrictBody):
+    schema_version: Literal[1]
+    files: list[ArtifactManifestFileCreate] = Field(
+        min_length=1,
+        max_length=MAX_ARTIFACT_MANIFEST_FILES,
+    )
 
 
 class RuntimeReleaseCreate(StrictBody):
@@ -554,6 +590,24 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     expected_admin = admin_token or os.environ.get("DURE_ADMIN_TOKEN")
     get_session = partial(session_dependency, factory)
 
+    @app.exception_handler(RequestValidationError)
+    async def closed_request_validation_error(
+        _request: Request,
+        _error: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "detail": [
+                    {
+                        "type": "request_validation",
+                        "loc": ["request"],
+                        "msg": "Request does not match the closed schema",
+                    }
+                ]
+            },
+        )
+
     def admin_auth(authorization: str | None = Header(default=None)) -> str:
         supplied = _bearer(authorization)
         if not expected_admin or not __import__("hmac").compare_digest(supplied, expected_admin):
@@ -776,6 +830,56 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"artifact": _artifact_dict(record)}
+
+    @app.post(
+        "/v1/admin/model-artifacts/{artifact_id}/manifest",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_manifest_register(
+        artifact_id: str,
+        body: ArtifactManifestCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record, created = register_artifact_manifest(
+                session,
+                artifact_id=artifact_id,
+                manifest=body.model_dump(),
+                commit=False,
+            )
+            value = artifact_manifest_dict(session, record)
+            session.commit()
+        except ArtifactManifestNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ArtifactManifestConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                str(exc),
+            ) from exc
+        return {"manifest": value, "created": created}
+
+    @app.get(
+        "/v1/admin/model-artifacts/{artifact_id}/manifest",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_manifest_show(
+        artifact_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            record = get_artifact_manifest(session, artifact_id)
+            if record is None:
+                raise ArtifactManifestNotFoundError(
+                    "artifact manifest is not registered"
+                )
+            value = artifact_manifest_dict(session, record)
+        except ArtifactManifestNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        except ArtifactManifestConflictError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return {"manifest": value}
 
     @app.post("/v1/admin/runtime-releases", dependencies=[Depends(admin_auth)])
     def runtime_release_create(
