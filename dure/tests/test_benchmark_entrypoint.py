@@ -72,6 +72,21 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimensions"):
             asyncio.run(module._run(args))
 
+    def test_chat_template_rejects_mapping_and_non_integer_tokens(self):
+        module = _load_entrypoint()
+
+        self.assertEqual(module._strict_token_ids([0, 1, 2]), [0, 1, 2])
+        for invalid in (
+            {"input_ids": [1], "attention_mask": [1]},
+            [],
+            [True],
+            [-1],
+            ["1"],
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(RuntimeError, "token id list"):
+                    module._strict_token_ids(invalid)
+
     def test_vllm_receives_tokens_prompt_mapping(self):
         module = _load_entrypoint()
         args = module._parser().parse_args(
@@ -113,8 +128,10 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
                 self.assert_false(add_special_tokens)
                 return [1]
 
-            def apply_chat_template(self, _messages, *, tokenize, add_generation_prompt):
-                if not tokenize or not add_generation_prompt:
+            def apply_chat_template(
+                self, _messages, *, tokenize, add_generation_prompt, return_dict
+            ):
+                if not tokenize or not add_generation_prompt or return_dict:
                     raise AssertionError("chat template flags changed")
                 return [2, 3]
 
@@ -173,7 +190,8 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
 
         self.assertEqual(len(observed_prompts), 22)
         self.assertEqual(len(observed_engine_args), 1)
-        self.assertIs(observed_engine_args[0]["async_scheduling"], False)
+        self.assertIs(observed_engine_args[0]["async_scheduling"], True)
+        self.assertEqual(observed_engine_args[0]["max_model_len"], 1281)
         sleep.assert_not_awaited()
         self.assertTrue(
             all(
