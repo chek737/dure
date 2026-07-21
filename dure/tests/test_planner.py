@@ -111,9 +111,13 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.tensor_parallel_size, 1)
         self.assertEqual(plan.world_size, 3)
         self.assertEqual(plan.ray_head_address, "192.168.0.228:6379")
+        # Rank 0 (head) carries embedding/lm_head + Ray driver overhead, so its
+        # effective GPU weight is discounted (HEAD_STAGE_OVERHEAD_FACTOR)
+        # before the proportional split, even though all three GPUs are the
+        # same physical size.
         self.assertEqual(
             [(item.layer_start, item.layer_end) for item in plan.assignments],
-            [(0, 26), (27, 53), (54, 79)],
+            [(0, 23), (24, 51), (52, 79)],
         )
 
     def test_non_contiguous_gpu_index_is_supported(self):

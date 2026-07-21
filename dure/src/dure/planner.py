@@ -261,7 +261,7 @@ def build_plan(
         raise ValueError(f"duplicate node profile(s): {', '.join(duplicates)}")
 
     healthy: list[tuple[NodeProfile, int]] = []
-    unused_gpu_warnings: list[str] = []
+    unused_gpu_warnings: list[tuple[str, str]] = []
     for profile in profiles:
         node_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
         if node_gpus:
@@ -271,10 +271,11 @@ def build_plan(
             healthy.append((profile, gpu.index))
             leftover = [g for g in node_gpus if g.index != gpu.index]
             if leftover:
-                unused_gpu_warnings.append(
+                unused_gpu_warnings.append((
+                    profile.node_id,
                     f"node {profile.node_id}: {len(leftover)} additional healthy GPU(s) "
-                    f"(index {', '.join(str(g.index) for g in leftover)}) not scheduled"
-                )
+                    f"(index {', '.join(str(g.index) for g in leftover)}) not scheduled",
+                ))
 
     if not healthy:
         return None
@@ -306,16 +307,31 @@ def build_plan(
             raise ValueError(
                 f"{model_id} requires {required_stages} eligible GPU node(s), found {len(eligible)}"
             )
+        # Prefer the biggest eligible GPUs for the stages we actually use,
+        # instead of just the first N nodes in probe order.
+        eligible.sort(key=lambda item: _gpu_for(item[0], item[1]).memory_mib, reverse=True)
         selected = eligible[:required_stages]
 
+    weights_all = [_gpu_for(profile, gpu_index).memory_mib for profile, gpu_index in selected]
+    if any(weight <= 0 for weight in weights_all):
+        raise ValueError("selected node has a GPU reporting non-positive memory; refusing to build a plan")
+
+    if selected:
+        # Put the largest GPU at rank 0: it absorbs the head-stage overhead
+        # discount below, so it should have the most headroom to begin with.
+        head_pos = max(range(len(selected)), key=lambda i: weights_all[i])
+        if head_pos != 0:
+            selected = [selected[head_pos], *selected[:head_pos], *selected[head_pos + 1:]]
+            weights_all = [weights_all[head_pos], *weights_all[:head_pos], *weights_all[head_pos + 1:]]
+
     stages = len(selected)
-    weights = [_gpu_for(profile, gpu_index).memory_mib for profile, gpu_index in selected]
+    weights = list(weights_all)
     if weights:
         # Rank 0 also carries the embedding/lm_head tensors and the Ray/vLLM
         # driver process, which the other stages don't pay for. Discount its
         # weight before the proportional split so it doesn't get assigned as
         # many transformer layers as a same-size GPU on a worker stage.
-        weights[0] = int(weights[0] * HEAD_STAGE_OVERHEAD_FACTOR)
+        weights[0] = max(1, int(weights[0] * HEAD_STAGE_OVERHEAD_FACTOR))
     partitions = _layer_partitions(model.layer_count, stages, weights)
     head_profile = selected[0][0]
     head_ip = head_profile.network.addresses[0] if head_profile.network.addresses else "127.0.0.1"
@@ -343,9 +359,7 @@ def build_plan(
         warnings.append("Container image is unpinned; use an immutable digest before production")
     selected_node_ids = {profile.node_id for profile, _gpu_index in selected}
     warnings.extend(
-        warning
-        for warning in unused_gpu_warnings
-        if warning.split(":", 1)[0].removeprefix("node ") in selected_node_ids
+        message for node_id, message in unused_gpu_warnings if node_id in selected_node_ids
     )
     driver_versions = {
         _gpu_for(profile, gpu_index).driver_version for profile, gpu_index in selected
