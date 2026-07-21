@@ -20,6 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     event,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,6 +35,26 @@ def utcnow() -> datetime:
 def _deployment_lineage_default(context: Any) -> str:
     """Keep legacy/manual deployments in a one-record lineage by default."""
     return str(context.get_current_parameters()["id"])
+
+
+def _canonical_uuid_check(column: str = "id") -> str:
+    hyphen_positions = {9, 14, 19, 24}
+    hexadecimal = ", ".join(
+        repr(character) for character in "0123456789abcdef"
+    )
+    character_checks = " AND ".join(
+        f"substr({column}, {position}, 1) IN ({hexadecimal})"
+        for position in range(1, 37)
+        if position not in hyphen_positions
+    )
+    return (
+        f"length({column}) = 36 AND {column} = lower({column}) "
+        f"AND substr({column}, 9, 1) = '-' "
+        f"AND substr({column}, 14, 1) = '-' "
+        f"AND substr({column}, 19, 1) = '-' "
+        f"AND substr({column}, 24, 1) = '-' "
+        f"AND {character_checks}"
+    )
 
 
 class Node(Base):
@@ -87,6 +108,169 @@ class DeploymentRecommendationRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class FleetRecommendationRecord(Base):
+    """여러 배포 후보를 한 번에 고정한 콘텐츠 주소 Fleet 추천."""
+
+    __tablename__ = "fleet_recommendations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 71 AND id LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_id_sha256",
+        ),
+        CheckConstraint(
+            "schema_version = 1",
+            name="ck_fleet_recommendation_schema_version",
+        ),
+        CheckConstraint(
+            "objective = 'quality-first'",
+            name="ck_fleet_recommendation_objective",
+        ),
+        CheckConstraint(
+            "selection_mode IN ('all_online', 'explicit_nodes')",
+            name="ck_fleet_recommendation_selection_mode",
+        ),
+        CheckConstraint(
+            "minimum_reserve_nodes >= 0",
+            name="ck_fleet_recommendation_reserve_nonnegative",
+        ),
+        CheckConstraint(
+            "length(inventory_fingerprint) = 71 "
+            "AND inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_inventory_sha256",
+        ),
+        CheckConstraint(
+            "length(source_inventory_fingerprint) = 71 "
+            "AND source_inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_source_inventory_sha256",
+        ),
+        CheckConstraint(
+            "length(catalog_version) = 71 "
+            "AND catalog_version LIKE 'sha256:%'",
+            name="ck_fleet_recommendation_catalog_version_sha256",
+        ),
+        CheckConstraint(
+            "length(catalog_policy_version) BETWEEN 1 AND 64",
+            name="ck_fleet_recommendation_catalog_policy_version",
+        ),
+        CheckConstraint(
+            "length(candidate_policy_version) BETWEEN 1 AND 64",
+            name="ck_fleet_recommendation_candidate_policy_version",
+        ),
+        CheckConstraint(
+            "length(scheduler_version) BETWEEN 1 AND 64",
+            name="ck_fleet_recommendation_scheduler_version",
+        ),
+        Index("ix_fleet_recommendations_created_at", "created_at"),
+    )
+    id: Mapped[str] = mapped_column(String(71), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    objective: Mapped[str] = mapped_column(
+        String(40), default="quality-first", nullable=False
+    )
+    selection_mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    minimum_replicas: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    minimum_reserve_nodes: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserve_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    source_inventory_fingerprint: Mapped[str] = mapped_column(
+        String(71), nullable=False
+    )
+    catalog_version: Mapped[str] = mapped_column(String(71), nullable=False)
+    catalog_policy_version: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    candidate_policy_version: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    scheduler_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    recommendation_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "schema_version": self.schema_version,
+            "objective": self.objective,
+            "selection_mode": self.selection_mode,
+            "requested_node_ids": list(self.requested_node_ids),
+            "minimum_replicas": dict(self.minimum_replicas),
+            "minimum_reserve_nodes": self.minimum_reserve_nodes,
+            "reserve_node_ids": list(self.reserve_node_ids),
+            "inventory_fingerprint": self.inventory_fingerprint,
+            "source_inventory_fingerprint": self.source_inventory_fingerprint,
+            "catalog_version": self.catalog_version,
+            "catalog_policy_version": self.catalog_policy_version,
+            "candidate_policy_version": self.candidate_policy_version,
+            "scheduler_version": self.scheduler_version,
+            "recommendation_snapshot": dict(self.recommendation_snapshot),
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+        }
+
+
+class FleetRecord(Base):
+    """수락된 불변 Fleet 추천의 원자적 생성 단위."""
+
+    __tablename__ = "fleets"
+    __table_args__ = (
+        CheckConstraint(
+            _canonical_uuid_check(),
+            name="ck_fleets_id_canonical_uuid",
+        ),
+        CheckConstraint(
+            "status IN ('ACCEPTED', 'PREPARING', 'PREPARED', 'APPLYING', "
+            "'VERIFYING', 'ACTIVE', 'PARTIAL_FAILED', 'FAILED')",
+            name="ck_fleets_status",
+        ),
+        UniqueConstraint(
+            "source_recommendation_id",
+            name="uq_fleets_source_recommendation_id",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    source_recommendation_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "fleet_recommendations.id",
+            name="fk_fleets_source_recommendation_id",
+        ),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default="ACCEPTED", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source_recommendation_id": self.source_recommendation_id,
+            "status": self.status,
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+            "updated_at": (
+                self.updated_at.isoformat()
+                if self.updated_at is not None
+                else None
+            ),
+        }
+
+
 class Deployment(Base):
     __tablename__ = "deployments"
     __table_args__ = (
@@ -102,6 +286,27 @@ class Deployment(Base):
         UniqueConstraint(
             "source_recommendation_id",
             name="uq_deployments_source_recommendation_id",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "fleet_candidate_id",
+            name="uq_deployments_fleet_candidate_id",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "id",
+            name="uq_deployments_fleet_ownership",
+        ),
+        CheckConstraint(
+            "(fleet_id IS NULL AND fleet_candidate_id IS NULL) OR "
+            "(fleet_id IS NOT NULL AND fleet_candidate_id IS NOT NULL)",
+            name="ck_deployments_fleet_binding",
+        ),
+        CheckConstraint(
+            "fleet_candidate_id IS NULL OR "
+            "(length(fleet_candidate_id) = 71 "
+            "AND fleet_candidate_id LIKE 'sha256:%')",
+            name="ck_deployments_fleet_candidate_sha256",
         ),
     )
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -120,6 +325,13 @@ class Deployment(Base):
             name="fk_deployments_source_recommendation_id",
         )
     )
+    fleet_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "fleets.id",
+            name="fk_deployments_fleet_id",
+        )
+    )
+    fleet_candidate_id: Mapped[str | None] = mapped_column(String(71))
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     plan: Mapped[dict] = mapped_column(JSON, nullable=False)
     accept_model_download: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -127,6 +339,228 @@ class Deployment(Base):
     status: Mapped[str] = mapped_column(String(40), default="CREATED", nullable=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FleetResourceReservation(Base):
+    """Fleet 수락 트랜잭션에서 고정한 활성 노드·GPU 예약."""
+
+    __tablename__ = "fleet_resource_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            _canonical_uuid_check(),
+            name="ck_fleet_resource_reservation_id_canonical_uuid",
+        ),
+        CheckConstraint(
+            "gpu_index >= 0",
+            name="ck_fleet_resource_reservation_gpu_index",
+        ),
+        CheckConstraint(
+            "gpu_uuid LIKE 'GPU-%' AND length(gpu_uuid) BETWEEN 5 AND 128",
+            name="ck_fleet_resource_reservation_gpu_uuid",
+        ),
+        CheckConstraint(
+            "rank >= 0",
+            name="ck_fleet_resource_reservation_rank",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "node_id",
+            name="uq_fleet_resource_reservations_fleet_node",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "gpu_uuid",
+            name="uq_fleet_resource_reservations_fleet_gpu_uuid",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "deployment_id",
+            "rank",
+            name="uq_fleet_resource_reservations_fleet_deployment_rank",
+        ),
+        ForeignKeyConstraint(
+            ["fleet_id", "deployment_id"],
+            ["deployments.fleet_id", "deployments.id"],
+            name="fk_fleet_resource_reservations_fleet_deployment",
+        ),
+        Index(
+            "ux_fleet_resource_reservations_active_node",
+            "node_id",
+            unique=True,
+            sqlite_where=text("released_at IS NULL"),
+            postgresql_where=text("released_at IS NULL"),
+        ),
+        Index(
+            "ux_fleet_resource_reservations_active_gpu_uuid",
+            "gpu_uuid",
+            unique=True,
+            sqlite_where=text("released_at IS NULL"),
+            postgresql_where=text("released_at IS NULL"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    fleet_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "fleets.id",
+            ondelete="CASCADE",
+            name="fk_fleet_resource_reservations_fleet_id",
+        ),
+        nullable=False,
+    )
+    deployment_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "nodes.id",
+            name="fk_fleet_resource_reservations_node_id",
+        ),
+        nullable=False,
+    )
+    gpu_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    gpu_uuid: Mapped[str] = mapped_column(String(128), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "fleet_id": self.fleet_id,
+            "deployment_id": self.deployment_id,
+            "node_id": self.node_id,
+            "gpu_index": self.gpu_index,
+            "gpu_uuid": self.gpu_uuid,
+            "rank": self.rank,
+            "released_at": (
+                self.released_at.isoformat()
+                if self.released_at is not None
+                else None
+            ),
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+        }
+
+
+class FleetDeploymentRuntime(Base):
+    """Fleet 안의 배포 하나에 대한 준비·적용·검증 실행 상태."""
+
+    __tablename__ = "fleet_deployment_runtime"
+    __table_args__ = (
+        CheckConstraint(
+            _canonical_uuid_check(),
+            name="ck_fleet_deployment_runtime_id_canonical_uuid",
+        ),
+        CheckConstraint(
+            "status IN ('ACCEPTED', 'PREPARING', 'PREPARED', "
+            "'PREPARE_FAILED', 'APPLYING', 'VERIFYING', 'ACTIVE', "
+            "'APPLY_FAILED', 'VERIFY_FAILED')",
+            name="ck_fleet_deployment_runtime_status",
+        ),
+        CheckConstraint(
+            "(status NOT IN ('PREPARE_FAILED', 'APPLY_FAILED', "
+            "'VERIFY_FAILED') AND failure_phase IS NULL "
+            "AND failure_code IS NULL) OR "
+            "(status = 'PREPARE_FAILED' AND failure_phase = 'PREPARE' "
+            "AND failure_code IS NOT NULL "
+            "AND length(failure_code) BETWEEN 1 AND 64) OR "
+            "(status = 'APPLY_FAILED' AND failure_phase = 'APPLY' "
+            "AND failure_code IS NOT NULL "
+            "AND length(failure_code) BETWEEN 1 AND 64) OR "
+            "(status = 'VERIFY_FAILED' AND failure_phase = 'VERIFY' "
+            "AND failure_code IS NOT NULL "
+            "AND length(failure_code) BETWEEN 1 AND 64)",
+            name="ck_fleet_deployment_runtime_failure",
+        ),
+        ForeignKeyConstraint(
+            ["fleet_id", "deployment_id"],
+            ["deployments.fleet_id", "deployments.id"],
+            ondelete="CASCADE",
+            name="fk_fleet_deployment_runtime_fleet_deployment",
+        ),
+        UniqueConstraint(
+            "fleet_id",
+            "deployment_id",
+            name="uq_fleet_deployment_runtime_fleet_deployment",
+        ),
+        UniqueConstraint(
+            "preparation_id",
+            name="uq_fleet_deployment_runtime_preparation",
+        ),
+        UniqueConstraint(
+            "current_operation_id",
+            name="uq_fleet_deployment_runtime_current_operation",
+        ),
+        Index(
+            "ix_fleet_deployment_runtime_fleet_status",
+            "fleet_id",
+            "status",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    fleet_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "fleets.id",
+            ondelete="CASCADE",
+            name="fk_fleet_deployment_runtime_fleet_id",
+        ),
+        nullable=False,
+    )
+    deployment_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="ACCEPTED", nullable=False
+    )
+    preparation_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "artifact_preparations.id",
+            name="fk_fleet_deployment_runtime_preparation_id",
+        ),
+    )
+    current_operation_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "deployment_operations.id",
+            name="fk_fleet_deployment_runtime_current_operation_id",
+        ),
+    )
+    failure_phase: Mapped[str | None] = mapped_column(String(16))
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "fleet_id": self.fleet_id,
+            "deployment_id": self.deployment_id,
+            "status": self.status,
+            "preparation_id": self.preparation_id,
+            "current_operation_id": self.current_operation_id,
+            "failure_phase": self.failure_phase,
+            "failure_code": self.failure_code,
+            "created_at": (
+                self.created_at.isoformat()
+                if self.created_at is not None
+                else None
+            ),
+            "updated_at": (
+                self.updated_at.isoformat()
+                if self.updated_at is not None
+                else None
+            ),
+        }
 
 
 class DeploymentOperation(Base):
@@ -879,6 +1313,38 @@ class PlacementProfileRecord(Base):
         CheckConstraint("min_disk_free_mib > 0", name="ck_placement_disk_positive"),
         CheckConstraint("pipeline_parallel_size > 0", name="ck_placement_pp_positive"),
         CheckConstraint("tensor_parallel_size > 0", name="ck_placement_tp_positive"),
+        CheckConstraint("max_model_len > 0", name="ck_placement_context_positive"),
+        CheckConstraint("max_concurrency > 0", name="ck_placement_concurrency_positive"),
+        CheckConstraint(
+            "origin IN ('MANUAL', 'AUTO')",
+            name="ck_placement_origin",
+        ),
+        CheckConstraint(
+            "status IN ('DRAFT', 'QUALIFYING', 'VALIDATED', 'ACTIVE', 'REVOKED')",
+            name="ck_placement_status",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR tensor_parallel_size = 1",
+            name="ck_placement_auto_tp1",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR pipeline_parallel_size = node_count",
+            name="ck_placement_auto_pp_nodes",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR status IN ('DRAFT', 'QUALIFYING') "
+            "OR qualification_evidence_id IS NOT NULL",
+            name="ck_placement_auto_evidence",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR status NOT IN ('VALIDATED', 'ACTIVE') "
+            "OR qualified_at IS NOT NULL",
+            name="ck_placement_auto_qualified_at",
+        ),
+        CheckConstraint(
+            "origin != 'AUTO' OR status != 'ACTIVE' OR activated_at IS NOT NULL",
+            name="ck_placement_auto_activation",
+        ),
         CheckConstraint(
             "max_packet_loss_pct IS NULL OR (max_packet_loss_pct >= 0 AND max_packet_loss_pct <= 100)",
             name="ck_placement_packet_loss_range",
@@ -902,6 +1368,7 @@ class PlacementProfileRecord(Base):
         CheckConstraint(
             "max_rtt_ms IS NULL OR max_rtt_ms >= 0", name="ck_placement_rtt_nonnegative"
         ),
+        Index("ix_placement_profiles_status", "status"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     release_id: Mapped[str] = mapped_column(ForeignKey("model_releases.id", ondelete="CASCADE"), nullable=False)
@@ -912,6 +1379,20 @@ class PlacementProfileRecord(Base):
     min_disk_free_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     pipeline_parallel_size: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     tensor_parallel_size: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_model_len: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    origin: Mapped[str] = mapped_column(String(20), default="MANUAL", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE", nullable=False)
+    spec_digest: Mapped[str | None] = mapped_column(String(71))
+    qualification_evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "profile_qualification_evidence.id",
+            name="fk_placement_profiles_qualification_evidence",
+            use_alter=True,
+        )
+    )
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     requires_network_evidence: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     requires_nccl: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     min_bandwidth_mbps: Mapped[int | None] = mapped_column(Integer)
@@ -924,6 +1405,172 @@ class PlacementProfileRecord(Base):
     min_vram_headroom_pct: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
     min_throughput_tps: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProfileQualificationRun(Base):
+    __tablename__ = "profile_qualification_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('QUALIFYING', 'PASSED', 'FAILED', 'CANCELED')",
+            name="ck_profile_qualification_run_status",
+        ),
+        CheckConstraint(
+            "length(inventory_fingerprint) = 71 "
+            "AND inventory_fingerprint LIKE 'sha256:%'",
+            name="ck_profile_qualification_run_inventory_sha256",
+        ),
+        CheckConstraint(
+            "length(profile_spec_digest) = 71 "
+            "AND profile_spec_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_run_spec_sha256",
+        ),
+        CheckConstraint(
+            "length(workload_digest) = 71 "
+            "AND workload_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_run_workload_sha256",
+        ),
+        CheckConstraint(
+            "max_model_len > 0",
+            name="ck_profile_qualification_run_context_positive",
+        ),
+        CheckConstraint(
+            "max_concurrency > 0",
+            name="ck_profile_qualification_run_concurrency_positive",
+        ),
+        CheckConstraint(
+            "(status = 'QUALIFYING' AND evidence_id IS NULL "
+            "AND failure_code IS NULL) OR "
+            "(status = 'PASSED' AND evidence_id IS NOT NULL "
+            "AND failure_code IS NULL) OR "
+            "(status IN ('FAILED', 'CANCELED') AND failure_code IS NOT NULL)",
+            name="ck_profile_qualification_run_outcome",
+        ),
+        Index("ix_profile_qualification_runs_placement", "placement_id"),
+        Index("ix_profile_qualification_runs_status", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    release_id: Mapped[str] = mapped_column(
+        ForeignKey("model_releases.id"), nullable=False
+    )
+    placement_id: Mapped[str] = mapped_column(
+        ForeignKey("placement_profiles.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    rank_node_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    gpu_bindings: Mapped[list[dict]] = mapped_column(JSON, nullable=False)
+    inventory_fingerprint: Mapped[str] = mapped_column(String(71), nullable=False)
+    profile_spec_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    required_steps: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    workload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    workload_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    max_model_len: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifact_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_manifest_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    runtime_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    runtime_vllm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "profile_qualification_evidence.id",
+            name="fk_profile_qualification_runs_evidence",
+            use_alter=True,
+        )
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProfileQualificationBinding(Base):
+    __tablename__ = "profile_qualification_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "node_id",
+            name="uq_profile_qualification_binding_node",
+        ),
+        UniqueConstraint(
+            "run_id",
+            "gpu_uuid",
+            name="uq_profile_qualification_binding_gpu_uuid",
+        ),
+        CheckConstraint(
+            "rank >= 0", name="ck_profile_qualification_binding_rank"
+        ),
+        CheckConstraint(
+            "gpu_index >= 0", name="ck_profile_qualification_binding_gpu_index"
+        ),
+        CheckConstraint(
+            "gpu_uuid LIKE 'GPU-%'",
+            name="ck_profile_qualification_binding_gpu_uuid",
+        ),
+        CheckConstraint(
+            "memory_mib > 0",
+            name="ck_profile_qualification_binding_memory",
+        ),
+        Index("ix_profile_qualification_bindings_node", "node_id"),
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_qualification_runs.id"), primary_key=True
+    )
+    rank: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    gpu_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    gpu_uuid: Mapped[str] = mapped_column(String(128), nullable=False)
+    memory_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    compute_capability: Mapped[str | None] = mapped_column(String(32))
+
+
+class ProfileQualificationEvidence(Base):
+    __tablename__ = "profile_qualification_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PASSED', 'FAILED')",
+            name="ck_profile_qualification_evidence_status",
+        ),
+        CheckConstraint(
+            "length(evidence_digest) = 71 "
+            "AND evidence_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_evidence_sha256",
+        ),
+        CheckConstraint(
+            "executor_image LIKE '%@sha256:%'",
+            name="ck_profile_qualification_executor_digest",
+        ),
+        CheckConstraint(
+            "length(workload_digest) = 71 "
+            "AND workload_digest LIKE 'sha256:%'",
+            name="ck_profile_qualification_evidence_workload_sha256",
+        ),
+        UniqueConstraint("run_id"),
+        UniqueConstraint("evidence_digest"),
+        Index("ix_profile_qualification_evidence_run", "run_id"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_qualification_runs.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    steps: Mapped[list[dict]] = mapped_column(JSON, nullable=False)
+    metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    workload_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    executor_image: Mapped[str] = mapped_column(String(512), nullable=False)
+    dure_commit: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class BenchmarkEvidence(Base):

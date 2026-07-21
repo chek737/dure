@@ -21,6 +21,12 @@ from dure.artifact_manifest import (
 from dure.artifact_prepare import validate_digest_pinned_runtime_image
 from dure.models import DeploymentPlan, NodeProfile, VLLM_RAY_PP_BACKEND
 from dure.pipeline_runtime import validate_strict_pipeline_plan
+from dure.profile_generator import (
+    AUTO_PROFILE_ORIGIN,
+    PLACEMENT_PROFILE_STATUSES,
+    generate_auto_placement_profile_specs,
+)
+from dure.resource_pool import FLEET_MODEL_IDS, FLEET_TENSOR_PARALLEL_SIZE
 from dure.task import (
     BENCHMARK_DURATION_SECONDS,
     MAX_BENCHMARK_CONTEXT_TOKENS,
@@ -62,6 +68,12 @@ from .models import (
     TaskType,
     utcnow,
 )
+from .qualification import active_profile_qualification_nodes
+from .resource_reservation import (
+    FleetResourceReservationError,
+    ensure_fleet_reservation_scope,
+    lock_fleet_reservation_gate,
+)
 from .rollout import (
     DeploymentRolloutConflictError,
     PHASE_TASK_TYPES,
@@ -69,6 +81,7 @@ from .rollout import (
     cancel_operation_task,
     claim_operation_task,
     finish_operation_task,
+    revoke_operation_tasks_for_node,
     valid_deployment_task_success_result,
 )
 
@@ -335,6 +348,7 @@ def prepare_or_apply_artifact_cache_quarantine(
         from .cache_lifecycle import request_cache_quarantine
         from .models import NodeArtifactCache
 
+        lock_fleet_reservation_gate(session)
         locked_node = session.scalar(
             select(Node)
             .join(NodeArtifactCache, NodeArtifactCache.node_id == Node.id)
@@ -347,6 +361,18 @@ def prepare_or_apply_artifact_cache_quarantine(
                 "artifact cache node is unavailable",
                 code="ARTIFACT_CACHE_NODE_UNAVAILABLE",
             )
+        try:
+            ensure_fleet_reservation_scope(
+                session,
+                node_ids=[node_id],
+                gate_locked=True,
+            )
+        except FleetResourceReservationError as exc:
+            raise ArtifactCacheControlError(
+                str(exc),
+                code=exc.code,
+                details=exc.details,
+            ) from exc
         cache = _artifact_cache_projection(session, cache_id)
         current_identity = _validated_cache_control_projection(cache, cache_id)
         if current_identity != (node_id, cache_kind, cache_identity_digest):
@@ -969,6 +995,12 @@ def add_placement_profile(
     min_success_rate: float,
     min_vram_headroom_pct: float,
     min_throughput_tps: float,
+    max_model_len: int | None = None,
+    max_concurrency: int = 1,
+    origin: str = "MANUAL",
+    status: str = "ACTIVE",
+    spec_digest: str | None = None,
+    _commit: bool = True,
 ) -> PlacementProfileRecord:
     release = session.scalar(
         select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
@@ -977,6 +1009,9 @@ def add_placement_profile(
         raise ValueError("unknown model release")
     if release.status != "DRAFT":
         raise ValueError("placement profiles can only be added to DRAFT releases")
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    if artifact is None:
+        raise ValueError("unknown model artifact")
     if re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,99}", profile_id) is None:
         raise ValueError("invalid placement profile_id")
     if topology not in TOPOLOGIES:
@@ -1011,6 +1046,58 @@ def add_placement_profile(
         raise ValueError("success and VRAM thresholds are out of range")
     if min_throughput_tps <= 0:
         raise ValueError("throughput SLO must be positive")
+    if max_model_len is None:
+        max_model_len = artifact.default_max_model_len
+    if max_model_len <= 0 or max_model_len > artifact.default_max_model_len:
+        raise ValueError("max_model_len exceeds the immutable model contract")
+    if max_concurrency <= 0:
+        raise ValueError("max_concurrency must be positive")
+    if origin not in {"MANUAL", AUTO_PROFILE_ORIGIN}:
+        raise ValueError("unknown placement profile origin")
+    if status not in PLACEMENT_PROFILE_STATUSES:
+        raise ValueError("unknown placement profile status")
+    if origin == AUTO_PROFILE_ORIGIN:
+        if artifact.model_id not in FLEET_MODEL_IDS:
+            raise ValueError("automatic profiles support only the Fleet model allowlist")
+        if tensor_parallel_size != FLEET_TENSOR_PARALLEL_SIZE:
+            raise ValueError("automatic profiles require TP=1")
+        if pipeline_parallel_size != node_count:
+            raise ValueError("automatic profiles require PP=node_count")
+        if status != "DRAFT":
+            raise ValueError("automatic profiles must be created as DRAFT")
+    elif status != "ACTIVE":
+        raise ValueError("manual profiles must be created as ACTIVE")
+    if spec_digest is None:
+        canonical_spec = {
+            "model_id": artifact.model_id,
+            "profile_id": profile_id,
+            "topology": topology,
+            "node_count": node_count,
+            "min_gpu_memory_mib": min_gpu_memory_mib,
+            "min_disk_free_mib": min_disk_free_mib,
+            "pipeline_parallel_size": pipeline_parallel_size,
+            "tensor_parallel_size": tensor_parallel_size,
+            "max_model_len": max_model_len,
+            "max_concurrency": max_concurrency,
+            "requires_network_evidence": requires_network_evidence,
+            "requires_nccl": requires_nccl,
+            "min_bandwidth_mbps": min_bandwidth_mbps,
+            "max_rtt_ms": max_rtt_ms,
+            "max_packet_loss_pct": max_packet_loss_pct,
+            "max_ttft_p95_ms": max_ttft_p95_ms,
+            "max_tpot_p95_ms": max_tpot_p95_ms,
+            "max_e2e_p95_ms": max_e2e_p95_ms,
+            "min_success_rate": min_success_rate,
+            "min_vram_headroom_pct": min_vram_headroom_pct,
+            "min_throughput_tps": min_throughput_tps,
+            "origin": origin,
+        }
+        encoded = json.dumps(
+            canonical_spec, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        spec_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", spec_digest) is None:
+        raise ValueError("placement spec_digest must be canonical SHA-256")
     if session.scalar(
         select(PlacementProfileRecord.id).where(
             PlacementProfileRecord.release_id == release_id,
@@ -1027,6 +1114,11 @@ def add_placement_profile(
         min_disk_free_mib=min_disk_free_mib,
         pipeline_parallel_size=pipeline_parallel_size,
         tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        max_concurrency=max_concurrency,
+        origin=origin,
+        status=status,
+        spec_digest=spec_digest,
         requires_network_evidence=requires_network_evidence,
         requires_nccl=requires_nccl,
         min_bandwidth_mbps=min_bandwidth_mbps,
@@ -1046,8 +1138,88 @@ def add_placement_profile(
         session.rollback()
         raise RegistryConflictError("placement profile already exists") from exc
     audit(session, "admin", "placement_profile.create", record.id, "success")
-    session.commit()
+    if _commit:
+        session.commit()
     return record
+
+
+def generate_auto_placement_profiles(
+    session: Session,
+    *,
+    release_id: str,
+    apply: bool,
+) -> dict[str, object]:
+    """Preview or atomically persist the closed automatic profile set."""
+
+    if type(apply) is not bool:
+        raise ValueError("apply must be a boolean")
+    release = session.scalar(
+        select(ModelRelease).where(ModelRelease.id == release_id).with_for_update()
+    )
+    if release is None:
+        raise ValueError("unknown model release")
+    if release.status != "DRAFT":
+        raise ValueError("automatic profiles require a DRAFT model release")
+    artifact = session.get(ModelArtifact, release.artifact_id)
+    if artifact is None:
+        raise ValueError("unknown model artifact")
+    specs = generate_auto_placement_profile_specs(artifact.model_id)
+    existing = {
+        record.profile_id: record
+        for record in session.scalars(
+            select(PlacementProfileRecord).where(
+                PlacementProfileRecord.release_id == release.id,
+                PlacementProfileRecord.profile_id.in_(
+                    [spec.profile_id for spec in specs]
+                ),
+            )
+        )
+    }
+    profile_results: list[dict[str, object]] = []
+    missing = []
+    for spec in specs:
+        record = existing.get(spec.profile_id)
+        if record is None:
+            state = "MISSING"
+            missing.append(spec)
+        elif (
+            record.origin == AUTO_PROFILE_ORIGIN
+            and record.spec_digest == spec.spec_digest
+        ):
+            state = "EXISTS"
+        else:
+            raise RegistryConflictError(
+                f"placement profile identity conflicts: {spec.profile_id}"
+            )
+        profile_results.append({**spec.to_dict(), "state": state})
+
+    created_profile_ids: list[str] = []
+    if apply:
+        for spec in missing:
+            record = add_placement_profile(
+                session,
+                release_id=release.id,
+                _commit=False,
+                **spec.create_kwargs(),
+            )
+            created_profile_ids.append(record.profile_id)
+        audit(
+            session,
+            "admin",
+            "placement_profile.generate",
+            release.id,
+            "success",
+            created_profile_ids=created_profile_ids,
+        )
+        session.commit()
+
+    return {
+        "release_id": release.id,
+        "model_id": artifact.model_id,
+        "apply": apply,
+        "profiles": profile_results,
+        "created_profile_ids": created_profile_ids,
+    }
 
 
 def transition_model_release(
@@ -1072,7 +1244,8 @@ def transition_model_release(
     if target_status in {"VALIDATED", "ACTIVE"}:
         placement = session.scalar(
             select(PlacementProfileRecord.id).where(
-                PlacementProfileRecord.release_id == release.id
+                PlacementProfileRecord.release_id == release.id,
+                PlacementProfileRecord.status == "ACTIVE",
             )
         )
         if placement is None:
@@ -1229,6 +1402,7 @@ def revoke_node(session: Session, node_id: str) -> bool:
     canceled_preparations = revoke_preparation_tasks_for_node(
         session, node_id
     )
+    canceled_operations = revoke_operation_tasks_for_node(session, node_id)
     node.desired_state = None
     audit(
         session,
@@ -1237,6 +1411,7 @@ def revoke_node(session: Session, node_id: str) -> bool:
         node_id,
         "success",
         canceled_preparation_tasks=canceled_preparations,
+        canceled_operation_tasks=canceled_operations,
     )
     session.commit()
     return True
@@ -1271,12 +1446,15 @@ def _mark_node_unjoined(session: Session, node: Node, *, actor: str) -> None:
 
 def unjoin_node(session: Session, node_id: str) -> bool:
     try:
+        lock_fleet_reservation_gate(session)
         node = session.scalar(
             select(Node).where(Node.id == node_id).with_for_update()
         )
         if node is None:
             return False
-        _ensure_deployment_node_scope_available(session, [node_id])
+        _ensure_deployment_node_scope_available(
+            session, [node_id], gate_locked=True
+        )
         _mark_node_unjoined(session, node, actor=f"node:{node_id}")
         session.commit()
         return True
@@ -1842,6 +2020,7 @@ def apply_benchmark_run(
     ).one_or_none()
     if identity is None:
         raise BenchmarkRunNotFoundError("benchmark run not found")
+    lock_fleet_reservation_gate(session)
     locked_release = session.scalar(
         select(ModelRelease)
         .where(ModelRelease.id == identity.release_id)
@@ -1901,6 +2080,36 @@ def apply_benchmark_run(
             },
         )
 
+    selected_gpu_uuids: list[str] = []
+    profile_record = session.get(NodeProfileRecord, locked_node.id)
+    if profile_record is not None:
+        try:
+            current_profile = NodeProfile.from_dict(profile_record.profile)
+            healthy_gpus = [gpu for gpu in current_profile.gpus if gpu.healthy]
+            if healthy_gpus:
+                selected_gpu = max(
+                    healthy_gpus,
+                    key=lambda gpu: (gpu.memory_mib, -gpu.index),
+                )
+                selected_gpu_uuids = [selected_gpu.uuid]
+        except (KeyError, TypeError, ValueError):
+            # benchmark_context below returns the closed context error; this
+            # guard only adds the exact GPU identity when it is representable.
+            pass
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=[locked_node.id],
+            gpu_uuids=selected_gpu_uuids,
+            gate_locked=True,
+        )
+    except FleetResourceReservationError as exc:
+        raise BenchmarkRunError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
+
     active_task = session.scalar(
         select(Task)
         .where(
@@ -1921,6 +2130,18 @@ def apply_benchmark_run(
                 "node_id": locked_node.id,
                 "task_id": active_task.id,
                 "task_type": active_task.type,
+            },
+        )
+    active_qualification = active_profile_qualification_nodes(
+        session, [locked_node.id]
+    ).get(locked_node.id)
+    if active_qualification is not None:
+        raise BenchmarkRunError(
+            "benchmark coordinator node belongs to an active profile qualification",
+            code="BENCHMARK_NODE_BUSY",
+            details={
+                "node_id": locked_node.id,
+                "qualification_run_id": active_qualification,
             },
         )
     for operation in session.scalars(
@@ -2497,12 +2718,44 @@ def _lock_deployment_task_nodes(
     return {node.id: node for node in nodes}
 
 
+def _ensure_fleet_reservation_scope_available(
+    session: Session,
+    node_ids: list[str],
+    *,
+    deployment: Deployment | None = None,
+    gate_locked: bool = False,
+) -> None:
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=node_ids,
+            deployment=deployment,
+            gate_locked=gate_locked,
+        )
+    except FleetResourceReservationError as exc:
+        raise DeploymentRolloutConflictError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
+
+
 def _ensure_deployment_node_scope_available(
-    session: Session, node_ids: list[str]
+    session: Session,
+    node_ids: list[str],
+    *,
+    deployment: Deployment | None = None,
+    gate_locked: bool = False,
 ) -> None:
     requested = set(node_ids)
     if not requested:
         return
+    _ensure_fleet_reservation_scope_available(
+        session,
+        node_ids,
+        deployment=deployment,
+        gate_locked=gate_locked,
+    )
     for operation in session.scalars(
         select(DeploymentOperation).where(
             DeploymentOperation.active_lineage_id.is_not(None)
@@ -2539,6 +2792,21 @@ def _ensure_deployment_node_scope_available(
                 "node_id": active_task.node_id,
             },
         )
+    active_qualifications = active_profile_qualification_nodes(
+        session, requested
+    )
+    if active_qualifications:
+        overlap = sorted(active_qualifications)
+        raise DeploymentRolloutConflictError(
+            "assigned nodes belong to active profile qualification runs",
+            code="DEPLOYMENT_NODE_QUALIFICATION_ACTIVE",
+            details={
+                "node_ids": overlap,
+                "qualification_run_ids": sorted(
+                    {active_qualifications[node_id] for node_id in overlap}
+                ),
+            },
+        )
 
 
 def _operation_hook_conflict(action: str, task_id: str) -> DeploymentRolloutConflictError:
@@ -2556,6 +2824,7 @@ def create_tasks(
     task_type: TaskType,
     deployment_id: str | None,
     options: dict,
+    _fleet_runtime_id: str | None = None,
 ) -> tuple[str, list[Task], dict[str, str]]:
     if task_type == TaskType.BENCHMARK:
         raise ValueError(
@@ -2574,19 +2843,61 @@ def create_tasks(
         bulk_id = str(uuid.uuid4())
         tasks: list[Task] = []
         errors: dict[str, str] = {}
+        lock_fleet_reservation_gate(session)
         locked_nodes = _lock_deployment_task_nodes(session, node_ids)
         deployment = (
             session.get(Deployment, deployment_id) if deployment_id else None
         )
         if task_type in DEPLOYMENT_TASK_TYPES and deployment is None:
             raise ValueError("a valid deployment_id is required")
+        if (
+            deployment is not None
+            and deployment.fleet_id is not None
+            and task_type in DEPLOYMENT_TASK_TYPES
+            and _fleet_runtime_id is None
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet deployment runtime requires the dedicated Fleet workflow",
+                code="FLEET_RUNTIME_NOT_AVAILABLE",
+                details={
+                    "fleet_id": deployment.fleet_id,
+                    "deployment_id": deployment.id,
+                },
+            )
+        if (
+            _fleet_runtime_id is not None
+            and (
+                deployment is None
+                or deployment.fleet_id is None
+                or task_type != TaskType.APPLY_DEPLOYMENT
+                or options != {"serve": True}
+            )
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet runtime capability is invalid",
+                code="FLEET_RUNTIME_BINDING_INVALID",
+            )
         if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
             _lock_deployment_lineage_for_task_creation(session, deployment)
-            _ensure_deployment_node_scope_available(session, node_ids)
+            _ensure_deployment_node_scope_available(
+                session,
+                node_ids,
+                deployment=deployment,
+                gate_locked=True,
+            )
         elif task_type == TaskType.UNJOIN_NODE:
-            _ensure_deployment_node_scope_available(session, node_ids)
+            _ensure_deployment_node_scope_available(
+                session, node_ids, gate_locked=True
+            )
+        else:
+            _ensure_fleet_reservation_scope_available(
+                session, node_ids, gate_locked=True
+            )
         effective_plan = deployment.plan if deployment is not None else None
-        if deployment is not None and deployment.source_recommendation_id is not None:
+        if deployment is not None and (
+            deployment.source_recommendation_id is not None
+            or deployment.fleet_id is not None
+        ):
             from .preparation import effective_deployment_plan
 
             effective_plan = effective_deployment_plan(
@@ -2722,11 +3033,13 @@ def create_tasks(
                     accept_model_download=(
                         deployment.accept_model_download
                         if deployment.source_recommendation_id is None
+                        and deployment.fleet_id is None
                         else False
                     ),
                     pull_image=(
                         deployment.pull_image
                         if deployment.source_recommendation_id is None
+                        and deployment.fleet_id is None
                         else False
                     ),
                 )
@@ -2740,14 +3053,44 @@ def create_tasks(
             session.add(task)
             tasks.append(task)
             node.desired_state = task_type.value
-        if deployment is not None:
-            attach_deployment_bulk_operation(
-                session,
-                deployment=deployment,
-                task_type=task_type,
-                tasks=tasks,
-                options=options,
+        if _fleet_runtime_id is not None and (
+            errors
+            or sorted(task.node_id for task in tasks)
+            != sorted(set(node_ids))
+            or len(tasks) != len(set(node_ids))
+        ):
+            raise DeploymentRolloutConflictError(
+                "Fleet apply must queue every exact reserved node",
+                code="FLEET_APPLY_INCOMPLETE",
+                details={"errors": errors},
             )
+        if deployment is not None:
+            # The operation payload performs one final immutable-plan check.
+            # Do not autoflush the tasks being attached before that check: a
+            # Fleet task must not make its own exact node set appear occupied
+            # and thereby invalidate the qualification it is about to use.
+            with session.no_autoflush:
+                operation = attach_deployment_bulk_operation(
+                    session,
+                    deployment=deployment,
+                    task_type=task_type,
+                    tasks=tasks,
+                    options=options,
+                )
+            if _fleet_runtime_id is not None:
+                if operation is None:
+                    raise DeploymentRolloutConflictError(
+                        "Fleet apply operation was not created",
+                        code="FLEET_RUNTIME_OPERATION_INVALID",
+                    )
+                from .fleet_runtime import bind_fleet_operation
+
+                bind_fleet_operation(
+                    session,
+                    runtime_id=_fleet_runtime_id,
+                    deployment=deployment,
+                    operation=operation,
+                )
             if tasks and task_type in {
                 TaskType.START_DEPLOYMENT,
                 TaskType.RESTART_DEPLOYMENT,

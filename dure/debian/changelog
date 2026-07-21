@@ -1,3 +1,60 @@
+dure (0.4.6) UNRELEASED; urgency=medium
+
+  * 수락된 Fleet의 배포별 모델·이미지 준비와 명시적 적용을 추가합니다.
+  * 적용 작업을 API 기동과 전체 노드 검증까지 폐쇄형 단계로 연결합니다.
+  * 한 배포의 실패를 격리하고 Fleet·배포 런타임 상태를 증적과 동기화합니다.
+  * 중복 적용 요청을 멱등 처리하고 Fleet 계보의 일반 세대 확장을 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:59:00 +0900
+
+dure (0.4.5) UNRELEASED; urgency=medium
+
+  * 불변 Fleet 추천 수락 시 모든 배포 세대와 노드·GPU 예약을 원자적으로 생성합니다.
+  * 추천 입력과 qualification 증적을 잠금 안에서 재검사하고 부분 Fleet 생성을 금지합니다.
+  * 활성 Fleet 예약을 다른 배포·작업·qualification이 우회하지 못하게 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:50:00 +0900
+
+dure (0.4.4) UNRELEASED; urgency=medium
+
+  * 다중 배포 Fleet 추천을 콘텐츠 주소 불변 스냅샷으로 저장합니다.
+  * 관리자 Fleet recommend·show API와 CLI를 추가합니다.
+  * 추천 생성·조회와 수락·예약·호스트 변경 권한을 분리합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:30:00 +0900
+
+dure (0.4.3) UNRELEASED; urgency=medium
+
+  * PRIMARY·SUPPLEMENTARY exact 증적을 여러 독립 배포 후보로 투영합니다.
+  * 네 모델과 TP=1을 강제하는 결정론적 Fleet set-packing 스케줄러를 추가합니다.
+  * 제품 노드 수 상한 없이 100개 노드와 구조화된 미배정 사유를 검증합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:00:00 +0900
+
+dure (0.4.2) UNRELEASED; urgency=medium
+
+  * 자동 배치 프로필에 GPU UUID 결합 qualification 증적과 승격 게이트를 추가합니다.
+  * 정책·작업 부하·rank 결합을 동결하고 운영자 명시 활성화를 요구합니다.
+  * Alembic 0012로 qualification 실행·증적·GPU 결합을 안전하게 영속화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 21:30:00 +0900
+
+dure (0.4.1) UNRELEASED; urgency=medium
+
+  * 네 Qwen2.5 AWQ 모델의 TP=1 자동 배치 프로필 생성기를 추가합니다.
+  * 배치 프로필에 독립 상태, origin, spec digest와 실행 한도를 저장합니다.
+  * 변경 없는 미리보기와 명시적 원자 적용 API를 추가합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:35:00 +0900
+
+dure (0.4.0) UNRELEASED; urgency=medium
+
+  * 노드 수 상한 없는 읽기 전용 GPU 풀 스냅샷을 추가합니다.
+  * 노드마다 선택한 GPU index와 UUID 한 쌍을 계획과 런타임에 고정합니다.
+  * 다중 GPU 노드에서도 선택하지 않은 GPU를 배포에 노출하지 않습니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 19:10:00 +0900
+
 dure (0.3.31) UNRELEASED; urgency=medium
 
   * ACTIVE 승격의 15분 최소 측정 조건을 제거하고 200회 실측을 유지합니다.

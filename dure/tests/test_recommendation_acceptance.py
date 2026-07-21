@@ -455,6 +455,12 @@ class RecommendationAcceptanceTests(unittest.TestCase):
             [item["expected_runtime_rank"] for item in plan["assignments"]],
             [0, 1, 2],
         )
+        self.assertTrue(
+            all(
+                item["gpu_uuid"].startswith("GPU-")
+                for item in plan["assignments"]
+            )
+        )
         self.assertEqual(DeploymentPlan.from_dict(plan).to_dict(), plan)
         with self.factory() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
@@ -576,11 +582,6 @@ class RecommendationAcceptanceTests(unittest.TestCase):
                 "STRICT_NETWORK",
             ),
             (
-                "two-gpus",
-                {"extra_healthy_gpu": True},
-                "STRICT_GPU_TOPOLOGY",
-            ),
-            (
                 "wrong-vllm",
                 {"vllm_version": "0.9.1"},
                 "STRICT_RUNTIME_VERSION",
@@ -619,46 +620,46 @@ class RecommendationAcceptanceTests(unittest.TestCase):
                         response, 409, "RECOMMENDATION_NOT_FEASIBLE"
                     )
 
-    def test_postgresql_accept_locks_evidence_registry_and_inventory_tables(self):
+    def test_multinode_recommendation_binds_one_gpu_on_a_multi_gpu_node(self):
+        node_ids, _, _ = self._seed_pipeline_candidate(
+            "two-gpus", extra_healthy_gpu=True
+        )
+
+        recommendation = self._recommend_nodes(node_ids)
+        response = self._accept(recommendation["id"])
+
+        self.assertIsNotNone(recommendation["selected"])
+        self.assertEqual(response.status_code, 200, response.text)
+        assignments = response.json()["deployment"]["plan"]["assignments"]
+        self.assertEqual(len(assignments), 3)
+        self.assertEqual(len({item["node_id"] for item in assignments}), 3)
+        self.assertTrue(all(item["gpu_index"] == 0 for item in assignments))
+        self.assertTrue(
+            all(item["gpu_uuid"].startswith("GPU-") for item in assignments)
+        )
+
+    def test_accept_locks_only_the_frozen_inventory_rows_in_writer_order(self):
         session = Mock()
         session.get_bind.return_value.dialect.name = "postgresql"
         session.scalars.return_value = []
-        record = Mock(selection_mode="all_online", requested_node_ids=[])
+        node_ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ]
+        record = Mock(selection_mode="all_online", requested_node_ids=node_ids)
 
         _lock_recommendation_inputs(session, record)
 
-        statement = str(session.execute.call_args.args[0])
-        self.assertEqual(
-            statement,
-            "LOCK TABLE artifact_chunks, artifact_manifests, "
-            "artifact_manifest_files, artifact_file_chunks, benchmark_evidence, "
-            "benchmark_runs, model_artifacts, model_releases, nodes, "
-            "node_profiles, placement_profiles, runtime_releases, "
-            "stage_artifact_variants, stage_artifact_ranks, "
-            "stage_artifact_validation_evidence, "
-            "stage_artifact_validation_ranks IN SHARE MODE",
-        )
-        self.assertLess(
-            statement.index("artifact_chunks"),
-            statement.index("artifact_manifests"),
-        )
-        self.assertLess(
-            statement.index("artifact_manifests"),
-            statement.index("artifact_manifest_files"),
-        )
-        self.assertLess(
-            statement.index("artifact_manifest_files"),
-            statement.index("artifact_file_chunks"),
-        )
-        self.assertLess(
-            statement.index("stage_artifact_variants"),
-            statement.index("stage_artifact_ranks"),
-        )
-        self.assertLess(
-            statement.index("stage_artifact_ranks"),
-            statement.index("stage_artifact_validation_evidence"),
-        )
-        session.scalars.assert_not_called()
+        session.execute.assert_not_called()
+        self.assertEqual(session.scalars.call_count, 2)
+        node_statement = str(session.scalars.call_args_list[0].args[0])
+        profile_statement = str(session.scalars.call_args_list[1].args[0])
+        self.assertIn("FROM nodes", node_statement)
+        self.assertIn("ORDER BY nodes.id", node_statement)
+        self.assertIn("FOR UPDATE", node_statement)
+        self.assertIn("FROM node_profiles", profile_statement)
+        self.assertIn("ORDER BY node_profiles.node_id", profile_statement)
+        self.assertIn("FOR UPDATE", profile_statement)
 
     def test_multinode_ray_head_rejects_public_only_address(self):
         public_only = profile("public-only", address="203.0.113.10")

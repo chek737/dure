@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,10 @@ from dure.task import (
 )
 
 from .benchmark import BENCHMARK_POLICY_VERSION, BENCHMARK_SUITE_ID
+from .qualification import (
+    ProfileQualificationError,
+    validate_profile_qualification_evidence,
+)
 
 from .models import (
     AuditEvent,
@@ -60,6 +64,8 @@ from .models import (
     Node,
     NodeProfileRecord,
     PlacementProfileRecord,
+    ProfileQualificationEvidence,
+    ProfileQualificationRun,
     RuntimeRelease,
     StageArtifactRank,
     StageArtifactValidationEvidence,
@@ -69,6 +75,11 @@ from .models import (
     utcnow,
 )
 from .service import artifact_manifest_dict, aware, node_status
+from .resource_reservation import (
+    FleetResourceReservationError,
+    ensure_fleet_reservation_scope,
+    lock_fleet_reservation_gate,
+)
 from .stage_artifacts import (
     StageArtifactConflictError,
     StageArtifactNotFoundError,
@@ -254,12 +265,126 @@ def _network_evidence_bindings(
     placement: PlacementProfileRecord,
     inventory: list[InventoryNode],
     now: datetime,
+    reservation_fleet_id: str | None = None,
 ) -> tuple[NetworkEvidenceBinding, ...]:
     requires_network = placement.requires_network_evidence or placement.node_count > 1
-    if not requires_network:
+    requires_qualification = placement.origin == "AUTO"
+    if not requires_network and not requires_qualification:
         return ()
 
     inventory_by_id = {node.node_id: node for node in inventory}
+    if requires_qualification:
+        rows = list(
+            session.execute(
+                select(
+                    ProfileQualificationRun,
+                    ProfileQualificationEvidence,
+                )
+                .outerjoin(
+                    ProfileQualificationEvidence,
+                    ProfileQualificationEvidence.run_id
+                    == ProfileQualificationRun.id,
+                )
+                .where(
+                    ProfileQualificationRun.placement_id == placement.id,
+                    ProfileQualificationRun.status.in_(
+                        ("QUALIFYING", "PASSED", "FAILED")
+                    ),
+                )
+                .order_by(
+                    ProfileQualificationRun.updated_at.desc(),
+                    ProfileQualificationRun.id.desc(),
+                )
+            )
+        )
+        bindings: list[NetworkEvidenceBinding] = []
+        seen_node_sets: set[tuple[str, ...]] = set()
+        for qualification_run, qualification in rows:
+            node_set = _exact_node_set(
+                qualification_run.node_ids,
+                node_count=placement.node_count,
+            )
+            if node_set is None or node_set in seen_node_sets:
+                continue
+            # The newest attempt for an exact node set is authoritative.  A
+            # pending or failed requalification blocks reuse of an older pass.
+            seen_node_sets.add(node_set)
+            if (
+                qualification_run.status != "PASSED"
+                or qualification is None
+                or qualification_run.evidence_id != qualification.id
+            ):
+                continue
+            try:
+                validate_profile_qualification_evidence(
+                    session,
+                    placement=placement,
+                    evidence=qualification,
+                    run=qualification_run,
+                    now=now,
+                    require_primary=False,
+                    reservation_fleet_id=reservation_fleet_id,
+                )
+            except ProfileQualificationError:
+                continue
+            registered_at = aware(qualification.created_at)
+            age = now - registered_at
+            if age < timedelta(0) or age > NETWORK_EVIDENCE_MAX_AGE:
+                continue
+            if any(
+                node_id not in inventory_by_id
+                or inventory_by_id[node_id].profile is None
+                for node_id in node_set
+            ):
+                continue
+            metrics = qualification.metrics
+            network_ok = not requires_network or (
+                type(metrics) is dict
+                and type(metrics.get("network_bandwidth_mbps")) in {int, float}
+                and (
+                    placement.min_bandwidth_mbps is None
+                    or metrics["network_bandwidth_mbps"]
+                    >= placement.min_bandwidth_mbps
+                )
+                and type(metrics.get("network_rtt_ms")) in {int, float}
+                and (
+                    placement.max_rtt_ms is None
+                    or metrics["network_rtt_ms"] <= placement.max_rtt_ms
+                )
+                and type(metrics.get("packet_loss_pct")) in {int, float}
+                and (
+                    placement.max_packet_loss_pct is None
+                    or metrics["packet_loss_pct"]
+                    <= placement.max_packet_loss_pct
+                )
+                and (
+                    not placement.requires_nccl
+                    or metrics.get("nccl_all_reduce_ok") is True
+                )
+            )
+            if not network_ok:
+                continue
+            bindings.append(
+                NetworkEvidenceBinding(
+                    evidence_id=qualification.id,
+                    evidence_digest=qualification.evidence_digest,
+                    node_ids=node_set,
+                    registered_at=registered_at.isoformat(),
+                    rank_node_ids=tuple(qualification_run.rank_node_ids),
+                )
+            )
+        # AUTO profiles never fall back to generic network verification or
+        # benchmark evidence: deployment must use the exact qualified nodes.
+        return tuple(
+            sorted(
+                bindings,
+                key=lambda item: (
+                    item.node_ids,
+                    item.evidence_digest,
+                    item.evidence_id,
+                ),
+            )
+        )
     evidence_rows = list(
         session.scalars(
             select(BenchmarkEvidence)
@@ -561,6 +686,7 @@ def _active_catalog(
     *,
     inventory: list[InventoryNode],
     now: datetime,
+    reservation_fleet_id: str | None = None,
 ) -> tuple[ModelCatalog, dict[str, dict[str, Any]]]:
     rows = session.execute(
         select(ModelRelease, ModelArtifact, RuntimeRelease, PlacementProfileRecord)
@@ -570,7 +696,10 @@ def _active_catalog(
             PlacementProfileRecord,
             PlacementProfileRecord.release_id == ModelRelease.id,
         )
-        .where(ModelRelease.status == "ACTIVE")
+        .where(
+            ModelRelease.status == "ACTIVE",
+            PlacementProfileRecord.status == "ACTIVE",
+        )
         .order_by(
             ModelRelease.quality_rank.desc(),
             ModelArtifact.model_id,
@@ -599,6 +728,7 @@ def _active_catalog(
             placement=placement,
             inventory=inventory,
             now=now,
+            reservation_fleet_id=reservation_fleet_id,
         )
         base_context = {
             "model_id": artifact.model_id,
@@ -642,7 +772,24 @@ def _active_catalog(
             "min_disk_free_mib": placement.min_disk_free_mib,
             "pipeline_parallel_size": placement.pipeline_parallel_size,
             "tensor_parallel_size": placement.tensor_parallel_size,
+            "max_model_len": placement.max_model_len,
+            "max_concurrency": placement.max_concurrency,
+            "origin": placement.origin,
+            "status": placement.status,
+            "spec_digest": placement.spec_digest,
+            "qualification_evidence_id": placement.qualification_evidence_id,
+            "qualified_at": (
+                aware(placement.qualified_at).isoformat()
+                if placement.qualified_at is not None
+                else None
+            ),
+            "activated_at": (
+                aware(placement.activated_at).isoformat()
+                if placement.activated_at is not None
+                else None
+            ),
             "requires_network_evidence": placement.requires_network_evidence,
+            "requires_qualification_evidence": placement.origin == "AUTO",
             "requires_nccl": placement.requires_nccl,
             "min_bandwidth_mbps": placement.min_bandwidth_mbps,
             "max_rtt_ms": placement.max_rtt_ms,
@@ -683,6 +830,7 @@ def _active_catalog(
             requires_network_evidence=(
                 placement.requires_network_evidence or placement.node_count > 1
             ),
+            requires_qualification_evidence=placement.origin == "AUTO",
         )
 
         delivery_candidates: list[
@@ -1266,57 +1414,56 @@ def show_deployment_recommendation(
 def _lock_recommendation_inputs(
     session: Session, record: DeploymentRecommendationRecord
 ) -> None:
-    if session.get_bind().dialect.name == "postgresql":
-        session.execute(
-            text(
-                "LOCK TABLE artifact_chunks, artifact_manifests, "
-                "artifact_manifest_files, artifact_file_chunks, benchmark_evidence, "
-                "benchmark_runs, model_artifacts, model_releases, nodes, "
-                "node_profiles, placement_profiles, runtime_releases, "
-                "stage_artifact_variants, stage_artifact_ranks, "
-                "stage_artifact_validation_evidence, "
-                "stage_artifact_validation_ranks IN SHARE MODE"
+    # The immutable recommendation already freezes its observed node set. Lock
+    # those rows in the same Node -> NodeProfile order used by heartbeat and
+    # task completion, then re-evaluate every registry/evidence input. Broad
+    # table SHARE locks used here previously could deadlock with a completion
+    # that held a Node row and needed to flush its node/profile update.
+    node_ids = sorted(set(record.requested_node_ids))
+    if not node_ids:
+        inventory_snapshot = getattr(record, "inventory_snapshot", None)
+        if not isinstance(inventory_snapshot, list):
+            stored = getattr(record, "recommendation_snapshot", None)
+            evaluation = (
+                stored.get("evaluation") if isinstance(stored, dict) else None
             )
-        )
+            inventory_snapshot = (
+                evaluation.get("inventory_snapshot")
+                if isinstance(evaluation, dict)
+                else None
+            )
+        if isinstance(inventory_snapshot, list):
+            node_ids = sorted(
+                {
+                    item.get("node_id")
+                    for item in inventory_snapshot
+                    if isinstance(item, dict)
+                    and isinstance(item.get("node_id"), str)
+                }
+            )
+    if not node_ids:
         return
-    # Keep the fallback lock order identical across callers.  SQLite ignores
-    # FOR UPDATE, but this path is also exercised by databases that provide
-    # row locks without PostgreSQL table locks.
-    for model, order_by in (
-        (ArtifactChunk, (ArtifactChunk.digest,)),
-        (ArtifactManifest, (ArtifactManifest.digest,)),
-        (ArtifactManifestFile, (ArtifactManifestFile.id,)),
-        (ArtifactFileChunk, (ArtifactFileChunk.file_id, ArtifactFileChunk.ordinal)),
-        (BenchmarkEvidence, (BenchmarkEvidence.id,)),
-        (BenchmarkRun, (BenchmarkRun.id,)),
-        (ModelArtifact, (ModelArtifact.id,)),
-        (ModelRelease, (ModelRelease.id,)),
-        (PlacementProfileRecord, (PlacementProfileRecord.id,)),
-        (RuntimeRelease, (RuntimeRelease.id,)),
-        (StageArtifactVariant, (StageArtifactVariant.artifact_set_digest,)),
-        (StageArtifactRank, (StageArtifactRank.id,)),
-        (
-            StageArtifactValidationEvidence,
-            (StageArtifactValidationEvidence.identity_digest,),
-        ),
-        (
-            StageArtifactValidationRank,
-            (StageArtifactValidationRank.evidence_id, StageArtifactValidationRank.rank),
-        ),
-    ):
-        list(session.scalars(select(model).order_by(*order_by).with_for_update()))
-    node_statement = select(Node).order_by(Node.id)
-    profile_statement = select(NodeProfileRecord).order_by(NodeProfileRecord.node_id)
-    if record.selection_mode == "explicit_nodes":
-        node_statement = node_statement.where(Node.id.in_(record.requested_node_ids))
-        profile_statement = profile_statement.where(
-            NodeProfileRecord.node_id.in_(record.requested_node_ids)
+    list(
+        session.scalars(
+            select(Node)
+            .where(Node.id.in_(node_ids))
+            .order_by(Node.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
-    list(session.scalars(node_statement.with_for_update()))
-    list(session.scalars(profile_statement.with_for_update()))
+    )
+    list(
+        session.scalars(
+            select(NodeProfileRecord)
+            .where(NodeProfileRecord.node_id.in_(node_ids))
+            .order_by(NodeProfileRecord.node_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
 
 
-def _best_gpu_index(profile: NodeProfile, minimum_mib: int) -> int:
+def _best_gpu(profile: NodeProfile, minimum_mib: int):
     eligible = [
         gpu
         for gpu in profile.gpus
@@ -1328,7 +1475,10 @@ def _best_gpu_index(profile: NodeProfile, minimum_mib: int) -> int:
             code="GENERATION_GPU_UNAVAILABLE",
             details={"node_id": profile.node_id},
         )
-    return max(eligible, key=lambda item: (item.memory_mib, -item.index)).index
+    return min(
+        eligible,
+        key=lambda item: (-item.memory_mib, item.uuid, item.index),
+    )
 
 
 def _layer_partitions(layer_count: int, stages: int) -> list[tuple[int, int]]:
@@ -1621,6 +1771,7 @@ def _build_generation_plan(
             NodeAssignment(
                 node_id=binding.profile.node_id,
                 gpu_index=binding.gpu_index,
+                gpu_uuid=binding.gpu_uuid,
                 rank=rank,
                 pipeline_rank=rank,
                 layer_start=partitions[rank][0],
@@ -1678,12 +1829,14 @@ def _build_generation_plan(
                 code="GENERATION_MODEL_CACHE_UNSUPPORTED",
             )
         ordered_profiles = profiles
+        selected_gpu = _best_gpu(
+            profiles[0], placement.min_gpu_memory_mib
+        )
         assignments = [
             NodeAssignment(
                 node_id=profiles[0].node_id,
-                gpu_index=_best_gpu_index(
-                    profiles[0], placement.min_gpu_memory_mib
-                ),
+                gpu_index=selected_gpu.index,
+                gpu_uuid=selected_gpu.uuid,
                 rank=0,
                 pipeline_rank=0,
                 layer_start=partitions[0][0],
@@ -1780,6 +1933,15 @@ def _previous_generation(
             code="PREVIOUS_GENERATION_LINEAGE_INVALID",
             details={"previous_generation_id": previous_generation_id},
         )
+    if root.fleet_id is not None or previous.fleet_id is not None:
+        raise RecommendationGenerationConflictError(
+            "Fleet deployment lineages cannot be extended by standalone recommendations",
+            code="FLEET_LINEAGE_EXTENSION_FORBIDDEN",
+            details={
+                "previous_generation_id": previous_generation_id,
+                "fleet_id": root.fleet_id or previous.fleet_id,
+            },
+        )
     if previous.status == "ROLLED_BACK":
         raise RecommendationGenerationConflictError(
             "a rolled-back generation cannot continue its old lineage",
@@ -1842,6 +2004,67 @@ def _previous_generation(
     return previous, lineage_id, previous.generation + 1
 
 
+def _raise_if_previous_generation_belongs_to_fleet(
+    session: Session, previous_generation_id: str | None
+) -> None:
+    """Fail before recommendation drift can obscure the Fleet boundary.
+
+    This is an early read-only check.  ``_previous_generation`` repeats the
+    decision after locking the lineage in the established mutation lock order.
+    """
+
+    if previous_generation_id is None:
+        return
+    candidate = session.get(Deployment, previous_generation_id)
+    if candidate is None:
+        return
+    lineage_id = candidate.lineage_id or candidate.id
+    root = candidate if candidate.id == lineage_id else session.get(
+        Deployment, lineage_id
+    )
+    fleet_id = (
+        candidate.fleet_id
+        if candidate.fleet_id is not None
+        else root.fleet_id if root is not None else None
+    )
+    if fleet_id is not None:
+        raise RecommendationGenerationConflictError(
+            "Fleet deployment lineages cannot be extended by standalone recommendations",
+            code="FLEET_LINEAGE_EXTENSION_FORBIDDEN",
+            details={
+                "previous_generation_id": previous_generation_id,
+                "fleet_id": fleet_id,
+            },
+        )
+
+
+def _raise_if_previous_lineage_operation_is_active(
+    session: Session, previous_generation_id: str | None
+) -> None:
+    """Preserve the specific lineage conflict before reporting inventory drift."""
+    if previous_generation_id is None:
+        return
+    lineage_id = session.scalar(
+        select(Deployment.lineage_id).where(
+            Deployment.id == previous_generation_id
+        )
+    )
+    if not isinstance(lineage_id, str):
+        return
+    active_operation = session.scalar(
+        select(DeploymentOperation)
+        .where(DeploymentOperation.active_lineage_id == lineage_id)
+        .order_by(DeploymentOperation.created_at, DeploymentOperation.id)
+        .limit(1)
+    )
+    if active_operation is not None:
+        raise RecommendationGenerationConflictError(
+            "deployment lineage has an active operation",
+            code="DEPLOYMENT_OPERATION_ACTIVE",
+            details={"operation_id": active_operation.id},
+        )
+
+
 def accept_deployment_recommendation(
     session: Session,
     recommendation_id: str,
@@ -1849,6 +2072,9 @@ def accept_deployment_recommendation(
     previous_generation_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    # Serialize with Fleet acceptance before taking recommendation, node, or
+    # deployment rows so all resource owners share one PostgreSQL lock order.
+    lock_fleet_reservation_gate(session)
     recommendation_record = session.scalar(
         select(DeploymentRecommendationRecord)
         .where(DeploymentRecommendationRecord.id == recommendation_id)
@@ -1859,6 +2085,9 @@ def accept_deployment_recommendation(
             details={"recommendation_id": recommendation_id}
         )
     _validate_stored_record(recommendation_record)
+    _raise_if_previous_generation_belongs_to_fleet(
+        session, previous_generation_id
+    )
     existing = session.scalar(
         select(Deployment)
         .where(Deployment.source_recommendation_id == recommendation_id)
@@ -1900,6 +2129,12 @@ def accept_deployment_recommendation(
         current_snapshot != expected_snapshot
         or inventory_snapshot != recommendation_record.inventory_snapshot
     ):
+        # An operation created after recommendation persistence also changes
+        # the qualification occupancy projection. Keep the established,
+        # actionable lineage error instead of obscuring it as generic drift.
+        _raise_if_previous_lineage_operation_is_active(
+            session, previous_generation_id
+        )
         changed_fields = [
             field
             for field in (
@@ -1952,6 +2187,18 @@ def accept_deployment_recommendation(
                 "selected recommendation node inventory no longer exists",
                 details={"node_ids": normalized_selected_node_ids},
             )
+        try:
+            ensure_fleet_reservation_scope(
+                session,
+                node_ids=normalized_selected_node_ids,
+                gate_locked=True,
+            )
+        except FleetResourceReservationError as exc:
+            raise RecommendationNotAcceptableError(
+                str(exc),
+                code=exc.code,
+                details=exc.details,
+            ) from exc
         active_quarantine = session.execute(
             select(Task.id, Task.node_id)
             .where(
@@ -1989,6 +2236,23 @@ def accept_deployment_recommendation(
         deployment_id=deployment_id,
         generation=generation,
     )
+    try:
+        ensure_fleet_reservation_scope(
+            session,
+            node_ids=[item["node_id"] for item in plan["assignments"]],
+            gpu_uuids=[
+                item["gpu_uuid"]
+                for item in plan["assignments"]
+                if isinstance(item.get("gpu_uuid"), str)
+            ],
+            gate_locked=True,
+        )
+    except FleetResourceReservationError as exc:
+        raise RecommendationNotAcceptableError(
+            str(exc),
+            code=exc.code,
+            details=exc.details,
+        ) from exc
     deployment = Deployment(
         id=deployment_id,
         lineage_id=lineage_id,

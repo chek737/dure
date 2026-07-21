@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+from contextlib import redirect_stdout
 import tempfile
 import unittest
 import uuid
@@ -12,6 +14,7 @@ from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy import (
     BigInteger,
+    bindparam,
     CheckConstraint,
     ForeignKeyConstraint,
     MetaData,
@@ -44,10 +47,14 @@ from dure.control.models import (
     DeploymentOperation,
     DeploymentOperationNode,
     DeploymentRecommendationRecord,
+    FleetRecord,
+    FleetRecommendationRecord,
+    FleetResourceReservation,
     ModelArtifact,
     ModelRelease,
     NodeArtifactCache,
     PlacementProfileRecord,
+    ProfileQualificationRun,
     RuntimeRelease,
     StageArtifactRank,
     StageArtifactValidationEvidence,
@@ -60,6 +67,7 @@ from dure.control.service import (
     create_model_artifact,
     create_model_release,
     create_runtime_release,
+    generate_auto_placement_profiles,
     prepare_benchmark_run,
 )
 
@@ -93,16 +101,26 @@ ARTIFACT_CACHE_TABLES = {
     "node_artifact_caches",
     "artifact_cache_events",
 }
+PROFILE_QUALIFICATION_TABLES = {
+    "profile_qualification_runs",
+    "profile_qualification_bindings",
+    "profile_qualification_evidence",
+}
 HEAD_TABLES = REGISTRY_TABLES | {
     *ARTIFACT_MANIFEST_TABLES,
     *ARTIFACT_PREPARATION_TABLES,
     *STAGE_ARTIFACT_TABLES,
     *ARTIFACT_CACHE_TABLES,
+    *PROFILE_QUALIFICATION_TABLES,
     "benchmark_evidence",
     "benchmark_runs",
     "deployment_operation_nodes",
     "deployment_operations",
     "deployment_recommendations",
+    "fleet_deployment_runtime",
+    "fleet_resource_reservations",
+    "fleet_recommendations",
+    "fleets",
 }
 STAGE_VARIANT_CHECKS = {
     "ck_stage_variant_architecture",
@@ -215,10 +233,64 @@ RECOMMENDATION_CHECKS = {
     "ck_deployment_recommendation_id_sha256",
     "ck_deployment_recommendation_selection_mode",
 }
+FLEET_RECOMMENDATION_INDEXES = {
+    "ix_fleet_recommendations_created_at"
+}
+FLEET_RECOMMENDATION_CHECKS = {
+    "ck_fleet_recommendation_candidate_policy_version",
+    "ck_fleet_recommendation_catalog_version_sha256",
+    "ck_fleet_recommendation_catalog_policy_version",
+    "ck_fleet_recommendation_id_sha256",
+    "ck_fleet_recommendation_inventory_sha256",
+    "ck_fleet_recommendation_objective",
+    "ck_fleet_recommendation_reserve_nonnegative",
+    "ck_fleet_recommendation_scheduler_version",
+    "ck_fleet_recommendation_schema_version",
+    "ck_fleet_recommendation_selection_mode",
+    "ck_fleet_recommendation_source_inventory_sha256",
+}
+FLEET_CHECKS = {
+    "ck_fleets_id_canonical_uuid",
+    "ck_fleets_status",
+}
+FLEET_RESOURCE_RESERVATION_CHECKS = {
+    "ck_fleet_resource_reservation_gpu_index",
+    "ck_fleet_resource_reservation_gpu_uuid",
+    "ck_fleet_resource_reservation_id_canonical_uuid",
+    "ck_fleet_resource_reservation_rank",
+}
+FLEET_RESOURCE_RESERVATION_INDEXES = {
+    "ux_fleet_resource_reservations_active_gpu_uuid",
+    "ux_fleet_resource_reservations_active_node",
+}
+FLEET_RESOURCE_RESERVATION_UNIQUES = {
+    ("fleet_id", "node_id"),
+    ("fleet_id", "gpu_uuid"),
+    ("fleet_id", "deployment_id", "rank"),
+}
+FLEET_DEPLOYMENT_RUNTIME_CHECKS = {
+    "ck_fleet_deployment_runtime_failure",
+    "ck_fleet_deployment_runtime_id_canonical_uuid",
+    "ck_fleet_deployment_runtime_status",
+}
+FLEET_DEPLOYMENT_RUNTIME_INDEXES = {
+    "ix_fleet_deployment_runtime_fleet_status",
+}
+FLEET_DEPLOYMENT_RUNTIME_UNIQUES = {
+    ("fleet_id", "deployment_id"),
+    ("preparation_id",),
+    ("current_operation_id",),
+}
 DEPLOYMENT_GENERATION_UNIQUES = {
     ("lineage_id", "generation"),
     ("previous_generation_id",),
     ("source_recommendation_id",),
+    ("fleet_id", "fleet_candidate_id"),
+    ("fleet_id", "id"),
+}
+DEPLOYMENT_FLEET_CHECKS = {
+    "ck_deployments_fleet_binding",
+    "ck_deployments_fleet_candidate_sha256",
 }
 DEPLOYMENT_OPERATION_CHECKS = {
     "ck_deployment_operation_id_length",
@@ -1696,6 +1768,294 @@ class MigrationTests(unittest.TestCase):
             {"promotion_evidence_ids", "promotion_evidence_digest"}
             <= release_columns
         )
+        placement_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("placement_profiles")
+        }
+        self.assertTrue(
+            {
+                "max_model_len",
+                "max_concurrency",
+                "origin",
+                "status",
+                "spec_digest",
+                "qualification_evidence_id",
+                "qualified_at",
+                "activated_at",
+            }
+            <= set(placement_columns)
+        )
+        self.assertTrue(
+            all(
+                not placement_columns[name]["nullable"]
+                for name in (
+                    "max_model_len",
+                    "max_concurrency",
+                    "origin",
+                    "status",
+                )
+            )
+        )
+        placement_checks = {
+            item["name"]
+            for item in inspector.get_check_constraints("placement_profiles")
+        }
+        self.assertTrue(
+            {
+                "ck_placement_context_positive",
+                "ck_placement_concurrency_positive",
+                "ck_placement_origin",
+                "ck_placement_status",
+                "ck_placement_auto_tp1",
+                "ck_placement_auto_pp_nodes",
+                "ck_placement_auto_evidence",
+                "ck_placement_auto_activation",
+                "ck_placement_auto_qualified_at",
+            }
+            <= placement_checks
+        )
+        self.assertIn(
+            "ix_placement_profiles_status",
+            {
+                item["name"]
+                for item in inspector.get_indexes("placement_profiles")
+            },
+        )
+        self.assertIn(
+            (
+                ("qualification_evidence_id",),
+                "profile_qualification_evidence",
+                ("id",),
+            ),
+            {
+                (
+                    tuple(item["constrained_columns"]),
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys("placement_profiles")
+            },
+        )
+        qualification_run_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("profile_qualification_runs")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "release_id",
+                "placement_id",
+                "status",
+                "node_ids",
+                "rank_node_ids",
+                "gpu_bindings",
+                "inventory_fingerprint",
+                "profile_spec_digest",
+                "policy_version",
+                "suite_id",
+                "required_steps",
+                "workload",
+                "workload_digest",
+                "max_model_len",
+                "max_concurrency",
+                "artifact_revision",
+                "artifact_manifest_digest",
+                "runtime_image",
+                "runtime_vllm_version",
+                "evidence_id",
+                "failure_code",
+                "created_at",
+                "updated_at",
+            },
+            set(qualification_run_columns),
+        )
+        self.assertEqual(
+            {
+                "ix_profile_qualification_runs_placement",
+                "ix_profile_qualification_runs_status",
+            },
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "profile_qualification_runs"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "ck_profile_qualification_run_status",
+                "ck_profile_qualification_run_inventory_sha256",
+                "ck_profile_qualification_run_spec_sha256",
+                "ck_profile_qualification_run_workload_sha256",
+                "ck_profile_qualification_run_context_positive",
+                "ck_profile_qualification_run_concurrency_positive",
+                "ck_profile_qualification_run_outcome",
+            },
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "profile_qualification_runs"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("release_id",): ("model_releases", ("id",)),
+                ("placement_id",): ("placement_profiles", ("id",)),
+                ("evidence_id",): (
+                    "profile_qualification_evidence",
+                    ("id",),
+                ),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "profile_qualification_runs"
+                )
+            },
+        )
+        qualification_evidence_columns = {
+            item["name"]: item
+            for item in inspector.get_columns(
+                "profile_qualification_evidence"
+            )
+        }
+        self.assertEqual(
+            {
+                "run_id",
+                "rank",
+                "node_id",
+                "gpu_index",
+                "gpu_uuid",
+                "memory_mib",
+                "compute_capability",
+            },
+            {
+                item["name"]
+                for item in inspector.get_columns(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {"ix_profile_qualification_bindings_node"},
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "ck_profile_qualification_binding_rank",
+                "ck_profile_qualification_binding_gpu_index",
+                "ck_profile_qualification_binding_gpu_uuid",
+                "ck_profile_qualification_binding_memory",
+            },
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("run_id", "node_id"),
+                ("run_id", "gpu_uuid"),
+            },
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("run_id",): ("profile_qualification_runs", ("id",)),
+                ("node_id",): ("nodes", ("id",)),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "profile_qualification_bindings"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "id",
+                "run_id",
+                "status",
+                "steps",
+                "metrics",
+                "policy_version",
+                "suite_id",
+                "workload_digest",
+                "executor_image",
+                "dure_commit",
+                "evidence_digest",
+                "created_at",
+            },
+            set(qualification_evidence_columns),
+        )
+        self.assertEqual(
+            {"ix_profile_qualification_evidence_run"},
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                "ck_profile_qualification_evidence_status",
+                "ck_profile_qualification_evidence_sha256",
+                "ck_profile_qualification_executor_digest",
+                "ck_profile_qualification_evidence_workload_sha256",
+            },
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
+        self.assertEqual(
+            {("run_id",), ("evidence_digest",)},
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("run_id",): (
+                    "profile_qualification_runs",
+                    ("id",),
+                )
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "profile_qualification_evidence"
+                )
+            },
+        )
         recommendation_columns = {
             item["name"]: item
             for item in inspector.get_columns("deployment_recommendations")
@@ -1734,6 +2094,293 @@ class MigrationTests(unittest.TestCase):
                 )
             },
         )
+        fleet_recommendation_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("fleet_recommendations")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "schema_version",
+                "objective",
+                "selection_mode",
+                "requested_node_ids",
+                "minimum_replicas",
+                "minimum_reserve_nodes",
+                "reserve_node_ids",
+                "inventory_fingerprint",
+                "source_inventory_fingerprint",
+                "catalog_version",
+                "catalog_policy_version",
+                "candidate_policy_version",
+                "scheduler_version",
+                "recommendation_snapshot",
+                "created_at",
+            },
+            set(fleet_recommendation_columns),
+        )
+        self.assertTrue(
+            all(
+                not column["nullable"]
+                for column in fleet_recommendation_columns.values()
+            )
+        )
+        self.assertEqual(
+            fleet_recommendation_columns["catalog_version"]["type"].length,
+            71,
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_INDEXES,
+            {
+                item["name"]
+                for item in inspector.get_indexes("fleet_recommendations")
+            },
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_INDEXES,
+            {
+                index.name
+                for index in FleetRecommendationRecord.__table__.indexes
+            },
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "fleet_recommendations"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_RECOMMENDATION_CHECKS,
+            {
+                constraint.name
+                for constraint in FleetRecommendationRecord.__table__.constraints
+                if isinstance(constraint, CheckConstraint)
+            },
+        )
+        fleet_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("fleets")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "source_recommendation_id",
+                "status",
+                "created_at",
+                "updated_at",
+            },
+            set(fleet_columns),
+        )
+        self.assertTrue(
+            all(not column["nullable"] for column in fleet_columns.values())
+        )
+        self.assertEqual(
+            FLEET_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints("fleets")
+            },
+        )
+        self.assertEqual(
+            FLEET_CHECKS,
+            {
+                constraint.name
+                for constraint in FleetRecord.__table__.constraints
+                if isinstance(constraint, CheckConstraint)
+            },
+        )
+        self.assertEqual(
+            {("source_recommendation_id",)},
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints("fleets")
+            },
+        )
+        self.assertEqual(
+            {
+                ("source_recommendation_id",): (
+                    "fleet_recommendations",
+                    ("id",),
+                )
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys("fleets")
+            },
+        )
+        reservation_columns = {
+            item["name"]: item
+            for item in inspector.get_columns(
+                "fleet_resource_reservations"
+            )
+        }
+        self.assertEqual(
+            {
+                "id",
+                "fleet_id",
+                "deployment_id",
+                "node_id",
+                "gpu_index",
+                "gpu_uuid",
+                "rank",
+                "released_at",
+                "created_at",
+            },
+            set(reservation_columns),
+        )
+        for name in set(reservation_columns) - {"released_at"}:
+            self.assertFalse(reservation_columns[name]["nullable"], name)
+        self.assertTrue(reservation_columns["released_at"]["nullable"])
+        self.assertEqual(
+            FLEET_RESOURCE_RESERVATION_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "fleet_resource_reservations"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_RESOURCE_RESERVATION_UNIQUES,
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "fleet_resource_reservations"
+                )
+            },
+        )
+        reservation_indexes = {
+            item["name"]: item
+            for item in inspector.get_indexes(
+                "fleet_resource_reservations"
+            )
+        }
+        self.assertEqual(
+            FLEET_RESOURCE_RESERVATION_INDEXES,
+            set(reservation_indexes),
+        )
+        self.assertTrue(
+            all(item["unique"] for item in reservation_indexes.values())
+        )
+        self.assertEqual(
+            {
+                ("fleet_id",): ("fleets", ("id",)),
+                ("fleet_id", "deployment_id"): (
+                    "deployments",
+                    ("fleet_id", "id"),
+                ),
+                ("node_id",): ("nodes", ("id",)),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "fleet_resource_reservations"
+                )
+            },
+        )
+        runtime_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("fleet_deployment_runtime")
+        }
+        self.assertEqual(
+            {
+                "id",
+                "fleet_id",
+                "deployment_id",
+                "status",
+                "preparation_id",
+                "current_operation_id",
+                "failure_phase",
+                "failure_code",
+                "created_at",
+                "updated_at",
+            },
+            set(runtime_columns),
+        )
+        for name in (
+            "id",
+            "fleet_id",
+            "deployment_id",
+            "status",
+            "created_at",
+            "updated_at",
+        ):
+            self.assertFalse(runtime_columns[name]["nullable"], name)
+        for name in (
+            "preparation_id",
+            "current_operation_id",
+            "failure_phase",
+            "failure_code",
+        ):
+            self.assertTrue(runtime_columns[name]["nullable"], name)
+        self.assertEqual(
+            ["id"],
+            inspector.get_pk_constraint("fleet_deployment_runtime")[
+                "constrained_columns"
+            ],
+        )
+        self.assertEqual(
+            FLEET_DEPLOYMENT_RUNTIME_CHECKS,
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_DEPLOYMENT_RUNTIME_UNIQUES,
+            {
+                tuple(item["column_names"])
+                for item in inspector.get_unique_constraints(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
+        self.assertEqual(
+            FLEET_DEPLOYMENT_RUNTIME_INDEXES,
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
+        self.assertEqual(
+            {
+                ("fleet_id",): ("fleets", ("id",)),
+                ("fleet_id", "deployment_id"): (
+                    "deployments",
+                    ("fleet_id", "id"),
+                ),
+                ("preparation_id",): (
+                    "artifact_preparations",
+                    ("id",),
+                ),
+                ("current_operation_id",): (
+                    "deployment_operations",
+                    ("id",),
+                ),
+            },
+            {
+                tuple(item["constrained_columns"]): (
+                    item["referred_table"],
+                    tuple(item["referred_columns"]),
+                )
+                for item in inspector.get_foreign_keys(
+                    "fleet_deployment_runtime"
+                )
+            },
+        )
         deployment_columns = {
             item["name"]: item for item in inspector.get_columns("deployments")
         }
@@ -1742,6 +2389,8 @@ class MigrationTests(unittest.TestCase):
                 "lineage_id",
                 "previous_generation_id",
                 "source_recommendation_id",
+                "fleet_id",
+                "fleet_candidate_id",
                 "verified_at",
             }
             <= set(deployment_columns)
@@ -1749,7 +2398,16 @@ class MigrationTests(unittest.TestCase):
         self.assertFalse(deployment_columns["lineage_id"]["nullable"])
         self.assertTrue(deployment_columns["previous_generation_id"]["nullable"])
         self.assertTrue(deployment_columns["source_recommendation_id"]["nullable"])
+        self.assertTrue(deployment_columns["fleet_id"]["nullable"])
+        self.assertTrue(deployment_columns["fleet_candidate_id"]["nullable"])
         self.assertTrue(deployment_columns["verified_at"]["nullable"])
+        self.assertTrue(
+            DEPLOYMENT_FLEET_CHECKS
+            <= {
+                item["name"]
+                for item in inspector.get_check_constraints("deployments")
+            }
+        )
         self.assertEqual(
             DEPLOYMENT_GENERATION_UNIQUES,
             {
@@ -1771,6 +2429,10 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(
             deployment_foreign_keys[("source_recommendation_id",)],
             ("deployment_recommendations", ("id",)),
+        )
+        self.assertEqual(
+            deployment_foreign_keys[("fleet_id",)],
+            ("fleets", ("id",)),
         )
 
         operation_columns = {
@@ -2072,12 +2734,426 @@ class MigrationTests(unittest.TestCase):
             revision_module._append_only_guard_downgrade_sql("postgresql"),
         )
 
-    def test_migration_history_has_single_0010_head(self):
+    def test_migration_history_has_single_0015_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0010"])
+            self.assertEqual(heads, ["0015"])
+
+    def test_0014_fleet_reservation_schema_constraints_and_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'fleet-reservations.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "0014")
+
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                recommendations = []
+                for offset in range(3):
+                    digit = str(offset + 1)
+                    recommendation = FleetRecommendationRecord(
+                        id="sha256:" + digit * 64,
+                        schema_version=1,
+                        objective="quality-first",
+                        selection_mode="all_online",
+                        requested_node_ids=[],
+                        minimum_replicas={},
+                        minimum_reserve_nodes=0,
+                        reserve_node_ids=[],
+                        inventory_fingerprint="sha256:" + digit * 64,
+                        source_inventory_fingerprint=(
+                            "sha256:" + chr(ord("a") + offset) * 64
+                        ),
+                        catalog_version=(
+                            "sha256:" + chr(ord("d") + offset) * 64
+                        ),
+                        catalog_policy_version="fleet-policy-v1",
+                        candidate_policy_version="fleet-candidate-v1",
+                        scheduler_version="fleet-scheduler-v1",
+                        recommendation_snapshot={},
+                    )
+                    session.add(recommendation)
+                    recommendations.append(recommendation)
+                session.flush()
+
+                fleets = [
+                    FleetRecord(
+                        source_recommendation_id=recommendations[index].id
+                    )
+                    for index in range(2)
+                ]
+                session.add_all(fleets)
+                session.flush()
+                self.assertEqual(fleets[0].status, "ACCEPTED")
+                self.assertEqual(
+                    fleets[0].to_dict()["source_recommendation_id"],
+                    recommendations[0].id,
+                )
+
+                nodes = [
+                    _node(session, f"fleet-reservation-{index}")
+                    for index in range(3)
+                ]
+                deployments = []
+                for index, fleet in enumerate(fleets):
+                    deployment = Deployment(
+                        id=f"fleet-deployment-{index}",
+                        fleet_id=fleet.id,
+                        fleet_candidate_id=(
+                            "sha256:" + chr(ord("f") - index) * 64
+                        ),
+                        generation=1,
+                        plan={"nodes": []},
+                    )
+                    session.add(deployment)
+                    deployments.append(deployment)
+                session.flush()
+
+                reservation = FleetResourceReservation(
+                    fleet_id=fleets[0].id,
+                    deployment_id=deployments[0].id,
+                    node_id=nodes[0].id,
+                    gpu_index=0,
+                    gpu_uuid="GPU-fleet-reservation-a",
+                    rank=0,
+                )
+                session.add(reservation)
+                session.commit()
+                serialized = reservation.to_dict()
+                self.assertEqual(serialized["gpu_index"], 0)
+                self.assertEqual(serialized["rank"], 0)
+                self.assertIsNone(serialized["released_at"])
+                self.assertIsNotNone(serialized["created_at"])
+
+                session.add(
+                    FleetResourceReservation(
+                        fleet_id=fleets[0].id,
+                        deployment_id=deployments[1].id,
+                        node_id=nodes[2].id,
+                        gpu_index=0,
+                        gpu_uuid="GPU-cross-fleet-owner",
+                        rank=1,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                session.add(
+                    FleetResourceReservation(
+                        fleet_id=fleets[1].id,
+                        deployment_id=deployments[1].id,
+                        node_id=nodes[0].id,
+                        gpu_index=1,
+                        gpu_uuid="GPU-different",
+                        rank=0,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                session.add(
+                    FleetResourceReservation(
+                        fleet_id=fleets[1].id,
+                        deployment_id=deployments[1].id,
+                        node_id=nodes[1].id,
+                        gpu_index=0,
+                        gpu_uuid="GPU-fleet-reservation-a",
+                        rank=0,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                stored = session.get(
+                    FleetResourceReservation, reservation.id
+                )
+                stored.released_at = utcnow()
+                session.commit()
+                replacement = FleetResourceReservation(
+                    fleet_id=fleets[1].id,
+                    deployment_id=deployments[1].id,
+                    node_id=nodes[0].id,
+                    gpu_index=0,
+                    gpu_uuid="GPU-fleet-reservation-a",
+                    rank=0,
+                )
+                session.add(replacement)
+                session.commit()
+
+                session.add(
+                    FleetRecord(
+                        id="zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+                        source_recommendation_id=recommendations[2].id,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                session.add(
+                    FleetRecord(
+                        source_recommendation_id=recommendations[2].id,
+                        status="APPLIED",
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                session.add(
+                    Deployment(
+                        id="invalid-partial-fleet-binding",
+                        fleet_id=fleets[0].id,
+                        generation=1,
+                        plan={},
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+            engine.dispose()
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0014"):
+                command.downgrade(migration_config, "0013")
+
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                for model in (
+                    FleetResourceReservation,
+                    Deployment,
+                    FleetRecord,
+                ):
+                    records = session.scalars(select(model)).all()
+                    for record in records:
+                        if (
+                            model is not Deployment
+                            or record.fleet_id is not None
+                        ):
+                            session.delete(record)
+                session.commit()
+            engine.dispose()
+
+            command.downgrade(migration_config, "0013")
+            engine = make_engine(url)
+            inspector = inspect(engine)
+            self.assertNotIn("fleets", inspector.get_table_names())
+            self.assertNotIn(
+                "fleet_resource_reservations", inspector.get_table_names()
+            )
+            self.assertNotIn(
+                "fleet_id",
+                {
+                    item["name"]
+                    for item in inspector.get_columns("deployments")
+                },
+            )
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(
+                        text("SELECT version_num FROM alembic_version")
+                    ),
+                    "0013",
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+
+    def test_0014_postgresql_offline_upgrade_is_deterministic(self):
+        output = io.StringIO()
+        migration_config = config("postgresql://dure@localhost/dure")
+
+        with redirect_stdout(output):
+            command.upgrade(migration_config, "0013:0014", sql=True)
+
+        sql = output.getvalue()
+        self.assertIn("CREATE TABLE fleets", sql)
+        self.assertIn("CREATE TABLE fleet_resource_reservations", sql)
+        self.assertIn("fk_deployments_fleet_id", sql)
+        self.assertIn("ck_deployments_fleet_binding", sql)
+        self.assertIn("uq_deployments_fleet_candidate_id", sql)
+        self.assertIn(
+            "ux_fleet_resource_reservations_active_node", sql
+        )
+        self.assertIn("WHERE released_at IS NULL", sql)
+        revision_module = ScriptDirectory.from_config(
+            migration_config
+        ).get_revision("0014").module
+        self.assertEqual(
+            (
+                "LOCK TABLE deployments, fleets, "
+                "fleet_resource_reservations IN ACCESS EXCLUSIVE MODE",
+            ),
+            revision_module._destructive_downgrade_lock_sql("postgresql"),
+        )
+        self.assertEqual(
+            (), revision_module._destructive_downgrade_lock_sql("sqlite")
+        )
+
+    def test_0013_fleet_recommendation_schema_constraints_and_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'fleet-recommendations.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "0013")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            recommendation_id = "sha256:" + "a" * 64
+            with factory() as session:
+                record = FleetRecommendationRecord(
+                    id=recommendation_id,
+                    schema_version=1,
+                    objective="quality-first",
+                    selection_mode="explicit_nodes",
+                    requested_node_ids=["node-a", "node-b"],
+                    minimum_replicas={"qwen2.5-72b-awq": 1},
+                    minimum_reserve_nodes=1,
+                    reserve_node_ids=["node-b"],
+                    inventory_fingerprint="sha256:" + "b" * 64,
+                    source_inventory_fingerprint="sha256:" + "c" * 64,
+                    catalog_version="sha256:" + "1" * 64,
+                    catalog_policy_version="fleet-policy-v1",
+                    candidate_policy_version="fleet-candidate-v1",
+                    scheduler_version="fleet-scheduler-v1",
+                    recommendation_snapshot={
+                        "selected_candidate_ids": ["candidate-a"]
+                    },
+                )
+                session.add(record)
+                session.commit()
+                serialized = record.to_dict()
+                self.assertEqual(serialized["id"], recommendation_id)
+                self.assertEqual(serialized["schema_version"], 1)
+                self.assertEqual(
+                    serialized["minimum_replicas"],
+                    {"qwen2.5-72b-awq": 1},
+                )
+                self.assertEqual(serialized["reserve_node_ids"], ["node-b"])
+                self.assertIsNotNone(serialized["created_at"])
+
+                session.add(
+                    FleetRecommendationRecord(
+                        id="sha256:" + "d" * 64,
+                        schema_version=1,
+                        objective="quality-first",
+                        selection_mode="all_online",
+                        requested_node_ids=[],
+                        minimum_replicas={},
+                        minimum_reserve_nodes=-1,
+                        reserve_node_ids=[],
+                        inventory_fingerprint="sha256:" + "e" * 64,
+                        source_inventory_fingerprint="sha256:" + "f" * 64,
+                        catalog_version="sha256:" + "2" * 64,
+                        catalog_policy_version="fleet-policy-v1",
+                        candidate_policy_version="fleet-candidate-v1",
+                        scheduler_version="fleet-scheduler-v1",
+                        recommendation_snapshot={},
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+            engine.dispose()
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0013"):
+                command.downgrade(migration_config, "0012")
+
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                stored = session.get(
+                    FleetRecommendationRecord, recommendation_id
+                )
+                self.assertIsNotNone(stored)
+                session.delete(stored)
+                session.commit()
+            engine.dispose()
+
+            command.downgrade(migration_config, "0012")
+            engine = make_engine(url)
+            self.assertNotIn(
+                "fleet_recommendations", inspect(engine).get_table_names()
+            )
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(
+                        text("SELECT version_num FROM alembic_version")
+                    ),
+                    "0012",
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+
+    def test_0013_postgresql_offline_upgrade_is_deterministic(self):
+        output = io.StringIO()
+        migration_config = config("postgresql://dure@localhost/dure")
+
+        with redirect_stdout(output):
+            command.upgrade(migration_config, "0012:0013", sql=True)
+
+        sql = output.getvalue()
+        self.assertIn("CREATE TABLE fleet_recommendations", sql)
+        self.assertIn("ck_fleet_recommendation_id_sha256", sql)
+        self.assertIn("ck_fleet_recommendation_objective", sql)
+        revision_module = ScriptDirectory.from_config(
+            migration_config
+        ).get_revision("0013").module
+        self.assertEqual(
+            (
+                "LOCK TABLE fleet_recommendations "
+                "IN ACCESS EXCLUSIVE MODE",
+            ),
+            revision_module._destructive_downgrade_lock_sql("postgresql"),
+        )
+        self.assertEqual(
+            (), revision_module._destructive_downgrade_lock_sql("sqlite")
+        )
+
+    def test_0012_postgresql_offline_upgrade_is_deterministic(self):
+        output = io.StringIO()
+        migration_config = config("postgresql://dure@localhost/dure")
+
+        with redirect_stdout(output):
+            command.upgrade(migration_config, "0011:0012", sql=True)
+
+        sql = output.getvalue()
+        self.assertIn(
+            "upgrade 0012 requires legacy AUTO placement profiles to remain DRAFT",
+            sql,
+        )
+        self.assertIn(
+            "LOCK TABLE placement_profiles IN ACCESS EXCLUSIVE MODE",
+            sql,
+        )
+        self.assertIn("CREATE TABLE profile_qualification_runs", sql)
+        self.assertIn("CREATE TABLE profile_qualification_bindings", sql)
+        self.assertIn("CREATE TABLE profile_qualification_evidence", sql)
+        self.assertIn(
+            "fk_placement_profiles_qualification_evidence",
+            sql,
+        )
+        self.assertIn("fk_profile_qualification_runs_evidence", sql)
+        revision_module = ScriptDirectory.from_config(
+            migration_config
+        ).get_revision("0012").module
+        self.assertEqual(
+            (
+                "LOCK TABLE placement_profiles, profile_qualification_runs, "
+                "profile_qualification_bindings, "
+                "profile_qualification_evidence IN ACCESS EXCLUSIVE MODE",
+            ),
+            revision_module._destructive_downgrade_lock_sql("postgresql"),
+        )
+        self.assertEqual(
+            (), revision_module._destructive_downgrade_lock_sql("sqlite")
+        )
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2085,6 +3161,239 @@ class MigrationTests(unittest.TestCase):
 
             command.upgrade(config(url), "head")
 
+            self.assert_benchmark_head(url)
+
+    def test_0011_rejects_auto_tp_drift_and_destructive_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'profile-lifecycle.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = create_model_artifact(
+                    session,
+                    model_id="qwen2.5-72b-awq",
+                    repository="Qwen/Qwen2.5-72B-Instruct-AWQ",
+                    revision="a" * 40,
+                    manifest_digest="sha256:" + "b" * 64,
+                    quantization="awq",
+                    size_mib=39670,
+                    default_max_model_len=8192,
+                    layer_count=80,
+                    license_id="apache-2.0",
+                )
+                runtime = create_runtime_release(
+                    session,
+                    version="vllm-0.9.0",
+                    image="registry.example/vllm@sha256:" + "c" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+                release = create_model_release(
+                    session,
+                    artifact_id=artifact.id,
+                    runtime_id=runtime.id,
+                    quality_rank=72,
+                )
+                generate_auto_placement_profiles(
+                    session, release_id=release.id, apply=True
+                )
+                placement = session.scalar(
+                    select(PlacementProfileRecord).where(
+                        PlacementProfileRecord.release_id == release.id,
+                        PlacementProfileRecord.pipeline_parallel_size == 2,
+                    )
+                )
+                placement.tensor_parallel_size = 2
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0011"):
+                command.downgrade(migration_config, "0010")
+            engine.dispose()
+
+    def test_0012_rejects_invalid_auto_lifecycle_and_data_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'qualification-head.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = create_model_artifact(
+                    session,
+                    model_id="qwen2.5-7b-awq",
+                    repository="Qwen/Qwen2.5-7B-Instruct-AWQ",
+                    revision="d" * 40,
+                    manifest_digest="sha256:" + "e" * 64,
+                    quantization="awq",
+                    size_mib=4916,
+                    default_max_model_len=8192,
+                    layer_count=28,
+                    license_id="apache-2.0",
+                )
+                runtime = create_runtime_release(
+                    session,
+                    version="vllm-qualification-head",
+                    image="registry.example/vllm@sha256:" + "f" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+                release = create_model_release(
+                    session,
+                    artifact_id=artifact.id,
+                    runtime_id=runtime.id,
+                    quality_rank=7,
+                )
+                generate_auto_placement_profiles(
+                    session, release_id=release.id, apply=True
+                )
+                placement = session.scalar(
+                    select(PlacementProfileRecord).where(
+                        PlacementProfileRecord.release_id == release.id
+                    )
+                )
+                placement.status = "VALIDATED"
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                node_id = str(uuid.uuid4())
+                run = ProfileQualificationRun(
+                    id=str(uuid.uuid4()),
+                    release_id=release.id,
+                    placement_id=placement.id,
+                    status="QUALIFYING",
+                    node_ids=[node_id],
+                    rank_node_ids=[node_id],
+                    gpu_bindings=[],
+                    inventory_fingerprint="sha256:" + "1" * 64,
+                    profile_spec_digest=placement.spec_digest,
+                    policy_version="profile-qualification-v1",
+                    suite_id="dure-profile-qualification-v1",
+                    required_steps=["STATIC_COMPATIBILITY"],
+                    workload={"contract": "migration-test"},
+                    workload_digest="sha256:" + "2" * 64,
+                    max_model_len=placement.max_model_len,
+                    max_concurrency=placement.max_concurrency,
+                    artifact_revision=artifact.revision,
+                    artifact_manifest_digest=artifact.manifest_digest,
+                    runtime_image=runtime.image,
+                    runtime_vllm_version=runtime.vllm_version,
+                )
+                session.add(run)
+                session.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "downgrade 0012"):
+                command.downgrade(migration_config, "0011")
+            engine.dispose()
+
+    def test_true_0011_auto_profile_preflight_is_atomic_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'true-0011.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = create_model_artifact(
+                    session,
+                    model_id="qwen2.5-72b-awq",
+                    repository="Qwen/Qwen2.5-72B-Instruct-AWQ",
+                    revision="3" * 40,
+                    manifest_digest="sha256:" + "4" * 64,
+                    quantization="awq",
+                    size_mib=39670,
+                    default_max_model_len=8192,
+                    layer_count=80,
+                    license_id="apache-2.0",
+                )
+                runtime = create_runtime_release(
+                    session,
+                    version="vllm-true-0011",
+                    image="registry.example/vllm@sha256:" + "5" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.8",
+                    gpu_architectures=["ampere"],
+                )
+                release = create_model_release(
+                    session,
+                    artifact_id=artifact.id,
+                    runtime_id=runtime.id,
+                    quality_rank=72,
+                )
+                generate_auto_placement_profiles(
+                    session, release_id=release.id, apply=True
+                )
+                placement_ids = sorted(
+                    session.scalars(
+                        select(PlacementProfileRecord.id).where(
+                            PlacementProfileRecord.release_id == release.id
+                        )
+                    )
+                )
+            engine.dispose()
+
+            command.downgrade(migration_config, "0011")
+            engine = make_engine(url)
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE placement_profiles SET status = 'ACTIVE' "
+                        "WHERE id = :placement_id"
+                    ),
+                    {"placement_id": placement_ids[0]},
+                )
+            with self.assertRaisesRegex(RuntimeError, "legacy AUTO"):
+                command.upgrade(migration_config, "head")
+
+            inspector = inspect(engine)
+            self.assertNotIn(
+                "qualification_evidence_id",
+                {
+                    item["name"]
+                    for item in inspector.get_columns("placement_profiles")
+                },
+            )
+            self.assertFalse(
+                PROFILE_QUALIFICATION_TABLES
+                & set(inspector.get_table_names())
+            )
+            with engine.begin() as connection:
+                self.assertEqual(
+                    connection.scalar(
+                        text("SELECT version_num FROM alembic_version")
+                    ),
+                    "0011",
+                )
+                connection.execute(
+                    text(
+                        "UPDATE placement_profiles SET status = 'DRAFT' "
+                        "WHERE id = :placement_id"
+                    ),
+                    {"placement_id": placement_ids[0]},
+                )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            with engine.connect() as connection:
+                rows = connection.execute(
+                    text(
+                        "SELECT id, status FROM placement_profiles "
+                        "WHERE id IN :placement_ids ORDER BY id"
+                    ).bindparams(bindparam("placement_ids", expanding=True)),
+                    {"placement_ids": placement_ids},
+                ).all()
+            self.assertEqual(
+                [(placement_id, "DRAFT") for placement_id in placement_ids],
+                rows,
+            )
+            engine.dispose()
             self.assert_benchmark_head(url)
 
     def test_true_0009_upgrade_and_empty_round_trip_preserve_stage_registry(self):
@@ -2862,11 +4171,25 @@ class MigrationTests(unittest.TestCase):
                 ARTIFACT_PREPARATION_TABLES
                 & set(inspect(engine).get_table_names())
             )
-            factory = make_session_factory(engine)
-            with factory() as session:
-                self.assertIsNotNone(session.get(Deployment, deployment_id))
-                self.assertIsNotNone(
-                    session.get(ArtifactManifest, manifest_digest)
+            with engine.connect() as connection:
+                self.assertEqual(
+                    connection.scalar(
+                        text(
+                            "SELECT COUNT(*) FROM deployments WHERE id = :id"
+                        ),
+                        {"id": deployment_id},
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    connection.scalar(
+                        text(
+                            "SELECT COUNT(*) FROM artifact_manifests "
+                            "WHERE digest = :digest"
+                        ),
+                        {"digest": manifest_digest},
+                    ),
+                    1,
                 )
             engine.dispose()
 

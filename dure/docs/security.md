@@ -18,6 +18,7 @@
 | host bootstrap 공급망·서비스 중단 | 로컬 실행, 변경은 root 전용, 기본 preview, 명시적 apply, 고정 HTTPS 저장소·단일 primary key fingerprint·패키지 allowlist, 제거 금지, 재시작 직전 workload 재검사와 설정 복구 | 패키지 provenance·서명 투명성, 실제 host 수용 검사 |
 | 이미지 치환 | 중앙 계획은 OCI 다이제스트 요구, 준비 작업은 exact digest inspect·필요 시 pull·재inspect | 이미지 서명과 출처 검증 |
 | 모델 아티팩트 변경 | 리비전 고정 정책, 불변 정규 매니페스트, 중앙 준비의 콘텐츠 주소 청크·파일 SHA-256 재검증과 marker-last 캐시 활성화, 추천 apply의 exact evidence 게이트 | 게시자 서명과 provenance 검증 |
+| 미검증 자동 프로필의 배포 유입 | 네 모델 allowlist, `TP=1`·`PP=node_count` DB 제약, 버전 고정 spec digest, DRAFT 생성과 ACTIVE 추천 필터 | qualification 증적 서명과 정책 승인 분리 |
 | 오래되거나 손상된 캐시 재사용 | 현재 준비 성공만 만드는 `READY`, 완전한 probe의 강등, 검증 실패의 `CORRUPT` 투영, apply·start·restart·verify·rollback의 exact current-evidence 재검사 | 서명된 노드 증적과 원격 attestation |
 | 참조 중인 캐시의 위험한 정리 | 읽기 전용 보수적 참조 투영, preview 기본값, exact final 하나의 원자적 보존 이동, 자동 삭제·eviction 금지 | CAS 청크 단위 참조 수집과 보존 만료 정책 |
 | stage 출력 치환·rank 혼합 | source·runtime·exporter·토폴로지와 rank별 매니페스트를 결합한 variant identity, 완전한 rank 집합 검사와 실제 GPU export/load 승격 게이트 | 서명된 빌더 provenance와 투명성 로그 |
@@ -26,6 +27,7 @@
 | 벤치마크 증적 바꿔치기 | 릴리스·배치·정확한 정렬 노드 UUID 조합·현재 프로필 지문과 고정 아티팩트·런타임 식별자 결합, Agent·서버의 폐쇄형 결과 재검증, 중앙 추천의 24시간 TTL과 최신 결과 검사 | 서명된 Agent 결과와 원본 증적 provenance |
 | 작업 재생 | 임대, 세대 검사, 로컬 완료 저널, operation 단계·노드·시도 번호 펜싱 | 서명된 봉투와 암호학적 펜싱 토큰 |
 | 동시 변경 | 노드 행 잠금, 한 개의 활성 임대와 계보당 한 개의 활성 변경 | PostgreSQL 동시성 부하 시험 |
+| Fleet 부분 실패의 파급 | 배포별 runtime·current operation 펜싱, 실패 코드 격리, 다른 배포 자동 취소 금지, 예약 유지 | Fleet 전체 취소·검토된 예약 해제 절차 |
 | 컨테이너 오조작 | 배포·세대·노드와 엄격한 backend·pipeline rank·runtime rank·component 레이블의 조회 후 재검사 | 격리와 실제 Docker 경쟁 조건 검토 |
 | 잘못된 롤백 대상 | 서버가 직접 직전 검증 세대를 선택하고 전체 노드·토폴로지 재검사 | 실제 다중 노드 복구 수용 검사 |
 | 공개 Ray 노출 | 사설망 사용 문서화 | WireGuard와 firewall 검증 자동화 |
@@ -100,7 +102,7 @@ SHA-256과 OCI digest는 선택한 바이트의 동일성을 고정하지만 게
 
 `VLLM_RAY_PP_V1`은 정확히 vLLM 0.9.0 V0 Ray, `TP=1`, `PP=2/3`, 노드별 정상 GPU 한 장과 검증된 `FULL_SNAPSHOT` 또는 exact rank `STAGE`를 지원합니다. 새 backend는 별도 필드가 없는 기존 계획 JSON과 legacy 실행에 영향을 주지 않습니다. 반대로 엄격한 필드 일부만 legacy 계획에 섞거나 알 수 없는 backend·vLLM·cache kind를 지정하면 실행 전에 거부합니다.
 
-중앙 계획은 hostname을 실행 identity로 사용하지 않고 서버가 발급한 canonical UUID를 직접 배정합니다. head는 rank 0으로 고정하고 worker는 중복 없는 canonical RFC1918 IPv4 문자열 순으로 정렬합니다. 계획의 rank·layer 범위·노드·주소 집합은 빈틈없이 연속이어야 하며, 각 노드 Agent는 현재 probe에서 같은 UUID, `default_interface_addresses`에 정확히 결합된 계획 주소, 모든 노드에서 같은 기본 interface, 정상 GPU 정확히 한 장, cache kind에 맞는 exact marker와 Docker NVIDIA runtime을 다시 확인합니다. 비중지 작업은 전체 배정 집합과 0.3.18 이상 Agent를 요구하고 `STAGE`는 0.3.19 이상이어야 합니다.
+중앙 계획은 hostname을 실행 identity로 사용하지 않고 서버가 발급한 canonical UUID를 직접 배정합니다. head는 rank 0으로 고정하고 worker는 중복 없는 canonical RFC1918 IPv4 문자열 순으로 정렬합니다. 계획의 rank·layer 범위·노드·주소 집합은 빈틈없이 연속이어야 하며, 각 노드 Agent는 현재 probe에서 같은 UUID, `default_interface_addresses`에 정확히 결합된 계획 주소, 모든 노드에서 같은 기본 interface, 계획에 고정된 정상 GPU index·UUID 한 쌍, cache kind에 맞는 exact marker와 Docker NVIDIA runtime을 다시 확인합니다. 정상 GPU가 여러 장인 호스트에서도 선택되지 않은 GPU는 컨테이너에 노출하지 않습니다. 비중지 작업은 전체 배정 집합과 0.3.18 이상 Agent를 요구하고 `STAGE`는 0.3.19 이상이어야 합니다.
 
 Ray 실행 입력도 폐쇄돼 있습니다. GCS `6379`, worker `20000-21000`, API `127.0.0.1:8000`, `--node-ip-address`, `VLLM_HOST_IP`, Ray backend와 TP/PP 값은 코드의 고정 계약에서 생성합니다. 중앙 task가 임의 명령, 포트, Docker 인자, 환경 변수, mount나 host path를 주입할 수 없습니다. 다만 host network를 사용하는 Ray 컨테이너는 별도 network namespace 격리를 제공하지 않으므로, RFC1918 검사만으로 보안을 충족한다고 보아서는 안 됩니다. host firewall과 사설 overlay가 실제 접근 제어 경계입니다.
 
@@ -164,6 +166,29 @@ probe는 최대 256개의 marker metadata만 보고합니다. `scan_complete=tru
 - 추천 세대 롤백은 대상의 현재 `READY`, 기존 성공 증적과 로컬 다이제스트 이미지만 사용합니다. 새 준비 작업, 모델 네트워크 다운로드와 이미지 pull을 만들지 않습니다. `STOP_SOURCE`가 끝난 직후 `START_TARGET` task 생성 전에 같은 게이트를 잠금 상태로 다시 검사하고 실패하면 task를 만들지 않습니다.
 
 추천이 `FULL_SNAPSHOT`을 선택하면 각 노드에 같은 전체 모델을 두고, `STAGE`를 선택하면 각 노드에 서버가 그 UUID와 PP rank에 고정한 서로 다른 정규 매니페스트만 준비합니다. 컨테이너에는 계산된 host path만 `/models/model:ro`로 연결합니다. task가 host path·loader 인자를 제공할 수 없고 시작 직전 캐시 전체를 다시 해시합니다. 다만 이것은 게시자·builder 서명이나 악성 root·Docker daemon 방어를 대신하지 않습니다.
+
+## 자동 배치 프로필 qualification의 신뢰 경계
+
+자동 프로필 qualification은 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 전이와 증적 형식을 중앙에서 강제하는 계약입니다. 준비 시 policy·suite·작업 부하, 모델·런타임 식별자와 8단계 순서를 동결하고 각 rank를 서버 발급 노드 UUID와 GPU index·UUID에 정규화해 결합합니다. task, 활성 배포 operation, 활성 Fleet 예약, 다른 qualification 예약 또는 관측 작업 부하가 있는 노드는 대상에서 제외합니다. 증적 등록과 활성화 시 현재 인벤토리·binding·레지스트리를 다시 계산하며, 중앙 단일·다중 노드 AUTO 추천은 exact 결합의 24시간 이내 통과 증적만 사용합니다.
+
+- 준비 preview, `apply=true` run 생성, 증적 등록과 활성화는 Agent task, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지를 만들지 않습니다.
+- 증적은 정적 호환성, 용량, 아티팩트, 네트워크·NCCL, 모델 load, 짧은 추론, 컨텍스트·동시성, 재시작 안정성의 8단계와 폐쇄형 수치·실패 코드만 받습니다. 임의 명령·환경 변수·마운트·비밀·로그를 표현할 수 없습니다.
+- executor 이미지는 OCI digest로 고정하고 Dure 커밋 표식을 기록하지만, 이 값은 결과의 암호학적 서명이나 원본 로그 provenance가 아닙니다.
+- 현재 서버는 신뢰된 외부 executor가 관리자 API로 제출한 결과를 신뢰 경계 안에서 검증합니다. 다중 노드 Agent 자동 executor, 분산 barrier와 결과 서명은 구현되지 않았습니다.
+
+따라서 관리자 token, executor, 원본 결과 저장소를 같은 신뢰된 운영 경계에서 관리해야 합니다. 이 경계의 전체 계약은 [자동 배치 프로필 qualification](profile-qualification.md)을 참고합니다.
+
+Fleet 평가기는 유효한 PRIMARY·SUPPLEMENTARY 증적 하나를 정확한 node/GPU/rank 집합 하나로만 투영합니다. 같은 evidence ID의 digest나 결합이 달라지면 닫히고, 새 실패·진행 중 실행이 있는 exact 집합에서는 오래된 통과 결과를 사용하지 않습니다. 선택된 후보끼리 노드 또는 GPU UUID가 한 개라도 겹치면 동시에 선택할 수 없습니다. 관리자 추천 API는 평가 전체를 별도 콘텐츠 주소 행으로 멱등 저장하며 `show`는 저장 기록일 뿐 현재 유효성 보증이 아닙니다. 클라이언트는 계산 한도나 network zone을 입력해 점수를 조작할 수 없습니다.
+
+Fleet 수락은 저장 스냅샷의 콘텐츠 무결성을 먼저 확인하고, 전용 트랜잭션 잠금과 고정 인벤토리 행 잠금 안에서 레지스트리·인벤토리·qualification·task·operation·예약 입력으로 전체 추천을 다시 계산합니다. 선택된 각 후보는 `TP=1`, exact 노드·GPU index·GPU UUID·rank·STAGE/FULL identity와 전체 실행 plan 정규 digest가 생성 plan과 다시 일치해야 합니다. 모든 generation 1 배포와 활성 예약은 한 트랜잭션으로 생성되며, 일부만 성공한 Fleet는 허용하지 않습니다. 활성 노드와 GPU UUID에는 전역 조건부 unique 제약을 적용하고 Fleet 내부에도 노드·GPU·deployment/rank 중복 금지를 둡니다. 노드 UUID가 달라도 같은 GPU UUID를 보고하면 충돌로 취급하며 다른 단일 배포, qualification, benchmark, 캐시 격리와 무관한 task는 이 예약을 우회할 수 없습니다.
+
+추천 수락이 만드는 권한은 중앙 DB의 `CREATED` 배포, 배포별 runtime과 예약뿐입니다. Agent task, 자격 증명, 모델 다운로드, 이미지 pull, 컨테이너 실행·중지 또는 기존 서비스 변경 권한은 부여하지 않습니다. 상태 조회도 읽기 전용입니다. 실제 호스트 작업은 운영자가 별도의 Fleet prepare 또는 apply API를 호출한 경우에만 만들며 두 API는 빈 JSON 본문 외의 모델·노드·명령·Docker 옵션을 거부합니다.
+
+Fleet prepare는 서버 내부 runtime capability와 저장 후보를 결합해 기존 폐쇄형 준비기를 호출합니다. 수락 당시 plan을 현재 모델·런타임 레지스트리, 인벤토리, exact qualification 증적과 다시 비교하고 Fleet 자신의 정확한 예약만 자기 점유로 인정합니다. Fleet apply도 runtime에 연결된 준비 성공, 전체 예약 노드, exact `READY` 캐시와 최신 OCI digest 증적을 요구합니다. 기존 단일 배포 prepare·일반 task·rollout API로 Fleet 세대를 직접 실행하거나 runtime ID와 노드 부분집합을 클라이언트가 주입할 수 없습니다.
+
+일반 추천 수락은 Fleet 세대를 `previous_generation_id`로 받아 같은 계보를 확장할 수 없습니다. 평가 전 경계와 잠긴 계보의 권위 있는 경계가 모두 `FLEET_LINEAGE_EXTENSION_FORBIDDEN`을 강제하므로, Fleet runtime 밖의 일반 세대가 Fleet operation을 가로막는 혼합 계보를 만들 수 없습니다.
+
+각 배포는 하나의 current preparation과 current operation으로 펜싱됩니다. 적용은 `APPLY(전체 노드) → START_API(head) → VERIFY_API(head) → VERIFY(전체 노드)`의 폐쇄형 단계만 허용하고 과거 시도의 claim·완료·취소는 현재 상태를 바꾸지 못합니다. 한 배포의 준비·적용·검증 실패는 다른 배포의 권한을 넓히거나 자동 취소하지 않습니다. Dure는 실패 시 컨테이너를 자동 중지하거나 과거 세대로 롤백하지 않고, 노드·GPU 예약을 해제하거나 다른 후보로 재배치하지 않습니다. 이 보수적 경계는 운영자가 실제 호스트 상태를 조사하는 동안 중복 사용을 막지만, Fleet 전체 자동 복구나 서비스 연속성을 제공한다는 뜻은 아닙니다. 상세 목적 순서와 계산 한도, 수락·실행 경계는 [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md)를 참고합니다.
 
 ## 모델 레지스트리, 승격 게이트와 추천 수락의 경계
 
