@@ -994,6 +994,7 @@ class LockedChunkDownloader(Protocol):
         manifest_digest: str,
         chunk_digest: str,
         expected_size: int,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> str: ...
 
 
@@ -1452,6 +1453,8 @@ def _rename_noreplace(source: Path, target: Path) -> None:
 
 
 class ModelCachePreparer:
+    supports_progress_reporting = True
+
     def __init__(
         self,
         store: ContentAddressedModelStore,
@@ -2023,12 +2026,50 @@ class ModelCachePreparer:
         identity: CacheIdentity | StageCacheIdentity,
         manifest: dict,
         origin: object,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> PreparedModelCache:
+        if progress_callback is not None and not callable(progress_callback):
+            raise ModelStoreError("MODEL_STORE_INVALID")
         storage_digest = self._storage_digest(identity)
         with self.store.artifact_lock(storage_digest):
             completed_bytes = 0
             try:
                 parsed = self._validated_manifest(identity, manifest)
+                chunks = parsed.unique_chunks()
+                expected_download_bytes = sum(chunks.values())
+                chunk_high_water = {digest: 0 for digest in chunks}
+                total_high_water = 0
+
+                def report_chunk_progress(
+                    digest: str,
+                    bytes_complete: int,
+                    expected_size: int,
+                ) -> None:
+                    nonlocal total_high_water
+                    registered_size = chunks.get(digest)
+                    if (
+                        registered_size is None
+                        or expected_size != registered_size
+                        or type(bytes_complete) is not int
+                    ):
+                        return
+                    bounded = min(max(bytes_complete, 0), registered_size)
+                    previous = chunk_high_water[digest]
+                    if bounded <= previous:
+                        return
+                    chunk_high_water[digest] = bounded
+                    total_high_water += bounded - previous
+                    self._notify_progress(
+                        progress_callback,
+                        total_high_water,
+                        expected_download_bytes,
+                    )
+
+                self._notify_progress(
+                    progress_callback,
+                    0,
+                    expected_download_bytes,
+                )
                 final = self._cache_path(identity)
                 self.store.initialize()
                 if type(identity) is StageCacheIdentity:
@@ -2046,6 +2087,11 @@ class ModelCachePreparer:
                         _verify_cache_tree(final, parsed, identity)
                     except ModelStoreError as exc:
                         raise ModelStoreError("MODEL_STORE_TARGET_COLLISION") from exc
+                    self._notify_progress(
+                        progress_callback,
+                        expected_download_bytes,
+                        expected_download_bytes,
+                    )
                     self.store.write_attempt(
                         self._journal(
                             identity,
@@ -2067,7 +2113,6 @@ class ModelCachePreparer:
                     identity,
                 )
                 completed_bytes = staged_bytes
-                chunks = parsed.unique_chunks()
                 missing = 0 if staged_bytes == parsed.total_size_bytes else self._missing_chunk_bytes(chunks)
                 self._check_disk(
                     missing_chunk_bytes=missing,
@@ -2090,7 +2135,14 @@ class ModelCachePreparer:
                             manifest_digest=identity.manifest_digest,
                             chunk_digest=digest,
                             expected_size=size,
+                            progress_callback=report_chunk_progress,
                         )
+                else:
+                    self._notify_progress(
+                        progress_callback,
+                        expected_download_bytes,
+                        expected_download_bytes,
+                    )
 
                 self.store.write_attempt(
                     self._journal(identity, "ASSEMBLING", staged_bytes)
@@ -2133,12 +2185,26 @@ class ModelCachePreparer:
                 )
                 raise
 
+    @staticmethod
+    def _notify_progress(
+        progress_callback: Callable[[int, int], None] | None,
+        downloaded_bytes: int,
+        expected_bytes: int,
+    ) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(downloaded_bytes, expected_bytes)
+        except Exception:
+            return
+
     def prepare_full_snapshot(
         self,
         *,
         identity: CacheIdentity,
         manifest: dict,
         origin: object,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> PreparedModelCache:
         if (
             type(identity) is not CacheIdentity
@@ -2149,6 +2215,7 @@ class ModelCachePreparer:
             identity=identity,
             manifest=manifest,
             origin=origin,
+            progress_callback=progress_callback,
         )
 
     def prepare_stage(
@@ -2157,6 +2224,7 @@ class ModelCachePreparer:
         identity: StageCacheIdentity,
         manifest: dict,
         origin: object,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> PreparedModelCache:
         if type(identity) is not StageCacheIdentity:
             raise ModelStoreError("MODEL_STORE_CACHE_KIND_UNSUPPORTED")
@@ -2164,4 +2232,5 @@ class ModelCachePreparer:
             identity=identity,
             manifest=manifest,
             origin=origin,
+            progress_callback=progress_callback,
         )

@@ -12,7 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from .artifact_manifest import require_sha256_digest
 from .model_store import (
@@ -411,6 +411,7 @@ class ArtifactChunkDownloader:
         expected_size: int,
         descriptor: int,
         offset: int,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> int:
         headers = {
             "Accept": "application/octet-stream",
@@ -482,6 +483,12 @@ class ArtifactChunkDownloader:
                         raise ModelStoreError("MODEL_STORE_IO_FAILED")
                     view = view[written:]
                 received += len(block)
+                self._notify_progress(
+                    progress_callback,
+                    chunk_digest,
+                    offset + received,
+                    expected_size,
+                )
             if received != remaining:
                 raise ModelStoreError("MODEL_STORE_DOWNLOAD_INTERRUPTED")
             os.fsync(descriptor)
@@ -502,6 +509,27 @@ class ArtifactChunkDownloader:
                         "MODEL_STORE_DOWNLOAD_INTERRUPTED"
                     ) from None
 
+    @staticmethod
+    def _notify_progress(
+        progress_callback: Callable[[str, int, int], None] | None,
+        chunk_digest: str,
+        bytes_complete: int,
+        expected_size: int,
+    ) -> None:
+        """Publish bounded local telemetry without affecting cache integrity.
+
+        The callback is deliberately best-effort: losing operator telemetry
+        must not turn an otherwise valid immutable-cache write into a failed
+        model preparation.
+        """
+
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(chunk_digest, bytes_complete, expected_size)
+        except Exception:
+            return
+
     def download_chunk(
         self,
         *,
@@ -509,6 +537,7 @@ class ArtifactChunkDownloader:
         manifest_digest: str,
         chunk_digest: str,
         expected_size: int,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> str:
         try:
             require_sha256_digest(manifest_digest, field="manifest_digest")
@@ -520,6 +549,7 @@ class ArtifactChunkDownloader:
                 manifest_digest=manifest_digest,
                 chunk_digest=chunk_digest,
                 expected_size=expected_size,
+                progress_callback=progress_callback,
             )
 
     def download_chunk_locked(
@@ -529,10 +559,13 @@ class ArtifactChunkDownloader:
         manifest_digest: str,
         chunk_digest: str,
         expected_size: int,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> str:
         """Prepare one chunk while the caller holds the artifact lock."""
 
         if type(origin) is not TrustedHTTPSOrigin:
+            raise ModelStoreError("MODEL_STORE_INVALID")
+        if progress_callback is not None and not callable(progress_callback):
             raise ModelStoreError("MODEL_STORE_INVALID")
         try:
             require_sha256_digest(manifest_digest, field="manifest_digest")
@@ -564,6 +597,12 @@ class ArtifactChunkDownloader:
                 )
                 raise
             if existing is not None:
+                self._notify_progress(
+                    progress_callback,
+                    chunk_digest,
+                    expected_size,
+                    expected_size,
+                )
                 self.store.write_attempt(
                     self._journal(
                         manifest_digest,
@@ -593,6 +632,12 @@ class ArtifactChunkDownloader:
                     pass
                 raise
             try:
+                self._notify_progress(
+                    progress_callback,
+                    chunk_digest,
+                    offset,
+                    expected_size,
+                )
                 last_error: ModelStoreError | None = None
                 for attempt in range(self.attempts):
                     self.store.write_attempt(
@@ -606,6 +651,7 @@ class ArtifactChunkDownloader:
                                 expected_size,
                                 descriptor,
                                 offset,
+                                progress_callback,
                             )
                         try:
                             os.fsync(descriptor)
@@ -652,6 +698,12 @@ class ArtifactChunkDownloader:
                                         "MODEL_STORE_IO_FAILED"
                                     ) from reset_exc
                                 offset = 0
+                                self._notify_progress(
+                                    progress_callback,
+                                    chunk_digest,
+                                    offset,
+                                    expected_size,
+                                )
                         self.store.write_attempt(
                             self._journal(
                                 manifest_digest,

@@ -14,6 +14,132 @@ branch_labels = None
 depends_on = None
 
 
+_APPEND_ONLY_MESSAGE = "artifact_cache_events is append-only"
+_POSTGRESQL_GUARD_FUNCTION = "dure_artifact_cache_events_append_only_guard"
+_APPEND_ONLY_ROW_OPERATIONS = ("UPDATE", "DELETE")
+_SQLITE_NO_REPLACE_TRIGGER = "trg_artifact_cache_events_no_replace"
+_POSTGRESQL_NO_TRUNCATE_TRIGGER = (
+    "trg_artifact_cache_events_no_truncate"
+)
+
+
+def _append_only_guard_upgrade_sql(dialect_name: str) -> tuple[str, ...]:
+    if dialect_name == "sqlite":
+        row_guards = tuple(
+            f"""
+CREATE TRIGGER IF NOT EXISTS trg_artifact_cache_events_no_{operation.lower()}
+BEFORE {operation} ON artifact_cache_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, '{_APPEND_ONLY_MESSAGE}');
+END
+""".strip()
+            for operation in _APPEND_ONLY_ROW_OPERATIONS
+        )
+        # With SQLite's default recursive_triggers=OFF, INSERT OR REPLACE can
+        # delete a conflicting row without firing its DELETE trigger.  Reject
+        # every primary/replay-key collision before replacement is considered.
+        return row_guards + (
+            f"""
+CREATE TRIGGER IF NOT EXISTS {_SQLITE_NO_REPLACE_TRIGGER}
+BEFORE INSERT ON artifact_cache_events
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM artifact_cache_events AS existing
+    WHERE existing.id = NEW.id
+       OR (existing.cache_id = NEW.cache_id
+           AND existing.sequence = NEW.sequence)
+       OR (existing.cache_id = NEW.cache_id
+           AND existing.source_kind = NEW.source_kind
+           AND existing.source_id = NEW.source_id
+           AND existing.reason_code = NEW.reason_code)
+)
+BEGIN
+    SELECT RAISE(ABORT, '{_APPEND_ONLY_MESSAGE}');
+END
+""".strip(),
+        )
+    if dialect_name == "postgresql":
+        statements = [
+            f"""
+CREATE OR REPLACE FUNCTION {_POSTGRESQL_GUARD_FUNCTION}()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $dure$
+BEGIN
+    RAISE EXCEPTION '{_APPEND_ONLY_MESSAGE}'
+        USING ERRCODE = '23514';
+END;
+$dure$
+""".strip()
+        ]
+        for operation in _APPEND_ONLY_ROW_OPERATIONS:
+            trigger_name = (
+                f"trg_artifact_cache_events_no_{operation.lower()}"
+            )
+            statements.extend(
+                (
+                    f"DROP TRIGGER IF EXISTS {trigger_name} "
+                    "ON artifact_cache_events",
+                    f"""
+CREATE TRIGGER {trigger_name}
+BEFORE {operation} ON artifact_cache_events
+FOR EACH ROW
+EXECUTE FUNCTION {_POSTGRESQL_GUARD_FUNCTION}()
+""".strip(),
+                )
+            )
+        statements.extend(
+            (
+                f"DROP TRIGGER IF EXISTS "
+                f"{_POSTGRESQL_NO_TRUNCATE_TRIGGER} "
+                "ON artifact_cache_events",
+                f"""
+CREATE TRIGGER {_POSTGRESQL_NO_TRUNCATE_TRIGGER}
+BEFORE TRUNCATE ON artifact_cache_events
+FOR EACH STATEMENT
+EXECUTE FUNCTION {_POSTGRESQL_GUARD_FUNCTION}()
+""".strip(),
+            )
+        )
+        return tuple(statements)
+    raise RuntimeError(
+        "0010 append-only guard supports only SQLite and PostgreSQL, got: "
+        + dialect_name
+    )
+
+
+def _append_only_guard_downgrade_sql(dialect_name: str) -> tuple[str, ...]:
+    if dialect_name == "sqlite":
+        return ()
+    if dialect_name == "postgresql":
+        return (
+            "DROP FUNCTION IF EXISTS "
+            f"{_POSTGRESQL_GUARD_FUNCTION}()",
+        )
+    raise RuntimeError(
+        "0010 append-only guard supports only SQLite and PostgreSQL, got: "
+        + dialect_name
+    )
+
+
+def _execute_guard_sql(statements: tuple[str, ...]) -> None:
+    for statement in statements:
+        op.execute(sa.text(statement))
+
+
+def _install_append_only_guard() -> None:
+    _execute_guard_sql(
+        _append_only_guard_upgrade_sql(op.get_bind().dialect.name)
+    )
+
+
+def _remove_append_only_guard() -> None:
+    _execute_guard_sql(
+        _append_only_guard_downgrade_sql(op.get_bind().dialect.name)
+    )
+
+
 def _inspector():
     return sa.inspect(op.get_bind())
 
@@ -32,7 +158,25 @@ def _unique_names(table: str) -> set[str]:
     }
 
 
+def _column_names(table: str) -> set[str]:
+    if table not in _tables():
+        return set()
+    return {item["name"] for item in _inspector().get_columns(table)}
+
+
 def upgrade() -> None:
+    if (
+        "artifact_preparation_attempts" in _tables()
+        and "download_progress"
+        not in _column_names("artifact_preparation_attempts")
+    ):
+        with op.batch_alter_table("artifact_preparation_attempts") as batch:
+            batch.add_column(
+                sa.Column(
+                    "download_progress",
+                    sa.JSON(none_as_null=True),
+                )
+            )
     if (
         "stage_artifact_variants" in _tables()
         and "uq_stage_variant_set_source"
@@ -47,6 +191,7 @@ def upgrade() -> None:
         _create_node_artifact_caches()
     if "artifact_cache_events" not in _tables():
         _create_artifact_cache_events()
+    _install_append_only_guard()
 
 
 def _create_node_artifact_caches() -> None:
@@ -410,6 +555,7 @@ def _create_artifact_cache_events() -> None:
             "reason_code",
             name="uq_artifact_cache_events_source_replay",
         ),
+        sqlite_with_rowid=False,
     )
     op.create_index(
         "ix_artifact_cache_events_cache_created",
@@ -431,16 +577,71 @@ def _scalar_count(table: str) -> int:
     )
 
 
+def _destructive_downgrade_lock_sql(
+    dialect_name: str, tables: tuple[str, ...]
+) -> tuple[str, ...]:
+    if dialect_name == "sqlite":
+        return ()
+    if dialect_name == "postgresql":
+        return (
+            "LOCK TABLE "
+            + ", ".join(tables)
+            + " IN ACCESS EXCLUSIVE MODE",
+        ) if tables else ()
+    raise RuntimeError(
+        "0010 destructive downgrade supports only SQLite and PostgreSQL, got: "
+        + dialect_name
+    )
+
+
+def _lock_destructive_downgrade_inputs(tables: set[str]) -> None:
+    lockable = tuple(
+        table
+        for table in (
+            "artifact_preparation_attempts",
+            "node_artifact_caches",
+            "artifact_cache_events",
+        )
+        if table in tables
+    )
+    _execute_guard_sql(
+        _destructive_downgrade_lock_sql(
+            op.get_bind().dialect.name,
+            lockable,
+        )
+    )
+
+
 def _refuse_destructive_downgrade() -> None:
     tables = _tables()
+    _lock_destructive_downgrade_inputs(tables)
     populated = [
         table
         for table in ("artifact_cache_events", "node_artifact_caches")
         if table in tables and _scalar_count(table) > 0
     ]
+    if (
+        "artifact_preparation_attempts" in tables
+        and "download_progress"
+        in _column_names("artifact_preparation_attempts")
+        and int(
+            op.get_bind()
+            .execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM artifact_preparation_attempts "
+                    "WHERE download_progress IS NOT NULL "
+                    "AND CAST(download_progress AS TEXT) <> 'null'"
+                )
+            )
+            .scalar_one()
+        )
+        > 0
+    ):
+        populated.append("artifact_preparation_attempts.download_progress")
     if populated:
         raise RuntimeError(
-            "refusing to downgrade 0010 while artifact cache lifecycle data exists: "
+            "refusing to downgrade 0010 while artifact cache lifecycle "
+            "or download progress data exists: "
             + ", ".join(populated)
         )
 
@@ -450,8 +651,16 @@ def downgrade() -> None:
     tables = _tables()
     if "artifact_cache_events" in tables:
         op.drop_table("artifact_cache_events")
+    _remove_append_only_guard()
     if "node_artifact_caches" in tables:
         op.drop_table("node_artifact_caches")
+    if (
+        "artifact_preparation_attempts" in _tables()
+        and "download_progress"
+        in _column_names("artifact_preparation_attempts")
+    ):
+        with op.batch_alter_table("artifact_preparation_attempts") as batch:
+            batch.drop_column("download_progress")
     if (
         "stage_artifact_variants" in _tables()
         and "uq_stage_variant_set_source"

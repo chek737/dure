@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -286,6 +287,43 @@ class AgentPreparationTests(unittest.TestCase):
             manifest_loader=loader or (lambda task_id: copy.deepcopy(MANIFEST)),
         )
 
+    def test_agent_heartbeat_uses_only_closed_preparation_progress(self):
+        agent = object.__new__(Agent)
+
+        class ProgressExecutor:
+            @staticmethod
+            def preparation_progress(task_id):
+                self.assertEqual(task_id, TASK_ID)
+                return {"downloaded_bytes": 123}
+
+        agent.executor = ProgressExecutor()
+        self.assertEqual(
+            agent._task_heartbeat_payload(
+                TASK_ID,
+                is_preparation=True,
+            ),
+            {"progress": {"downloaded_bytes": 123}},
+        )
+        self.assertIsNone(
+            agent._task_heartbeat_payload(
+                TASK_ID,
+                is_preparation=False,
+            )
+        )
+
+    def test_task_executor_keeps_legacy_preparation_executor_compatible(self):
+        class LegacyPreparationExecutor:
+            @staticmethod
+            def execute(_task):
+                return {"ok": True}
+
+        executor = TaskExecutor(
+            NODE_ID,
+            preparation_executor=LegacyPreparationExecutor(),
+        )
+        self.assertIsNone(executor.preparation_progress(TASK_ID))
+        executor.clear_preparation_progress(TASK_ID)
+
     def test_model_task_uses_task_scoped_manifest_and_local_origin(self):
         preparer = FakeModelPreparer()
         loaded = []
@@ -470,6 +508,136 @@ class AgentPreparationTests(unittest.TestCase):
             ORIGIN.object_url(digest),
         )
         self.assertNotIn("url", task["payload"])
+        self.assertEqual(
+            executor.progress_snapshot(TASK_ID),
+            {"downloaded_bytes": len(config)},
+        )
+
+    def test_model_handler_exposes_live_chunk_high_water_without_identity_data(self):
+        first_block = 1024 * 1024
+        config = b'{"model_type":"dure-test"}'
+        weights = b"x" * (first_block + 128)
+        config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+        weights_digest = "sha256:" + hashlib.sha256(weights).hexdigest()
+        manifest = {
+            "schema_version": 1,
+            "files": [
+                {
+                    "path": "config.json",
+                    "kind": "REGULAR",
+                    "size_bytes": len(config),
+                    "sha256": config_digest,
+                    "chunks": [
+                        {
+                            "ordinal": 0,
+                            "offset_bytes": 0,
+                            "length_bytes": len(config),
+                            "sha256": config_digest,
+                        }
+                    ],
+                },
+                {
+                    "path": "model.safetensors",
+                    "kind": "REGULAR",
+                    "size_bytes": len(weights),
+                    "sha256": weights_digest,
+                    "chunks": [
+                        {
+                            "ordinal": 0,
+                            "offset_bytes": 0,
+                            "length_bytes": len(weights),
+                            "sha256": weights_digest,
+                        }
+                    ],
+                }
+            ],
+        }
+        task = model_task()
+        task["payload"]["manifest_digest"] = parse_artifact_manifest(
+            manifest
+        ).digest
+        blocked = threading.Event()
+        release = threading.Event()
+
+        class BlockingResponse(MemoryResponse):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.read_count = 0
+
+            def read(self, size):
+                self.read_count += 1
+                if self.read_count == 2:
+                    blocked.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release transport")
+                return super().read(size)
+
+        class BlockingTransport(MemoryTransport):
+            def open(self, origin, object_url, *, headers, timeout_seconds):
+                del origin, timeout_seconds
+                self.calls.append((object_url, dict(headers)))
+                digest = "sha256:" + object_url.rsplit("/", 1)[-1]
+                payload = self.objects[digest]
+                return (
+                    BlockingResponse(payload)
+                    if digest == weights_digest
+                    else MemoryResponse(payload)
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ContentAddressedModelStore(
+                store_root=root / "store",
+                model_root=root / "models",
+            )
+            preparer = ModelCachePreparer(
+                store,
+                ArtifactChunkDownloader(
+                    store,
+                    transport=BlockingTransport(
+                        {
+                            config_digest: config,
+                            weights_digest: weights,
+                        }
+                    ),
+                    attempts=1,
+                ),
+                disk_reserve_bytes=0,
+            )
+            executor = ArtifactPreparationExecutor(
+                NODE_ID,
+                origin=ORIGIN,
+                model_preparer=preparer,
+                manifest_loader=lambda task_id: copy.deepcopy(manifest),
+            )
+            errors = []
+
+            def execute():
+                try:
+                    executor.execute(task)
+                except Exception as exc:  # pragma: no cover - assertion below
+                    errors.append(exc)
+
+            worker = threading.Thread(target=execute)
+            worker.start()
+            self.assertTrue(blocked.wait(5))
+            live_bytes = executor.progress_snapshot(TASK_ID)[
+                "downloaded_bytes"
+            ]
+            self.assertIn(
+                live_bytes,
+                {first_block, first_block + len(config)},
+            )
+            self.assertNotIn("manifest_digest", executor.progress_snapshot(TASK_ID))
+            self.assertNotIn("url", executor.progress_snapshot(TASK_ID))
+            release.set()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                executor.progress_snapshot(TASK_ID),
+                {"downloaded_bytes": len(config) + len(weights)},
+            )
 
     def test_model_task_rejects_remote_origin_path_token_and_arbitrary_fields(self):
         forbidden = {

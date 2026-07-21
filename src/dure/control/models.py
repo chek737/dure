@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    DDL,
     DateTime,
     Float,
     ForeignKey,
@@ -18,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -1345,6 +1347,9 @@ class ArtifactPreparationAttempt(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     failure_code: Mapped[str | None] = mapped_column(String(64))
     result: Mapped[dict | None] = mapped_column(JSON)
+    download_progress: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -1704,6 +1709,11 @@ class ArtifactCacheEvent(Base):
             "ix_artifact_cache_events_source_task",
             "source_task_id",
         ),
+        # Eliminate SQLite's hidden rowid replacement key.  Together with the
+        # explicit replay-key INSERT guard, this prevents INSERT OR REPLACE
+        # from bypassing append-only DELETE protection on external SQLite
+        # connections where recursive_triggers may remain disabled.
+        {"sqlite_with_rowid": False},
     )
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
@@ -1738,6 +1748,115 @@ class ArtifactCacheEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE = (
+    "artifact_cache_events is append-only"
+)
+_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION = (
+    "dure_artifact_cache_events_append_only_guard"
+)
+
+
+def _register_artifact_cache_event_append_only_ddl() -> None:
+    """Install the same database guard for metadata-created test databases."""
+
+    table = ArtifactCacheEvent.__table__
+    for operation in ("UPDATE", "DELETE"):
+        trigger_name = f"trg_artifact_cache_events_no_{operation.lower()}"
+        event.listen(
+            table,
+            "after_create",
+            DDL(
+                f"""
+CREATE TRIGGER {trigger_name}
+BEFORE {operation} ON artifact_cache_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, '{_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE}');
+END
+"""
+            ).execute_if(dialect="sqlite"),
+        )
+    event.listen(
+        table,
+        "after_create",
+        DDL(
+            f"""
+CREATE TRIGGER trg_artifact_cache_events_no_replace
+BEFORE INSERT ON artifact_cache_events
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM artifact_cache_events AS existing
+    WHERE existing.id = NEW.id
+       OR (existing.cache_id = NEW.cache_id
+           AND existing.sequence = NEW.sequence)
+       OR (existing.cache_id = NEW.cache_id
+           AND existing.source_kind = NEW.source_kind
+           AND existing.source_id = NEW.source_id
+           AND existing.reason_code = NEW.reason_code)
+)
+BEGIN
+    SELECT RAISE(ABORT, '{_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE}');
+END
+"""
+        ).execute_if(dialect="sqlite"),
+    )
+
+    event.listen(
+        table,
+        "after_create",
+        DDL(
+            f"""
+CREATE OR REPLACE FUNCTION {_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $dure$
+BEGIN
+    RAISE EXCEPTION '{_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE}'
+        USING ERRCODE = '23514';
+END;
+$dure$
+"""
+        ).execute_if(dialect="postgresql"),
+    )
+    for operation in ("UPDATE", "DELETE"):
+        trigger_name = f"trg_artifact_cache_events_no_{operation.lower()}"
+        event.listen(
+            table,
+            "after_create",
+            DDL(
+                f"""
+CREATE TRIGGER {trigger_name}
+BEFORE {operation} ON artifact_cache_events
+FOR EACH ROW
+EXECUTE FUNCTION {_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()
+"""
+            ).execute_if(dialect="postgresql"),
+        )
+    event.listen(
+        table,
+        "after_create",
+        DDL(
+            f"""
+CREATE TRIGGER trg_artifact_cache_events_no_truncate
+BEFORE TRUNCATE ON artifact_cache_events
+FOR EACH STATEMENT
+EXECUTE FUNCTION {_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()
+"""
+        ).execute_if(dialect="postgresql"),
+    )
+    event.listen(
+        table,
+        "after_drop",
+        DDL(
+            "DROP FUNCTION IF EXISTS "
+            f"{_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()"
+        ).execute_if(dialect="postgresql"),
+    )
+
+
+_register_artifact_cache_event_append_only_ddl()
 
 
 class BenchmarkRun(Base):

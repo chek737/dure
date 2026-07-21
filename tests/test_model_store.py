@@ -789,13 +789,19 @@ class ModelStoreLockAndCASTests(unittest.TestCase):
             transport=NoNetworkTransport(),
             attempts=1,
         )
+        progress = []
         reused = downloader.download_chunk(
             origin=ORIGIN,
             manifest_digest=_digest(b"verified-manifest"),
             chunk_digest=chunk_digest,
             expected_size=len(payload),
+            progress_callback=lambda *values: progress.append(values),
         )
         self.assertEqual(Path(reused), published)
+        self.assertEqual(
+            progress,
+            [(chunk_digest, len(payload), len(payload))],
+        )
 
         published.write_bytes(b"X" * len(payload))
         with self.assertRaises(ModelStoreError) as caught:

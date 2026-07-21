@@ -498,6 +498,15 @@ class TaskExecutor:
         profile.node_id = self.node_id
         return profile
 
+    def preparation_progress(self, task_id: str) -> dict[str, int] | None:
+        reader = getattr(self.preparation_executor, "progress_snapshot", None)
+        return reader(task_id) if callable(reader) else None
+
+    def clear_preparation_progress(self, task_id: str) -> None:
+        clearer = getattr(self.preparation_executor, "clear_progress", None)
+        if callable(clearer):
+            clearer(task_id)
+
     def _deployment_task(self, task: dict, kind: TaskType):
         payload = task.get("payload")
         if type(payload) is not dict:
@@ -888,6 +897,21 @@ class Agent:
             raise ValueError("artifact manifest response is invalid")
         return response["manifest"]
 
+    def _task_heartbeat_payload(
+        self, task_id: str, *, is_preparation: bool
+    ) -> dict | None:
+        if not is_preparation:
+            return None
+        progress_reader = getattr(
+            self.executor,
+            "preparation_progress",
+            None,
+        )
+        progress = (
+            progress_reader(task_id) if callable(progress_reader) else None
+        )
+        return {"progress": progress} if progress is not None else None
+
     def stop(self, *_args) -> None:
         self.running = False
 
@@ -1078,7 +1102,15 @@ class Agent:
         def renew_lease() -> None:
             while not renewal_stop.wait(60):
                 try:
-                    self.client.request("POST", f"/v1/agent/tasks/{task_id}/heartbeat")
+                    heartbeat_payload = self._task_heartbeat_payload(
+                        task_id,
+                        is_preparation=is_preparation,
+                    )
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/heartbeat",
+                        heartbeat_payload,
+                    )
                 except APIError as exc:
                     LOG.warning("could not renew task %s lease: %s", task_id, exc)
 
@@ -1149,6 +1181,14 @@ class Agent:
         finally:
             renewal_stop.set()
             renewal.join(timeout=2)
+            if is_preparation:
+                progress_clearer = getattr(
+                    self.executor,
+                    "clear_preparation_progress",
+                    None,
+                )
+                if callable(progress_clearer):
+                    progress_clearer(task_id)
         return True
 
     def run(self, interval: float = 10) -> None:

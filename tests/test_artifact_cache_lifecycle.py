@@ -4,7 +4,8 @@ import unittest
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from dure.control.cache_lifecycle import (
     ArtifactCacheConflictError,
@@ -331,6 +332,87 @@ class ArtifactCacheLifecycleTests(unittest.TestCase):
             1,
         )
 
+    def test_append_only_event_rejects_orm_and_raw_mutation(self):
+        identity, attempt = self._full()
+        _cache, event, _changed = record_preparation_success(
+            self.session, attempt_id=attempt.id, identity=identity
+        )
+        self.session.commit()
+        event_id = event.id
+        original_source_id = event.source_id
+
+        with self.assertRaisesRegex(
+            OperationalError, "no such column: rowid"
+        ):
+            self.session.execute(
+                text(
+                    "SELECT rowid FROM artifact_cache_events "
+                    "WHERE id = :event_id"
+                ),
+                {"event_id": event_id},
+            )
+        self.session.rollback()
+
+        event.source_id = "orm-update-must-fail"
+        with self.assertRaisesRegex(IntegrityError, "append-only"):
+            self.session.commit()
+        self.session.rollback()
+
+        event = self.session.get(ArtifactCacheEvent, event_id)
+        self.assertIsNotNone(event)
+        self.session.delete(event)
+        with self.assertRaisesRegex(IntegrityError, "append-only"):
+            self.session.commit()
+        self.session.rollback()
+
+        with self.assertRaisesRegex(IntegrityError, "append-only"):
+            self.session.execute(
+                text(
+                    "UPDATE artifact_cache_events "
+                    "SET source_id = :source_id WHERE id = :event_id"
+                ),
+                {"source_id": "raw-update-must-fail", "event_id": event_id},
+            )
+        self.session.rollback()
+
+        with self.assertRaisesRegex(IntegrityError, "append-only"):
+            self.session.execute(
+                text(
+                    "INSERT OR REPLACE INTO artifact_cache_events ("
+                    "id, cache_id, sequence, previous_status, status, "
+                    "reason_code, source_kind, source_id, "
+                    "source_attempt_id, source_task_id, evidence_kind, "
+                    "evidence_digest, created_at) "
+                    "SELECT id, cache_id, sequence, previous_status, status, "
+                    "reason_code, source_kind, :source_id, "
+                    "source_attempt_id, source_task_id, evidence_kind, "
+                    "evidence_digest, created_at "
+                    "FROM artifact_cache_events WHERE id = :event_id"
+                ),
+                {
+                    "source_id": "raw-replace-must-fail",
+                    "event_id": event_id,
+                },
+            )
+        self.session.rollback()
+
+        with self.assertRaisesRegex(IntegrityError, "append-only"):
+            self.session.execute(
+                text("DELETE FROM artifact_cache_events WHERE id = :event_id"),
+                {"event_id": event_id},
+            )
+        self.session.rollback()
+
+        preserved = self.session.get(ArtifactCacheEvent, event_id)
+        self.assertIsNotNone(preserved)
+        self.assertEqual(preserved.source_id, original_source_id)
+        self.assertEqual(
+            self.session.scalar(
+                select(func.count()).select_from(ArtifactCacheEvent)
+            ),
+            1,
+        )
+
     def test_stale_unrecorded_attempt_cannot_create_or_replace_ready(self):
         identity, attempt = self._full()
         record = self.session.get(
@@ -438,6 +520,77 @@ class ArtifactCacheLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(cache.status, "CORRUPT")
         self.assertEqual(cache.reason_code, "PROBE_CORRUPT")
+
+    def test_older_or_equal_complete_probe_cannot_replace_newer_state_or_event(self):
+        identity, attempt = self._full()
+        cache, _event, _changed = record_preparation_success(
+            self.session, attempt_id=attempt.id, identity=identity
+        )
+        self.session.commit()
+        mismatch = ArtifactCacheObservation(
+            cache_kind="FULL_SNAPSHOT",
+            cache_identity_digest=identity.cache_identity_digest,
+            condition="IDENTITY_MISMATCH",
+            manifest_digest=_digest("9"),
+            verification_version=1,
+        )
+        corrupt = ArtifactCacheObservation(
+            cache_kind="FULL_SNAPSHOT",
+            cache_identity_digest=identity.cache_identity_digest,
+            condition="CORRUPT",
+        )
+        newest_at = self.now + timedelta(seconds=10)
+        newest = reconcile_probe_observations(
+            self.session,
+            node_id=self.node.id,
+            observations=[mismatch],
+            scan_complete=True,
+            source_id="newest-complete-scan",
+            observed_at=newest_at,
+        )
+        self.session.commit()
+        self.assertEqual(len(newest), 1)
+        self.assertEqual(cache.status, "STALE")
+        self.assertEqual(cache.reason_code, "PROBE_IDENTITY_MISMATCH")
+        newest_event_sequence = cache.event_sequence
+        newest_observed_at = cache.last_probe_observed_at
+        event_ids = tuple(
+            self.session.scalars(
+                select(ArtifactCacheEvent.id).order_by(ArtifactCacheEvent.sequence)
+            )
+        )
+
+        for source_id, observed_at in (
+            ("older-complete-scan", newest_at - timedelta(seconds=1)),
+            ("equal-complete-scan", newest_at),
+        ):
+            self.assertEqual(
+                reconcile_probe_observations(
+                    self.session,
+                    node_id=self.node.id,
+                    observations=[corrupt],
+                    scan_complete=True,
+                    source_id=source_id,
+                    observed_at=observed_at,
+                ),
+                [],
+            )
+        self.session.commit()
+
+        self.assertEqual(cache.status, "STALE")
+        self.assertEqual(cache.reason_code, "PROBE_IDENTITY_MISMATCH")
+        self.assertEqual(cache.event_sequence, newest_event_sequence)
+        self.assertEqual(cache.last_probe_observed_at, newest_observed_at)
+        self.assertEqual(
+            tuple(
+                self.session.scalars(
+                    select(ArtifactCacheEvent.id).order_by(
+                        ArtifactCacheEvent.sequence
+                    )
+                )
+            ),
+            event_ids,
+        )
 
     def test_probe_source_replay_rejects_changed_closed_evidence(self):
         identity, attempt = self._full()

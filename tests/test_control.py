@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import select
 
@@ -592,6 +593,70 @@ class ControlServiceTests(unittest.TestCase):
                 task.lease_until.replace(tzinfo=None),
                 current_lease.replace(tzinfo=None),
             )
+
+    def test_task_heartbeat_reads_time_after_bound_rows_are_locked(self):
+        with self.factory() as session:
+            node, _deployment = self.deployment(session)
+            create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.PROBE,
+                deployment_id=None,
+                options={},
+            )
+            task = claim_task(session, node.id)
+            before_wait = utcnow()
+            after_wait = before_wait + timedelta(seconds=10)
+            task.lease_until = before_wait + timedelta(seconds=5)
+            session.commit()
+
+            original_scalar = session.scalar
+            rows_locked = False
+
+            def scalar_after_wait(*args, **kwargs):
+                nonlocal rows_locked
+                value = original_scalar(*args, **kwargs)
+                rows_locked = True
+                return value
+
+            def observed_now():
+                return after_wait if rows_locked else before_wait
+
+            with patch.object(
+                session, "scalar", side_effect=scalar_after_wait
+            ), patch(
+                "dure.control.service.utcnow", side_effect=observed_now
+            ):
+                self.assertFalse(extend_task(session, task, node.id))
+
+            session.refresh(task)
+            self.assertEqual(
+                task.lease_until.replace(tzinfo=None),
+                (before_wait + timedelta(seconds=5)).replace(tzinfo=None),
+            )
+
+    def test_task_heartbeat_refreshes_revoked_node_before_extension(self):
+        with self.factory() as session:
+            node, _deployment = self.deployment(session)
+            create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.PROBE,
+                deployment_id=None,
+                options={},
+            )
+            task = claim_task(session, node.id)
+            self.assertTrue(node.approved)
+
+            with self.factory() as revoking_session:
+                revoked = revoking_session.get(type(node), node.id)
+                revoked.approved = False
+                revoking_session.commit()
+
+            self.assertTrue(node.approved)
+            self.assertFalse(extend_task(session, task, node.id))
+            session.refresh(node)
+            self.assertFalse(node.approved)
 
     def test_overlapping_lineages_cannot_activate_on_the_same_node(self):
         with self.factory() as session:

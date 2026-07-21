@@ -152,11 +152,22 @@ class BenchmarkTaskAPITests(unittest.TestCase):
     def test_apply_requires_exact_true_and_creates_one_closed_task(self):
         node, release, placement, _ = self.fixture("apply")
         body = _request(node, release, placement)
+        unsupported_backend = self.prepare(
+            {**body, "backend": "VLLM_RAY_PP_V1"}
+        )
+        self.assertEqual(unsupported_backend.status_code, 422)
         run = self.prepare(body).json()["benchmark_run"]
 
         self.assertEqual(self.apply(body["request_id"], {"apply": False}).status_code, 422)
         self.assertEqual(
             self.apply(body["request_id"], {"apply": True, "command": "id"}).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.apply(
+                body["request_id"],
+                {"apply": True, "backend": "VLLM_RAY_PP_V1"},
+            ).status_code,
             422,
         )
         first = self.apply(body["request_id"])

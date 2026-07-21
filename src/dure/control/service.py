@@ -2641,11 +2641,20 @@ def claim_task(session: Session, node_id: str, lease_seconds: int = 300) -> Task
         raise
 
 
-def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int = 300) -> bool:
-    now = utcnow()
+def extend_task(
+    session: Session,
+    task: Task,
+    node_id: str,
+    lease_seconds: int = 300,
+    *,
+    progress: dict | None = None,
+) -> bool:
     try:
         node = session.scalar(
-            select(Node).where(Node.id == node_id).with_for_update()
+            select(Node)
+            .where(Node.id == node_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         locked_task = session.scalar(
             select(Task)
@@ -2655,11 +2664,11 @@ def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int =
         )
         if (
             node is None
+            or not node.approved
             or locked_task is None
             or locked_task.node_id != node_id
             or locked_task.status != TaskStatus.RUNNING.value
             or aware(locked_task.lease_until) is None
-            or aware(locked_task.lease_until) < now
         ):
             session.rollback()
             return False
@@ -2692,11 +2701,24 @@ def extend_task(session: Session, task: Task, node_id: str, lease_seconds: int =
         }:
             from .preparation import extend_preparation_task
 
-            if not node.approved or not extend_preparation_task(
-                session, locked_task, node_id
+            if not extend_preparation_task(
+                session,
+                locked_task,
+                node_id,
+                progress=progress,
             ):
                 session.rollback()
                 return False
+        elif progress is not None:
+            session.rollback()
+            return False
+        # The node, task and any bound operation/preparation rows may all have
+        # blocked on locks.  Read the clock only after those locks are held so
+        # an already expired lease cannot be revived with a stale timestamp.
+        now = utcnow()
+        if aware(locked_task.lease_until) < now:
+            session.rollback()
+            return False
         locked_task.lease_until = now + timedelta(seconds=lease_seconds)
         node.last_seen = now
         session.commit()

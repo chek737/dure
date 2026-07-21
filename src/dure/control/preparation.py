@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -41,7 +41,9 @@ from .cache_lifecycle import (
     require_ready_cache,
 )
 from .models import (
+    ArtifactFileChunk,
     ArtifactManifest,
+    ArtifactManifestFile,
     ArtifactPreparation,
     ArtifactPreparationAttempt,
     ArtifactPreparationNode,
@@ -81,6 +83,21 @@ PREPARATION_TERMINAL_FAILURE_CODES = frozenset(
         "PREPARATION_NODE_REVOKED",
         "PREPARATION_RESULT_REJECTED",
     }
+)
+
+# Terminal verified bytes and best-effort download high-water have different
+# trust semantics.  Keep both sources explicit so API consumers never mistake
+# progress telemetry for completed immutable-manifest verification.
+PREPARATION_PROGRESS_BYTES_SOURCE = "COMPLETED_MODEL_VERIFICATION"
+PREPARATION_DOWNLOAD_BYTES_SOURCE = "MODEL_PREPARATION_HIGH_WATER"
+PREPARATION_DOWNLOAD_BYTES_DERIVED_SOURCE = (
+    "DERIVED_FROM_COMPLETED_MODEL_VERIFICATION"
+)
+PREPARATION_DOWNLOAD_BYTES_NOT_STARTED_SOURCE = "NOT_STARTED"
+PREPARATION_DOWNLOAD_BYTES_UNAVAILABLE_SOURCE = "UNAVAILABLE"
+PREPARATION_DOWNLOAD_BYTES_MIXED_SOURCE = "MIXED"
+PREPARATION_PROGRESS_STAGES = frozenset(
+    {"MODEL", "IMAGE", "COMPLETE", "FAILED"}
 )
 
 _SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$")
@@ -1180,6 +1197,7 @@ def _queue_attempt(
     record: ArtifactPreparationNode,
     *,
     stage: str,
+    download_expected_bytes: int | None = None,
 ) -> Task:
     if stage == "MODEL":
         record.model_current_attempt += 1
@@ -1208,7 +1226,23 @@ def _queue_attempt(
         attempt_no=attempt_no,
         task_id=task.id,
         status="QUEUED",
+        download_progress=(
+            {
+                "downloaded_bytes": 0,
+                "expected_bytes": download_expected_bytes,
+            }
+            if stage == "MODEL"
+            and type(download_expected_bytes) is int
+            and download_expected_bytes > 0
+            else None
+        ),
     )
+    if stage == "MODEL" and attempt.download_progress is None:
+        raise ArtifactPreparationError(
+            "preparation manifest has no downloadable chunks",
+            code="PREPARATION_MANIFEST_UNAVAILABLE",
+            details={"manifest_digest": record.model_manifest_digest},
+        )
     task.payload = _task_payload(
         preparation, record, attempt, stage=stage
     )
@@ -1298,8 +1332,31 @@ def _queue_for_apply(
         if record.model_status in {"PREPARED", "FAILED"}
     ]
     if model_records:
+        expected_by_manifest: dict[str, int] = {}
+        for record in model_records:
+            if record.model_manifest_digest not in expected_by_manifest:
+                expected = _manifest_download_bytes(
+                    session, record.model_manifest_digest
+                )
+                if expected is None:
+                    raise ArtifactPreparationError(
+                        "preparation manifest has no downloadable chunks",
+                        code="PREPARATION_MANIFEST_UNAVAILABLE",
+                        details={
+                            "manifest_digest": record.model_manifest_digest
+                        },
+                    )
+                expected_by_manifest[record.model_manifest_digest] = expected
         tasks.extend(
-            _queue_attempt(session, preparation, record, stage="MODEL")
+            _queue_attempt(
+                session,
+                preparation,
+                record,
+                stage="MODEL",
+                download_expected_bytes=expected_by_manifest[
+                    record.model_manifest_digest
+                ],
+            )
             for record in model_records
         )
     else:
@@ -1614,6 +1671,79 @@ def get_artifact_preparation(
     return preparation
 
 
+def _preparation_node_stage(record: ArtifactPreparationNode) -> str:
+    """Project one node onto the closed operator-facing preparation stages."""
+
+    if "FAILED" in {record.model_status, record.image_status}:
+        return "FAILED"
+    if record.model_status != "SUCCEEDED":
+        return "MODEL"
+    if record.image_status != "SUCCEEDED":
+        return "IMAGE"
+    return "COMPLETE"
+
+
+def _preparation_stage(
+    preparation: ArtifactPreparation,
+    node_progress: list[dict[str, Any]],
+) -> str:
+    """Return the earliest unfinished gate, or a terminal closed stage."""
+
+    if preparation.status in {"FAILED", "PARTIAL_FAILED"}:
+        return "FAILED"
+    stages = [item["stage"] for item in node_progress]
+    if "FAILED" in stages:
+        return "FAILED"
+    if stages and all(stage == "COMPLETE" for stage in stages):
+        return "COMPLETE"
+    # MODEL takes precedence while nodes are progressing concurrently because
+    # every deployment still depends on the earliest unfinished gate.
+    if "MODEL" in stages:
+        return "MODEL"
+    if "IMAGE" in stages:
+        return "IMAGE"
+    return "FAILED"
+
+
+def _attempt_progress(
+    *,
+    status: str,
+    current_attempt: int,
+    failure_code: str | None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "current_attempt": current_attempt,
+        "retry_count": max(current_attempt - 1, 0),
+        "failure_code": failure_code,
+    }
+
+
+def _manifest_download_bytes(
+    session: Session, manifest_digest: str
+) -> int | None:
+    """Return distinct immutable chunk bytes, excluding duplicate references."""
+
+    distinct_chunks = (
+        select(
+            ArtifactFileChunk.chunk_digest,
+            ArtifactFileChunk.length_bytes,
+        )
+        .join(
+            ArtifactManifestFile,
+            ArtifactManifestFile.id == ArtifactFileChunk.file_id,
+        )
+        .where(ArtifactManifestFile.manifest_digest == manifest_digest)
+        .distinct()
+        .subquery()
+    )
+    expected = session.scalar(
+        select(func.sum(distinct_chunks.c.length_bytes))
+    )
+    expected = int(expected) if expected is not None else 0
+    return expected if expected > 0 else None
+
+
 def artifact_preparation_detail(
     session: Session, preparation: ArtifactPreparation
 ) -> dict[str, Any]:
@@ -1637,7 +1767,17 @@ def artifact_preparation_detail(
     attempts_by_node: dict[str, list[dict[str, Any]]] = {
         record.id: [] for record in records
     }
+    attempts_by_identity: dict[
+        tuple[str, str, int], ArtifactPreparationAttempt
+    ] = {}
     for attempt in attempts:
+        attempts_by_identity[
+            (
+                attempt.preparation_node_id,
+                attempt.stage,
+                attempt.attempt_no,
+            )
+        ] = attempt
         attempts_by_node[attempt.preparation_node_id].append(
             {
                 "id": attempt.id,
@@ -1647,11 +1787,186 @@ def artifact_preparation_detail(
                 "status": attempt.status,
                 "failure_code": attempt.failure_code,
                 "result": attempt.result,
+                "download_progress": attempt.download_progress,
                 "created_at": _iso(attempt.created_at),
                 "updated_at": _iso(attempt.updated_at),
                 "completed_at": _iso(attempt.completed_at),
             }
         )
+    manifest_digests = {
+        record.model_manifest_digest for record in records
+    }
+    manifests = {
+        manifest.digest: manifest
+        for manifest in session.scalars(
+            select(ArtifactManifest).where(
+                ArtifactManifest.digest.in_(manifest_digests)
+            )
+        )
+    }
+    download_bytes_by_manifest = {
+        digest: _manifest_download_bytes(session, digest)
+        for digest in manifest_digests
+    }
+    node_progress: list[dict[str, Any]] = []
+    for record in records:
+        manifest = manifests.get(record.model_manifest_digest)
+        expected_bytes = (
+            manifest.total_size_bytes if manifest is not None else None
+        )
+        download_expected_bytes = download_bytes_by_manifest[
+            record.model_manifest_digest
+        ]
+        current_model_attempt = attempts_by_identity.get(
+            (record.id, "MODEL", record.model_current_attempt)
+        )
+        model_result = (
+            current_model_attempt.result
+            if current_model_attempt is not None
+            and current_model_attempt.status == "SUCCEEDED"
+            and record.model_status == "SUCCEEDED"
+            and type(current_model_attempt.result) is dict
+            else None
+        )
+        result_bytes = (
+            model_result.get("bytes_verified")
+            if model_result is not None
+            else None
+        )
+        verified_bytes = result_bytes if type(result_bytes) is int else 0
+        raw_download_progress = (
+            current_model_attempt.download_progress
+            if current_model_attempt is not None
+            else None
+        )
+        valid_download_progress = (
+            raw_download_progress
+            if type(raw_download_progress) is dict
+            and set(raw_download_progress)
+            == {"downloaded_bytes", "expected_bytes"}
+            and type(raw_download_progress.get("downloaded_bytes")) is int
+            and type(raw_download_progress.get("expected_bytes")) is int
+            and raw_download_progress["expected_bytes"]
+            == download_expected_bytes
+            and 0
+            <= raw_download_progress["downloaded_bytes"]
+            <= raw_download_progress["expected_bytes"]
+            else None
+        )
+        if current_model_attempt is None:
+            downloaded_bytes = 0
+            download_bytes_source = (
+                PREPARATION_DOWNLOAD_BYTES_NOT_STARTED_SOURCE
+            )
+        elif valid_download_progress is not None:
+            downloaded_bytes = valid_download_progress["downloaded_bytes"]
+            download_bytes_source = PREPARATION_DOWNLOAD_BYTES_SOURCE
+        elif model_result is not None and download_expected_bytes is not None:
+            # Pre-0010 successful attempts have no progress JSON, but their
+            # already validated immutable result proves all manifest chunks
+            # were locally available at terminal verification.
+            downloaded_bytes = download_expected_bytes
+            download_bytes_source = (
+                PREPARATION_DOWNLOAD_BYTES_DERIVED_SOURCE
+            )
+        else:
+            downloaded_bytes = None
+            download_bytes_source = (
+                PREPARATION_DOWNLOAD_BYTES_UNAVAILABLE_SOURCE
+            )
+        model_progress = _attempt_progress(
+            status=record.model_status,
+            current_attempt=record.model_current_attempt,
+            failure_code=record.model_failure_code,
+        )
+        image_progress = _attempt_progress(
+            status=record.image_status,
+            current_attempt=record.image_current_attempt,
+            failure_code=record.image_failure_code,
+        )
+        stage = _preparation_node_stage(record)
+        if stage not in PREPARATION_PROGRESS_STAGES:  # pragma: no cover
+            raise AssertionError("invalid preparation progress stage")
+        node_progress.append(
+            {
+                "node_id": record.node_id,
+                "expected_bytes": expected_bytes,
+                "verified_bytes": verified_bytes,
+                "bytes_source": PREPARATION_PROGRESS_BYTES_SOURCE,
+                "downloaded_bytes": downloaded_bytes,
+                "download_expected_bytes": download_expected_bytes,
+                "download_bytes_source": download_bytes_source,
+                "stage": stage,
+                "retrying": any(
+                    item["retry_count"] > 0
+                    and item["status"] in {"QUEUED", "RUNNING"}
+                    for item in (model_progress, image_progress)
+                ),
+                "model": model_progress,
+                "image": image_progress,
+            }
+        )
+    expected_values = [item["expected_bytes"] for item in node_progress]
+    expected_bytes = (
+        sum(expected_values)
+        if all(type(value) is int for value in expected_values)
+        else None
+    )
+    overall_stage = _preparation_stage(preparation, node_progress)
+    if overall_stage not in PREPARATION_PROGRESS_STAGES:  # pragma: no cover
+        raise AssertionError("invalid preparation progress stage")
+    progress = {
+        "expected_bytes": expected_bytes,
+        "verified_bytes": sum(
+            item["verified_bytes"] for item in node_progress
+        ),
+        "bytes_source": PREPARATION_PROGRESS_BYTES_SOURCE,
+        "downloaded_bytes": (
+            sum(item["downloaded_bytes"] for item in node_progress)
+            if all(
+                type(item["downloaded_bytes"]) is int
+                for item in node_progress
+            )
+            else None
+        ),
+        "download_expected_bytes": (
+            sum(item["download_expected_bytes"] for item in node_progress)
+            if all(
+                type(item["download_expected_bytes"]) is int
+                for item in node_progress
+            )
+            else None
+        ),
+        "download_bytes_source": (
+            next(
+                iter(
+                    {
+                        item["download_bytes_source"]
+                        for item in node_progress
+                    }
+                )
+            )
+            if len(
+                {
+                    item["download_bytes_source"]
+                    for item in node_progress
+                }
+            )
+            == 1
+            else PREPARATION_DOWNLOAD_BYTES_MIXED_SOURCE
+        ),
+        "stage": overall_stage,
+        "retrying": any(item["retrying"] for item in node_progress),
+        "model_retry_count": sum(
+            item["model"]["retry_count"] for item in node_progress
+        ),
+        "image_retry_count": sum(
+            item["image"]["retry_count"] for item in node_progress
+        ),
+    }
+    progress_by_node = {
+        item["node_id"]: item for item in node_progress
+    }
     return {
         "id": preparation.id,
         "request_id": preparation.request_id,
@@ -1662,6 +1977,7 @@ def artifact_preparation_detail(
         "created_at": _iso(preparation.created_at),
         "updated_at": _iso(preparation.updated_at),
         "completed_at": _iso(preparation.completed_at),
+        "progress": progress,
         "nodes": [
             {
                 "id": record.id,
@@ -1676,6 +1992,7 @@ def artifact_preparation_detail(
                 "image_failure_code": record.image_failure_code,
                 "created_at": _iso(record.created_at),
                 "updated_at": _iso(record.updated_at),
+                "progress": progress_by_node[record.node_id],
                 "attempts": attempts_by_node[record.id],
             }
             for record in records
@@ -1772,12 +2089,16 @@ def claim_preparation_task(
 
 
 def extend_preparation_task(
-    session: Session, task: Task, node_id: str
+    session: Session,
+    task: Task,
+    node_id: str,
+    *,
+    progress: dict[str, Any] | None = None,
 ) -> bool:
     if task.type not in PREPARATION_TASK_TYPES:
         return True
     attempt, record, preparation = _bound_attempt(session, task, lock=True)
-    return bool(
+    current = bool(
         attempt
         and record
         and preparation
@@ -1786,6 +2107,63 @@ def extend_preparation_task(
         and attempt.status == "RUNNING"
         and _attempt_is_current(task, attempt, record, preparation)
     )
+    if not current:
+        return False
+    if progress is None:
+        return True
+    if (
+        task.type != PREPARE_MODEL_TASK
+        or attempt.stage != "MODEL"
+        or type(progress) is not dict
+        or set(progress) != {"downloaded_bytes"}
+        or type(progress.get("downloaded_bytes")) is not int
+        or progress["downloaded_bytes"] < 0
+    ):
+        return False
+    previous = attempt.download_progress
+    stored_expected = (
+        previous.get("expected_bytes")
+        if type(previous) is dict
+        and set(previous) == {"downloaded_bytes", "expected_bytes"}
+        and type(previous.get("downloaded_bytes")) is int
+        and type(previous.get("expected_bytes")) is int
+        and previous["expected_bytes"] > 0
+        and 0 <= previous["downloaded_bytes"] <= previous["expected_bytes"]
+        else None
+    )
+    expected_bytes = (
+        stored_expected
+        if stored_expected is not None
+        else _manifest_download_bytes(session, record.model_manifest_digest)
+    )
+    if (
+        expected_bytes is None
+        or progress["downloaded_bytes"] > expected_bytes
+    ):
+        return False
+    if previous is None:
+        previous_bytes = 0
+    elif (
+        type(previous) is dict
+        and set(previous) == {"downloaded_bytes", "expected_bytes"}
+        and type(previous.get("downloaded_bytes")) is int
+        and previous.get("expected_bytes") == expected_bytes
+        and 0 <= previous["downloaded_bytes"] <= expected_bytes
+    ):
+        previous_bytes = previous["downloaded_bytes"]
+    else:
+        return False
+    high_water = max(previous_bytes, progress["downloaded_bytes"])
+    if previous is None or high_water != previous_bytes:
+        now = utcnow()
+        attempt.download_progress = {
+            "downloaded_bytes": high_water,
+            "expected_bytes": expected_bytes,
+        }
+        attempt.updated_at = now
+        record.updated_at = now
+        preparation.updated_at = now
+    return True
 
 
 def _task_wire(task: Task) -> dict[str, Any]:
@@ -1917,6 +2295,24 @@ def finish_preparation_task(
                 code=failure_code,
                 details={"task_id": locked_task.id},
             )
+
+    if failure_code is None and attempt.stage == "MODEL":
+        expected_download_bytes = _manifest_download_bytes(
+            session, record.model_manifest_digest
+        )
+        if expected_download_bytes is None:  # pragma: no cover - manifest gate
+            failure_code = "PREPARATION_RESULT_REJECTED"
+            validated_result = None
+            result_rejection = ArtifactPreparationError(
+                "preparation manifest has no downloadable chunks",
+                code=failure_code,
+                details={"task_id": locked_task.id},
+            )
+        else:
+            attempt.download_progress = {
+                "downloaded_bytes": expected_download_bytes,
+                "expected_bytes": expected_download_bytes,
+            }
 
     locked_task.status = (
         TaskStatus.FAILED.value

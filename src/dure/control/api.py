@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dure import __version__
+from dure.model_store import MAX_TRACKED_BYTES
 from dure.task import MAX_BENCHMARK_INTEGER
 
 from .db import Base, make_engine, make_session_factory, session_dependency
@@ -192,6 +193,14 @@ class TaskComplete(StrictBody):
 
 class TaskFail(StrictBody):
     error: str = Field(min_length=1, max_length=8192)
+
+
+class TaskHeartbeatProgress(StrictBody):
+    downloaded_bytes: int = Field(ge=0, le=MAX_TRACKED_BYTES)
+
+
+class TaskHeartbeat(StrictBody):
+    progress: TaskHeartbeatProgress | None = None
 
 
 class ModelArtifactCreate(StrictBody):
@@ -821,9 +830,24 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         return {"task": _task_dict(task) if task else None}
 
     @app.post("/v1/agent/tasks/{task_id}/heartbeat")
-    def agent_task_heartbeat(task_id: str, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
+    def agent_task_heartbeat(
+        task_id: str,
+        body: TaskHeartbeat | None = None,
+        node: Node = Depends(node_auth),
+        session: Session = Depends(get_session),
+    ):
         task = session.get(Task, task_id)
-        if task is None or not extend_task(session, task, node.id):
+        progress = (
+            body.progress.model_dump()
+            if body is not None and body.progress is not None
+            else None
+        )
+        if task is None or not extend_task(
+            session,
+            task,
+            node.id,
+            progress=progress,
+        ):
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be extended")
         return {"ok": True, "lease_until": task.lease_until}
 

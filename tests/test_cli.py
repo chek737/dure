@@ -582,25 +582,99 @@ class DeploymentGenerationCLITests(unittest.TestCase):
             },
         )
 
-    def test_preparation_reads_the_operation_detail_endpoint(self):
-        FakeJSONClient.response = {
-            "preparation": {"id": "preparation-1", "status": "RUNNING"}
-        }
-
-        result, output = self.run_cli(
-            self.command("preparation", "preparation-1")
+    def test_preparation_preserves_success_partial_and_retry_progress_json(self):
+        cases = (
+            ("SUCCEEDED", "COMPLETE", 40, False, 0, "SUCCEEDED"),
+            ("PARTIAL_FAILED", "FAILED", 20, False, 0, "FAILED"),
+            ("QUEUED", "MODEL", 20, True, 1, "QUEUED"),
         )
+        for (
+            status,
+            stage,
+            verified_bytes,
+            retrying,
+            retry_count,
+            model_status,
+        ) in cases:
+            with self.subTest(status=status):
+                FakeJSONClient.calls = []
+                FakeJSONClient.response = {
+                    "preparation": {
+                        "id": "preparation-1",
+                        "status": status,
+                        "progress": {
+                            "expected_bytes": 40,
+                            "verified_bytes": verified_bytes,
+                            "bytes_source": "COMPLETED_MODEL_VERIFICATION",
+                            "stage": stage,
+                            "retrying": retrying,
+                            "model_retry_count": retry_count,
+                            "image_retry_count": 0,
+                        },
+                        "nodes": [
+                            {
+                                "node_id": "node-1",
+                                "progress": {
+                                    "expected_bytes": 40,
+                                    "verified_bytes": verified_bytes,
+                                    "bytes_source": (
+                                        "COMPLETED_MODEL_VERIFICATION"
+                                    ),
+                                    "stage": stage,
+                                    "retrying": retrying,
+                                    "model": {
+                                        "status": model_status,
+                                        "current_attempt": retry_count + 1,
+                                        "retry_count": retry_count,
+                                        "failure_code": (
+                                            "MODEL_STORE_DOWNLOAD_TIMEOUT"
+                                            if model_status == "FAILED"
+                                            else None
+                                        ),
+                                    },
+                                    "image": {
+                                        "status": (
+                                            "SUCCEEDED"
+                                            if stage == "COMPLETE"
+                                            else "PREPARED"
+                                        ),
+                                        "current_attempt": (
+                                            1 if stage == "COMPLETE" else 0
+                                        ),
+                                        "retry_count": 0,
+                                        "failure_code": None,
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                }
 
-        self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output), FakeJSONClient.response)
-        self.assertEqual(
-            FakeJSONClient.calls[-1][2:],
-            (
-                "GET",
-                "/v1/admin/deployment-preparations/preparation-1",
-                None,
-            ),
-        )
+                result, output = self.run_cli(
+                    self.command("preparation", "preparation-1")
+                )
+
+                self.assertEqual(result, 0)
+                self.assertEqual(json.loads(output), FakeJSONClient.response)
+                rendered = json.loads(output)["preparation"]
+                self.assertEqual(rendered["progress"]["stage"], stage)
+                self.assertEqual(
+                    rendered["progress"]["verified_bytes"], verified_bytes
+                )
+                self.assertEqual(
+                    rendered["nodes"][0]["progress"]["model"][
+                        "retry_count"
+                    ],
+                    retry_count,
+                )
+                self.assertEqual(
+                    FakeJSONClient.calls[-1][2:],
+                    (
+                        "GET",
+                        "/v1/admin/deployment-preparations/preparation-1",
+                        None,
+                    ),
+                )
 
     def test_prepare_rejects_a_missing_or_noncanonical_request_id(self):
         invalid_commands = (
