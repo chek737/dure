@@ -665,6 +665,36 @@ class DeploymentRolloutTests(unittest.TestCase):
                 ),
                 0,
             )
+
+    def test_rollback_rejects_type_confused_legacy_topology(self) -> None:
+        with self.factory() as session:
+            self._node(session, NODE_A)
+            _target, source = self._lineage(session, [NODE_A])
+            source_plan = dict(source.plan)
+            source_plan["assignments"] = [
+                dict(item) for item in source.plan["assignments"]
+            ]
+            # Python considers False == 0.  Stored JSON topology comparison
+            # must still fail closed when the wire types differ.
+            source_plan["assignments"][0]["gpu_index"] = False
+            source.plan = source_plan
+            session.commit()
+
+            with self.assertRaises(DeploymentRolloutError) as context:
+                prepare_or_apply_rollback(
+                    session, source.id, [NODE_A], apply=True, serve=False
+                )
+
+            self.assertEqual(
+                context.exception.code, "ROLLBACK_TOPOLOGY_UNSUPPORTED"
+            )
+            session.rollback()
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(DeploymentOperation)
+                ),
+                0,
+            )
             self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
 
     def test_multiple_prepares_are_allowed_but_only_one_can_be_applied(self) -> None:

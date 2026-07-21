@@ -228,18 +228,30 @@ def _plan_assignments(
         )
     signature: list[tuple[Any, ...]] = []
     node_ids: list[str] = []
-    required = (
+    assignment_topology_fields = (
         "node_id",
         "gpu_index",
         "rank",
         "pipeline_rank",
-        "layer_start",
-        "layer_end",
         "role",
     )
+    if strict_ray:
+        assignment_topology_fields += (
+            "expected_runtime_rank",
+            "runtime_address",
+        )
+    else:
+        # Legacy plans use the declared layer range as part of their runtime
+        # partition.  The strict vLLM backend validates each generation's
+        # model-specific range independently; across generations only the
+        # node/rank/runtime placement is topology.
+        assignment_topology_fields += (
+            "layer_start",
+            "layer_end",
+        )
     for assignment in assignments:
         if type(assignment) is not dict or any(
-            field not in assignment for field in required
+            field not in assignment for field in assignment_topology_fields
         ):
             raise DeploymentRolloutError(
                 "deployment assignment topology is invalid",
@@ -252,11 +264,18 @@ def _plan_assignments(
                 code="ROLLBACK_PLAN_INVALID",
             )
         node_ids.append(node_id)
+        # Compare only the host/runtime topology across generations.  Model
+        # and STAGE identities (for example rank manifest and tensor-key
+        # digests) belong to the independently validated target artifact and
+        # must be allowed to differ during rollback.
         signature.append(
             (
                 node_id,
                 json.dumps(
-                    assignment,
+                    {
+                        field: assignment[field]
+                        for field in assignment_topology_fields
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
@@ -276,10 +295,12 @@ def _plan_assignments(
         "network_interface",
     )
     if strict_ray:
+        # Cache delivery kind is an artifact contract, not a runtime topology
+        # coordinate.  Each plan validates it independently and rollback gates
+        # the target's exact READY cache before any target start.
         topology_fields += (
             "execution_backend",
             "runtime_vllm_version",
-            "model_cache_kind",
         )
     if any(field not in plan for field in topology_fields):
         raise DeploymentRolloutError(
