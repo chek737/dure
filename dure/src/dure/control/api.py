@@ -25,7 +25,9 @@ from sqlalchemy.orm import Session
 
 from dure import __version__
 from dure.artifact_download import DEFAULT_MAX_CHUNK_BYTES
+from dure.fleet_scheduler import FleetSchedulingError
 from dure.model_store import MAX_TRACKED_BYTES
+from dure.resource_pool import FLEET_MODEL_IDS
 from dure.task import MAX_BENCHMARK_INTEGER
 
 from .db import Base, make_engine, make_session_factory, session_dependency
@@ -114,6 +116,13 @@ from .recommendation import (
     accept_deployment_recommendation,
     recommend_deployment,
     show_deployment_recommendation,
+)
+from .fleet import FleetEvaluationError
+from .fleet_recommendation import (
+    FleetRecommendationError,
+    FleetRecommendationNotFoundError,
+    recommend_fleet,
+    show_fleet_recommendation,
 )
 from .qualification import (
     QUALIFICATION_STEPS,
@@ -507,6 +516,50 @@ class DeploymentRecommendationCreate(StrictBody):
                     raise ValueError
             except (AttributeError, ValueError) as exc:
                 raise ValueError("node_ids must be canonical UUIDs") from exc
+        return self
+
+
+class FleetRecommendationCreate(StrictBody):
+    node_ids: list[str] = Field(default_factory=list)
+    all_online: StrictBool = False
+    objective: Literal["quality-first"] = "quality-first"
+    minimum_replicas: dict[str, int] = Field(default_factory=dict)
+    minimum_reserve_nodes: int = Field(default=0, ge=0)
+    reserve_node_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_fleet_policy(self):
+        if bool(self.node_ids) == self.all_online:
+            raise ValueError("choose exactly one of node_ids or all_online")
+        for field, values in (
+            ("node_ids", self.node_ids),
+            ("reserve_node_ids", self.reserve_node_ids),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{field} must not contain duplicates")
+            for node_id in values:
+                try:
+                    if str(uuid.UUID(node_id)) != node_id:
+                        raise ValueError
+                except (AttributeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{field} must contain canonical UUIDs"
+                    ) from exc
+        if self.node_ids and not set(self.reserve_node_ids).issubset(
+            self.node_ids
+        ):
+            raise ValueError(
+                "reserve_node_ids must be a subset of explicit node_ids"
+            )
+        for model_id, count in self.minimum_replicas.items():
+            if model_id not in FLEET_MODEL_IDS:
+                raise ValueError(
+                    f"model is outside the Fleet allowlist: {model_id}"
+                )
+            if type(count) is not int or count < 0:
+                raise ValueError(
+                    "minimum replica counts must be non-negative integers"
+                )
         return self
 
 
@@ -1826,6 +1879,60 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         return {"release": _model_release_dict(session, release)}
+
+    @app.post(
+        "/v1/admin/fleet-recommendations",
+        dependencies=[Depends(admin_auth)],
+    )
+    def fleet_recommendation_create(
+        body: FleetRecommendationCreate,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return recommend_fleet(session, **body.model_dump())
+        except RecommendationNodeNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except RecommendationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+        except FleetRecommendationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
+        except FleetEvaluationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": exc.code, "message": str(exc), **exc.details},
+            ) from exc
+        except FleetSchedulingError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": exc.code, "message": str(exc)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    @app.get(
+        "/v1/admin/fleet-recommendations/{recommendation_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def fleet_recommendation_get(
+        recommendation_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return show_fleet_recommendation(session, recommendation_id)
+        except FleetRecommendationNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, exc.to_detail()
+            ) from exc
+        except FleetRecommendationError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, exc.to_detail()
+            ) from exc
 
     @app.post(
         "/v1/admin/deployment-recommendations",
