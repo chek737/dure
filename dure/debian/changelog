@@ -1,3 +1,9 @@
+dure (0.3.29) UNRELEASED; urgency=medium
+
+  * Triton JIT 공유 라이브러리를 로드할 수 있도록 벤치마크 tmpfs 실행을 허용합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 22:55:00 +0900
+
 dure (0.3.28) UNRELEASED; urgency=medium
 
   * vLLM 0.25.x 벤치마크가 토큰 입력을 공식 TokensPrompt 형식으로 전달합니다.
