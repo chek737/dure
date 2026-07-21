@@ -56,7 +56,7 @@ BENCHMARK_CONTAINER_INSPECT_FORMAT = (
     '{{index .Config.Labels "dure.release"}}\t'
     '{{index .Config.Labels "dure.placement"}}\t'
     '{{index .Config.Labels "dure.workload"}}\t'
-    '{{index .Config.Labels "dure.deployment"}}'
+    '{{or (index .Config.Labels "dure.deployment") "-"}}'
 )
 
 
@@ -503,7 +503,7 @@ def _benchmark_container_identity(
         payload.release_id,
         payload.placement_id,
         payload.workload_id,
-        "",
+        "-",
     ]
     if (
         len(identity) != 10
