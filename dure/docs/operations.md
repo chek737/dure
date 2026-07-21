@@ -31,6 +31,37 @@ systemctl restart dure-server
 curl -fsS http://127.0.0.1:8081/health
 ```
 
+## 관리자 CLI credential
+
+관리자 CLI는 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`을 같은 dotenv 파일에서 읽을 수 있습니다. 저장소 최상위에서 실행하면 먼저 `dure/.env`, 그다음 `.env`를 확인합니다. Dure 프로젝트 디렉터리 안에서 실행하면 해당 디렉터리의 `.env`를 확인합니다.
+
+```bash
+cd ~/workspace/dure
+install -m 600 /dev/null dure/.env
+```
+
+파일에는 두 값을 모두 설정합니다. 실제 token은 출력하거나 Git에 추가하지 않습니다.
+
+```dotenv
+DURE_SERVER=https://api.dure.example
+DURE_ADMIN_TOKEN=<same-random-secret-as-the-server>
+```
+
+```bash
+dure admin nodes
+dure admin nodes --pending
+```
+
+다른 위치는 admin 하위 명령보다 앞에 `--env-file`을 지정합니다.
+
+```bash
+dure admin --env-file /secure/path/dure-admin.env nodes
+```
+
+CLI는 파일을 shell로 source하지 않고 빈 줄·주석, `KEY=VALUE`와 `export KEY=VALUE`만 파싱합니다. 그중 `DURE_SERVER`·`DURE_ADMIN_TOKEN`만 사용하며 shell expansion과 command substitution은 실행하지 않습니다. 파일 크기는 64KiB 이하이고 현재 사용자 소유 regular file이며 group·other 권한이 없어야 합니다. symlink, 중복·빈 값, 두 설정 중 하나만 있는 파일은 요청 전에 거부합니다.
+
+연결 설정 우선순위는 `--server`·`--token`, 선택된 dotenv의 한 쌍, 프로세스의 `DURE_SERVER`·`DURE_ADMIN_TOKEN`, 패키지의 서버 주소 순서입니다. 따라서 안전한 dotenv가 발견되면 셸에 남아 있는 오래된 admin 환경변수와 섞지 않습니다. 401이 발생하면 서버 프로세스와 관리자 파일의 token이 같은지 확인하되 값을 터미널·로그에 출력하지 말고, 수정 뒤 파일 권한을 다시 확인합니다.
+
 ## GPU 노드 런타임 준비
 
 GPU 노드에는 Dure 패키지와 정상 동작하는 NVIDIA host driver가 먼저 있어야 합니다. 현재 bootstrap 지원 범위는 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 다만 공식 Dure APT 저장소는 아직 `amd64`만 게시합니다. `arm64`에서는 CLI·Agent 실행 파일과 함께 패키지의 `dure-agent.service`, `/etc/dure/dure-client.env`를 별도로 설치해야 하며 unit이 없으면 bootstrap을 차단합니다. CPU utility 노드는 Docker/NVIDIA runtime 준비를 건너뛸 수 있습니다.

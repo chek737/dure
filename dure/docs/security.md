@@ -36,6 +36,7 @@
 
 - 개발 목적이 아닌 모든 에이전트 연결에는 HTTPS를 사용합니다.
 - `DURE_ADMIN_TOKEN`, 데이터베이스 자격 증명, APT 서명 키, 모델 자격 증명을 Git 밖에 보관합니다.
+- 관리자 CLI의 dotenv는 현재 사용자만 읽을 수 있게 두고 token을 셸 이력, 로그나 지원 요청에 출력하지 않습니다.
 - 가능하면 join과 중앙 제어면 종단점을 신뢰된 LAN 또는 사설 오버레이로 제한합니다.
 - 노드를 승인하기 전 호스트명, GPU 인벤토리, 주소, 소유자를 검토합니다.
 - 배포 이미지와 모델 리비전을 고정하고 Ray 포드 전체에서 같은 검증 런타임을 사용합니다.
@@ -44,6 +45,12 @@
 - 프롬프트와 자격 증명을 기록하지 않고 메타데이터와 오류만 수집합니다.
 - `dure admin diagnose`는 명시적 외부 처리입니다. 선택된 인벤토리가 운영자 컴퓨터의 Codex 제공자로 전송될 수 있지만 자격 증명, 컨테이너 환경 변수·명령, 프롬프트는 전송하지 않습니다.
 - PostgreSQL 백업, 자격 증명 폐기, 복구 절차를 실제로 검증합니다.
+
+## 관리자 CLI credential 파일의 신뢰 경계
+
+`dure admin`은 현재 작업 디렉터리의 `dure/.env`, `.env` 또는 명시적 `--env-file`에서 `DURE_SERVER`와 `DURE_ADMIN_TOKEN`만 읽을 수 있습니다. 파일을 shell로 source하지 않으므로 command substitution, 변수 확장과 임의 shell 문법을 실행하지 않습니다. 두 설정은 같은 파일에 모두 있어야 하며, 파일 설정을 사용하기로 한 뒤 프로세스 환경의 token이나 server와 섞지 않습니다. 명시적 `--server`·`--token`만 개별 값을 덮어쓸 수 있습니다.
+
+credential 파일은 64KiB 이하의 현재 사용자 소유 regular file이어야 하고 group·other 접근 비트가 없어야 합니다. final-component symlink, 비일반 파일, 중복·빈 값, 불완전한 Dure 설정과 잘못된 UTF-8은 네트워크 요청 전에 거부합니다. 자동 발견은 Dure 설정이 없는 일반 dotenv를 credential 파일로 사용하지 않으며 `.env`는 저장소의 ignore 규칙에 포함됩니다. 그러나 ignore는 secret 저장소나 접근 통제가 아니므로 파일을 commit, artifact, backup 또는 지원 자료에 포함하지 않아야 합니다. 현재 작업 디렉터리는 설정 발견 입력이므로 신뢰하지 않는 디렉터리에서 관리자 명령을 실행하지 말고, 자동 발견을 피하려면 신뢰 경로를 `--env-file`로 명시합니다.
 
 ## 로컬 host bootstrap의 신뢰 경계
 
