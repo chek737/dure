@@ -88,6 +88,10 @@ def _parser() -> argparse.ArgumentParser:
     join.add_argument("--server", help="Override the packaged central server address")
     join.add_argument("--insecure", action="store_true", default=None, help="Development only")
 
+    subparsers.add_parser(
+        "unjoin", help="Release this machine's Dure GPU and leave the control plane"
+    )
+
     admin = subparsers.add_parser("admin", help="Manage nodes through the central control plane")
     _add_admin_connection(admin)
     admin_sub = admin.add_subparsers(dest="admin_command", required=True)
@@ -102,6 +106,12 @@ def _parser() -> argparse.ArgumentParser:
     node_show.add_argument("node_id")
     node_approve = node_sub.add_parser("approve")
     node_approve.add_argument("node_id")
+    admin_unjoin = admin_sub.add_parser(
+        "unjoin", help="Unjoin one or all registered GPU nodes"
+    )
+    admin_unjoin_target = admin_unjoin.add_mutually_exclusive_group(required=True)
+    admin_unjoin_target.add_argument("--node", dest="node_id")
+    admin_unjoin_target.add_argument("--all", dest="all_nodes", action="store_true")
     enrollment = admin_sub.add_parser("enrollment")
     enrollment_sub = enrollment.add_subparsers(dest="enrollment_command", required=True)
     enrollment_create = enrollment_sub.add_parser("create")
@@ -465,6 +475,18 @@ def _join(args: argparse.Namespace) -> int:
     return 0
 
 
+def _unjoin(_args: argparse.Namespace) -> int:
+    from .agent import unjoin_control_plane
+
+    try:
+        result = unjoin_control_plane()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Unjoined node {result['node_id']}; Dure GPU resources are released.")
+    return 0
+
+
 def _duration_seconds(value: str) -> int:
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     try:
@@ -473,6 +495,33 @@ def _duration_seconds(value: str) -> int:
         return int(value)
     except (ValueError, IndexError) as exc:
         raise ValueError(f"invalid duration: {value}") from exc
+
+
+def _gpu_node_ids_from_inventory(
+    inventory: dict, node_id: str | None = None
+) -> list[str]:
+    gpu_nodes: dict[str, dict] = {}
+    for item in inventory.get("nodes", []):
+        identifier = item.get("id")
+        profile = item.get("profile")
+        if not item.get("approved") or not isinstance(profile, dict):
+            continue
+        try:
+            has_gpus = bool(NodeProfile.from_dict(profile).gpus)
+        except (TypeError, ValueError):
+            has_gpus = False
+        if isinstance(identifier, str) and has_gpus:
+            gpu_nodes[identifier] = item
+    if node_id is not None:
+        if node_id not in gpu_nodes:
+            raise ValueError(
+                f"unknown, pending, revoked, or non-GPU node: {node_id}"
+            )
+        return [node_id]
+    values = sorted(gpu_nodes)
+    if not values:
+        raise ValueError("no approved GPU nodes are available to unjoin")
+    return values
 
 
 def _admin(args: argparse.Namespace) -> int:
@@ -512,6 +561,26 @@ def _admin(args: argparse.Namespace) -> int:
         value = client.request("GET", f"/v1/admin/nodes/{args.node_id}")["node"]
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0
+    if args.admin_command == "unjoin":
+        inventory = client.request("GET", "/v1/admin/inventory")
+        node_ids = _gpu_node_ids_from_inventory(inventory, args.node_id)
+        value = client.request(
+            "POST",
+            "/v1/admin/tasks",
+            {
+                "node_ids": node_ids,
+                "type": "UNJOIN_NODE",
+                "deployment_id": None,
+                "options": {},
+            },
+        )
+        print(json.dumps(value, indent=2, sort_keys=True))
+        print(
+            "Unjoin is queued. Watch tasks until every target succeeds; rebuild any "
+            "remaining pipeline as a replacement deployment.",
+            file=sys.stderr,
+        )
+        return 0 if not value["errors"] else 1
     if args.admin_command == "enrollment":
         value = client.request("POST", "/v1/admin/enrollments", {"expires_in_seconds": _duration_seconds(args.expires_in)})
         print(value["token"])
@@ -715,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": _status,
         "verify": _verify,
         "join": _join,
+        "unjoin": _unjoin,
         "admin": _admin,
     }
     try:

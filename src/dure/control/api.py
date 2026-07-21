@@ -93,6 +93,7 @@ from .service import (
     register_artifact_manifest,
     complete_benchmark_task,
     transition_model_release,
+    unjoin_node,
     verify_artifact_cache,
 )
 from .cache_lifecycle import (
@@ -816,6 +817,21 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
             agent_version=body.agent_version,
         )
         return {"ok": True, "approved": node.approved}
+
+    @app.post("/v1/agent/unjoin")
+    def agent_unjoin(
+        node: Node = Depends(node_auth),
+        session: Session = Depends(get_session),
+    ):
+        try:
+            accepted = unjoin_node(session, node.id)
+        except DeploymentRolloutError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, _rollout_error_detail(exc)
+            ) from exc
+        if not accepted:
+            raise HTTPException(status.HTTP_409_CONFLICT, "node cannot be unjoined")
+        return {"ok": True, "node_id": node.id, "status": "unjoined"}
 
     @app.post("/v1/agent/tasks/claim")
     def agent_claim(node: Node = Depends(node_auth), session: Session = Depends(get_session)):

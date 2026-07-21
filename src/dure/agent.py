@@ -52,7 +52,7 @@ from .pipeline_runtime import (
 from .probe import DURE_MODEL_ROOT, NodeProbe
 from .readiness import ReadinessVerifier
 from .runtime import ContainerRuntime
-from .state import StateStore
+from .state import NodeState, StateStore
 from .task import (
     MAX_BENCHMARK_INTEGER,
     BenchmarkTaskPayload,
@@ -410,6 +410,84 @@ def _enable_agent_service(runner=None) -> None:
         raise RuntimeError(f"dure-agent could not be started: {detail}")
 
 
+def _retire_local_registration(
+    config_path: Path,
+    config: dict,
+    *,
+    state_path: Path,
+) -> None:
+    """Remove credentials while preserving the installation identity for rejoin."""
+    install_id = config.get("install_id")
+    if install_id:
+        _atomic_json(config_path, {"install_id": install_id})
+    else:
+        config_path.unlink(missing_ok=True)
+    StateStore(state_path).save(
+        NodeState(
+            phase="UNJOINED",
+            node_id=config.get("node_id"),
+            detail="Node left the Dure control plane and released its deployment GPU",
+        )
+    )
+
+
+def unjoin_control_plane(
+    *,
+    config_path: Path = DEFAULT_CONFIG,
+    runner=None,
+    setup_lock_path: Path = HOST_SETUP_LOCK_PATH,
+) -> dict:
+    """Stop this node's exact Dure deployment slice and revoke registration."""
+    if os.geteuid() != 0:
+        raise PermissionError("dure unjoin must run as root")
+    try:
+        lock_descriptor = acquire_host_setup_lock(
+            setup_lock_path,
+            require_root_owner=setup_lock_path == HOST_SETUP_LOCK_PATH,
+        )
+    except HostSetupLockError as exc:
+        raise RuntimeError(f"dure unjoin cannot start: {exc}") from exc
+    try:
+        config = _read_json(config_path)
+        if not {"server", "node_id", "credential"} <= set(config):
+            raise ValueError("node is not joined")
+        service_runner = runner or SubprocessRunner()
+        state_path = Path(config.get("state_file", DEFAULT_STATE))
+        state = StateStore(state_path).load()
+        if state.deployment_id:
+            stopped = ContainerRuntime(
+                service_runner, "docker"
+            ).stop_registered_node_deployment(
+                state.deployment_id,
+                generation=state.generation,
+                node_id=config["node_id"],
+            )
+            if not stopped.ok:
+                raise RuntimeError(stopped.detail)
+        disabled = service_runner.run(
+            ["systemctl", "disable", "--now", "dure-agent"], timeout=60
+        )
+        if not disabled.ok:
+            raise RuntimeError(
+                disabled.stderr
+                or disabled.stdout
+                or "dure-agent could not be disabled"
+            )
+        client = JSONClient(
+            config["server"],
+            config["credential"],
+            verify_tls=config.get("verify_tls", True),
+        )
+        response = client.request("POST", "/v1/agent/unjoin")
+        _retire_local_registration(config_path, config, state_path=state_path)
+        return {
+            "node_id": response.get("node_id", config["node_id"]),
+            "status": "unjoined",
+        }
+    finally:
+        release_host_setup_lock(lock_descriptor)
+
+
 def join_control_plane(
     *,
     server: str | None = None,
@@ -602,6 +680,27 @@ class TaskExecutor:
         payload = task.get("payload") or {}
         if kind == TaskType.PROBE:
             return {"profile": self._profile().to_dict()}
+        if kind == TaskType.UNJOIN_NODE:
+            if payload:
+                raise ValueError("UNJOIN_NODE payload must be empty")
+            store = StateStore(self.state_path or DEFAULT_STATE)
+            state = store.load()
+            checks = []
+            if state.deployment_id:
+                check = ContainerRuntime(
+                    self.runner, "docker"
+                ).stop_registered_node_deployment(
+                    state.deployment_id,
+                    generation=state.generation,
+                    node_id=self.node_id,
+                )
+                checks.append(check)
+                if not check.ok:
+                    raise RuntimeError(check.detail)
+            state.phase = "UNJOINING"
+            state.detail = "Deployment GPU released; waiting for control-plane revocation"
+            store.save(state)
+            return {"checks": [item.to_dict() for item in checks], "unjoined": True}
         if kind == TaskType.QUARANTINE_ARTIFACT_CACHE:
             return self.quarantine_executor.execute(task)
         if kind == TaskType.BENCHMARK:
@@ -749,12 +848,14 @@ class Agent:
         self,
         config: dict,
         *,
+        config_path: Path = DEFAULT_CONFIG,
         history_path: Path = DEFAULT_HISTORY,
         runner=None,
         benchmark_executor: SafeBenchmarkExecutor | None = None,
         build_commit: str | None | object = _BUILD_COMMIT_UNSET,
     ) -> None:
         self.config = config
+        self.config_path = config_path
         if config.get("verify_tls", True) and not config["server"].startswith("https://"):
             raise ValueError("agent control-plane URL must use HTTPS")
         self.client = JSONClient(config["server"], config["credential"], verify_tls=config.get("verify_tls", True))
@@ -781,9 +882,10 @@ class Agent:
                 else None
             )
         )
+        self.runner = runner or SubprocessRunner()
         self.executor = TaskExecutor(
             config["node_id"],
-            runner=runner,
+            runner=self.runner,
             state_path=self.state_path,
             benchmark_executor=benchmark_executor,
             artifact_origin_config=config.get("artifact_origin"),
@@ -866,10 +968,10 @@ class Agent:
             del pending_reports[task_id]
             self._save_history()
 
-    def _send_pending_report(self, task_id) -> None:
+    def _send_pending_report(self, task_id) -> bool:
         pending_reports = self.history["pending_reports"]
         if task_id not in pending_reports:
-            return
+            return False
         request = self._pending_report_request(
             task_id,
             pending_reports[task_id],
@@ -877,7 +979,7 @@ class Agent:
         if request is None:
             LOG.error("discarding malformed pending agent task report")
             self._drop_pending_report(task_id)
-            return
+            return False
         path, payload = request
         try:
             self.client.request("POST", path, payload)
@@ -890,8 +992,9 @@ class Agent:
                 exc.status_code,
             )
             self._drop_pending_report(task_id)
-            return
+            return False
         self._drop_pending_report(task_id)
+        return True
 
     def _flush_pending_reports(self) -> bool:
         task_ids = list(self.history["pending_reports"])
@@ -930,6 +1033,23 @@ class Agent:
         return {"progress": progress} if progress is not None else None
 
     def stop(self, *_args) -> None:
+        self.running = False
+
+    def _finish_unjoin(self) -> None:
+        disabled = self.runner.run(
+            ["systemctl", "disable", "dure-agent"], timeout=60
+        )
+        if not disabled.ok:
+            LOG.warning(
+                "node was unjoined but dure-agent could not be disabled: %s",
+                disabled.stderr or disabled.stdout,
+            )
+        try:
+            _retire_local_registration(
+                self.config_path, self.config, state_path=self.state_path
+            )
+        except OSError as exc:
+            LOG.error("node was unjoined but local credential cleanup failed: %s", exc)
         self.running = False
 
     def once(self) -> bool:
@@ -1113,6 +1233,8 @@ class Agent:
             else:
                 result = previous.get("result", previous)
                 self.client.request("POST", f"/v1/agent/tasks/{task_id}/complete", {"result": result})
+                if task.get("type") == TaskType.UNJOIN_NODE.value:
+                    self._finish_unjoin()
             return True
         renewal_stop = threading.Event()
 
@@ -1194,7 +1316,9 @@ class Agent:
                         benchmark.dure_commit
                     )
                 self._record_terminal_report(task_id, history_record)
-                self._send_pending_report(task_id)
+                reported = self._send_pending_report(task_id)
+                if reported and task.get("type") == TaskType.UNJOIN_NODE.value:
+                    self._finish_unjoin()
         finally:
             renewal_stop.set()
             renewal.join(timeout=2)
@@ -1275,7 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
         config = _read_json(args.config)
         if not {"server", "node_id", "credential"} <= set(config):
             parser.error("agent is not enrolled")
-        agent = Agent(config, history_path=args.history)
+        agent = Agent(config, config_path=args.config, history_path=args.history)
         signal.signal(signal.SIGTERM, agent.stop)
         signal.signal(signal.SIGINT, agent.stop)
         agent.run(args.interval)

@@ -326,6 +326,7 @@ class TaskType(str, enum.Enum):
     START_DEPLOYMENT = "START_DEPLOYMENT"
     STOP_DEPLOYMENT = "STOP_DEPLOYMENT"
     RESTART_DEPLOYMENT = "RESTART_DEPLOYMENT"
+    UNJOIN_NODE = "UNJOIN_NODE"
 
 
 class TaskStatus(str, enum.Enum):

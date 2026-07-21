@@ -1125,8 +1125,41 @@ def join_node(
 ) -> tuple[Node, str]:
     """Register an unauthenticated node as pending operator approval."""
     parsed = NodeProfile.from_dict(profile)
-    if session.scalar(select(Node).where(Node.install_id == install_id)) is not None:
-        raise ValueError("installation is already joined")
+    existing = session.scalar(select(Node).where(Node.install_id == install_id))
+    if existing is not None:
+        active_credential = session.scalar(
+            select(NodeCredential.id).where(
+                NodeCredential.node_id == existing.id,
+                NodeCredential.revoked_at.is_(None),
+            )
+        )
+        if active_credential is not None:
+            raise ValueError("installation is already joined")
+        existing.display_name = parsed.hostname
+        existing.hostname = parsed.hostname
+        existing.agent_version = agent_version
+        existing.approved = False
+        existing.last_seen = utcnow()
+        existing.observed_phase = "DISCOVERED"
+        existing.observed_role = None
+        existing.observed_deployment_id = None
+        existing.desired_state = None
+        profile_record = session.get(NodeProfileRecord, existing.id)
+        if profile_record is None:
+            session.add(NodeProfileRecord(node_id=existing.id, profile=profile))
+        else:
+            profile_record.profile = profile
+            profile_record.updated_at = utcnow()
+        raw_credential = secrets.token_urlsafe(48)
+        session.add(
+            NodeCredential(
+                node_id=existing.id,
+                credential_hash=secret_hash(raw_credential),
+            )
+        )
+        audit(session, f"node:{existing.id}", "node.rejoin", existing.id, "pending")
+        session.commit()
+        return existing, raw_credential
     node = Node(
         install_id=install_id,
         display_name=parsed.hostname,
@@ -1194,6 +1227,49 @@ def revoke_node(session: Session, node_id: str) -> bool:
     )
     session.commit()
     return True
+
+
+def _mark_node_unjoined(session: Session, node: Node, *, actor: str) -> None:
+    node.approved = False
+    node.observed_phase = "UNJOINED"
+    node.observed_role = None
+    node.observed_deployment_id = None
+    node.desired_state = None
+    now = utcnow()
+    for credential in session.scalars(
+        select(NodeCredential).where(
+            NodeCredential.node_id == node.id,
+            NodeCredential.revoked_at.is_(None),
+        )
+    ):
+        credential.revoked_at = now
+    from .preparation import revoke_preparation_tasks_for_node
+
+    canceled_preparations = revoke_preparation_tasks_for_node(session, node.id)
+    audit(
+        session,
+        actor,
+        "node.unjoin",
+        node.id,
+        "success",
+        canceled_preparation_tasks=canceled_preparations,
+    )
+
+
+def unjoin_node(session: Session, node_id: str) -> bool:
+    try:
+        node = session.scalar(
+            select(Node).where(Node.id == node_id).with_for_update()
+        )
+        if node is None:
+            return False
+        _ensure_deployment_node_scope_available(session, [node_id])
+        _mark_node_unjoined(session, node, actor=f"node:{node_id}")
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        raise
 
 
 def rotate_node_credential(session: Session, node_id: str) -> str | None:
@@ -2207,6 +2283,7 @@ NODE_EXCLUSIVE_TASK_TYPE_VALUES = DEPLOYMENT_TASK_TYPE_VALUES | {
     TaskType.PREPARE_MODEL.value,
     TaskType.PREPARE_IMAGE.value,
     TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+    TaskType.UNJOIN_NODE.value,
 }
 
 
@@ -2391,6 +2468,8 @@ def create_tasks(
         if deployment is not None and task_type in DEPLOYMENT_TASK_TYPES:
             _lock_deployment_lineage_for_task_creation(session, deployment)
             _ensure_deployment_node_scope_available(session, node_ids)
+        elif task_type == TaskType.UNJOIN_NODE:
+            _ensure_deployment_node_scope_available(session, node_ids)
         effective_plan = deployment.plan if deployment is not None else None
         if deployment is not None and deployment.source_recommendation_id is not None:
             from .preparation import effective_deployment_plan
@@ -2505,6 +2584,18 @@ def create_tasks(
             if node is None or not node.approved:
                 errors[node_id] = "unknown, pending, or revoked node"
                 continue
+            if task_type == TaskType.UNJOIN_NODE:
+                profile_record = session.get(NodeProfileRecord, node_id)
+                try:
+                    gpu_node = (
+                        profile_record is not None
+                        and bool(NodeProfile.from_dict(profile_record.profile).gpus)
+                    )
+                except (TypeError, ValueError):
+                    gpu_node = False
+                if not gpu_node:
+                    errors[node_id] = "unjoin is limited to registered GPU nodes"
+                    continue
             if deployment is not None and node_id not in assignments:
                 errors[node_id] = "node is not assigned to deployment"
                 continue
@@ -2939,6 +3030,8 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
         task.error = terminal_error
         task.lease_until = None
         node.desired_state = None
+        if terminal_error is None and task.type == TaskType.UNJOIN_NODE.value:
+            _mark_node_unjoined(session, node, actor=f"node:{node_id}")
         if (
             not error
             and task.type == TaskType.PROBE.value

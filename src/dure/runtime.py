@@ -553,6 +553,69 @@ class ContainerRuntime:
             f"Stopped {len(container_ids)} Dure container(s)" if stopped.ok else stopped.stderr or stopped.stdout,
         )
 
+    def stop_registered_node_deployment(
+        self,
+        deployment_id: str,
+        *,
+        generation: int,
+        node_id: str,
+    ) -> CheckResult:
+        """Stop the exact registered node slice without requiring the original plan."""
+        if self.engine != "docker":
+            return CheckResult("deployment-stop", False, "Apply mode currently supports Docker only")
+        listed = self.runner.run(
+            [
+                self.engine,
+                "ps",
+                "-q",
+                "--filter",
+                f"label=dure.deployment={deployment_id}",
+                "--filter",
+                f"label=dure.generation={generation}",
+                "--filter",
+                f"label=dure.node={node_id}",
+            ],
+            timeout=15,
+        )
+        if not listed.ok:
+            return CheckResult("deployment-stop", False, listed.stderr or listed.stdout)
+        container_ids = [item.strip() for item in listed.stdout.splitlines() if item.strip()]
+        if not container_ids:
+            return CheckResult("deployment-stop", True, "No running Dure deployment containers")
+        if len(container_ids) != len(set(container_ids)):
+            return CheckResult(
+                "deployment-stop", False, "Docker returned duplicate deployment containers"
+            )
+        verified_ids: list[str] = []
+        observed_components: set[str] = set()
+        for container_id in container_ids:
+            result, identity = self.inspect_deployment_container(container_id)
+            if not result.ok or identity is None:
+                return CheckResult(
+                    "deployment-stop", False, "Deployment container identity could not be verified"
+                )
+            if (
+                not identity.container_id.startswith(container_id)
+                or identity.deployment_id != deployment_id
+                or identity.generation != str(generation)
+                or identity.node_id != node_id
+                or identity.state not in STOPPABLE_CONTAINER_STATES
+            ):
+                return CheckResult("deployment-stop", False, "Deployment container label mismatch")
+            component_key = identity.component or identity.container_id
+            if component_key in observed_components:
+                return CheckResult("deployment-stop", False, "Duplicate deployment component identity")
+            observed_components.add(component_key)
+            verified_ids.append(identity.container_id)
+        stopped = self.runner.run(
+            [self.engine, "stop", "--time", "30", *verified_ids], timeout=60
+        )
+        return CheckResult(
+            "deployment-stop",
+            stopped.ok,
+            f"Stopped {len(verified_ids)} Dure container(s)" if stopped.ok else stopped.stderr or stopped.stdout,
+        )
+
     def start_ray(
         self,
         profile: NodeProfile,

@@ -8,9 +8,10 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from dure.agent import join_control_plane, resolve_join_settings
+from dure.agent import join_control_plane, resolve_join_settings, unjoin_control_plane
 from dure.cli import main
 from dure.host_setup import acquire_host_setup_lock, release_host_setup_lock
+from dure.state import NodeState, StateStore
 from tests.helpers import FakeRunner, profile
 
 
@@ -27,6 +28,63 @@ class FakeJoinClient:
 
 
 class JoinTests(unittest.TestCase):
+    @patch("dure.agent.os.geteuid", return_value=0)
+    def test_unjoin_stops_exact_node_slice_revokes_and_scrubs_credential(self, _geteuid):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "agent.json"
+            state_path = root / "state.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "server": "https://control.example",
+                        "node_id": "node-1",
+                        "credential": "secret",
+                        "install_id": "install-1",
+                        "state_file": str(state_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            StateStore(state_path).save(
+                NodeState(
+                    phase="READY",
+                    node_id="node-1",
+                    deployment_id="deploy-1",
+                    generation=3,
+                )
+            )
+            runner = FakeRunner(executables={"systemctl", "docker"})
+            FakeJoinClient.requests = []
+            with patch("dure.agent.JSONClient", FakeJoinClient):
+                result = unjoin_control_plane(
+                    config_path=config_path,
+                    runner=runner,
+                    setup_lock_path=root / "setup.lock",
+                )
+
+            self.assertEqual(result["status"], "unjoined")
+            self.assertEqual(
+                json.loads(config_path.read_text(encoding="utf-8")),
+                {"install_id": "install-1"},
+            )
+            self.assertEqual(StateStore(state_path).load().phase, "UNJOINED")
+            self.assertIn(("systemctl", "disable", "--now", "dure-agent"), runner.calls)
+            self.assertIn(
+                (
+                    "docker", "ps", "-q", "--filter",
+                    "label=dure.deployment=deploy-1", "--filter",
+                    "label=dure.generation=3", "--filter", "label=dure.node=node-1",
+                ),
+                runner.calls,
+            )
+            self.assertEqual(FakeJoinClient.requests[-1][1], "/v1/agent/unjoin")
+
+    @patch("dure.agent.os.geteuid", return_value=1000)
+    def test_unjoin_requires_root(self, _geteuid):
+        with self.assertRaisesRegex(PermissionError, "must run as root"):
+            unjoin_control_plane()
+
     def test_packaged_settings_resolve_without_command_arguments(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "client.env"

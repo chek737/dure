@@ -131,6 +131,61 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(check.ok)
         self.assertNotIn(("docker", "stop", "--time", "30"), runner.calls)
 
+    def test_unjoin_stop_accepts_strict_identity_for_exact_registered_node(self):
+        plan, head, _worker = strict_pipeline_fixture()
+        assignment = plan.assignment_for(head.node_id)
+        listed = (
+            "docker", "ps", "-q", "--filter",
+            f"label=dure.deployment={plan.deployment_id}", "--filter",
+            f"label=dure.generation={plan.generation}", "--filter",
+            f"label=dure.node={head.node_id}",
+        )
+        inspected = ("docker", "inspect", "--format", DEPLOYMENT_IDENTITY_FORMAT, "abc")
+        runner = FakeRunner(
+            responses={
+                listed: (0, "abc", ""),
+                inspected: (
+                    0,
+                    self.strict_identity(
+                        "abc", "running", plan.deployment_id, plan.generation,
+                        head.node_id, plan.execution_backend,
+                        assignment.pipeline_rank, assignment.expected_runtime_rank,
+                        RAY_COMPONENT,
+                        strict_runtime_contract_digest(plan, assignment, RAY_COMPONENT),
+                    ),
+                    "",
+                ),
+                ("docker", "stop", "--time", "30", "abc"): (0, "abc", ""),
+            }
+        )
+
+        check = ContainerRuntime(runner).stop_registered_node_deployment(
+            plan.deployment_id, generation=plan.generation, node_id=head.node_id
+        )
+
+        self.assertTrue(check.ok)
+        self.assertIn(("docker", "stop", "--time", "30", "abc"), runner.calls)
+
+    def test_unjoin_stop_refuses_container_from_another_node(self):
+        listed = (
+            "docker", "ps", "-q", "--filter", "label=dure.deployment=deploy-1",
+            "--filter", "label=dure.generation=2", "--filter", "label=dure.node=node-1",
+        )
+        inspected = ("docker", "inspect", "--format", DEPLOYMENT_IDENTITY_FORMAT, "abc")
+        runner = FakeRunner(
+            responses={
+                listed: (0, "abc", ""),
+                inspected: (0, self.identity("abc", "running", "deploy-1", 2, "node-2"), ""),
+            }
+        )
+
+        check = ContainerRuntime(runner).stop_registered_node_deployment(
+            "deploy-1", generation=2, node_id="node-1"
+        )
+
+        self.assertFalse(check.ok)
+        self.assertFalse(any(call[:2] == ("docker", "stop") for call in runner.calls))
+
     def test_stop_refuses_any_label_mismatch_before_stopping(self):
         node_id = "11111111-1111-4111-8111-111111111111"
         listed = (
