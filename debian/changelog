@@ -1,3 +1,11 @@
+dure (0.3.14) UNRELEASED; urgency=medium
+
+  * 불변 정규 모델 아티팩트 매니페스트와 파일·청크 레지스트리를 추가합니다.
+  * 관리자 전용의 멱등 매니페스트 등록·조회와 엄격한 경로·범위 검증을 추가합니다.
+  * SHA-256 무결성과 게시자 서명·공급망 provenance의 신뢰 경계를 문서화합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 01:10:11 +0900
+
 dure (0.3.13) UNRELEASED; urgency=medium
 
   * 정확한 다중 노드 조합의 최신 네트워크·NCCL 증적을 중앙 추천에 연결합니다.
