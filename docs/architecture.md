@@ -65,7 +65,7 @@ production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 
 
 로컬 상태는 `부분 다운로드 → 검증 CAS → assembling → marker-last 검증 staging → no-replace final` 순서로만 전진합니다. 다운로드·조립 중단은 결정적 부분 파일에서 재개합니다. 잘못된 CAS, 예상 밖 entry, symlink·hardlink·special file, marker·양자화 불일치와 기존 final 충돌은 보존한 채 실패하며 자동 재귀 삭제나 캐시 퇴출을 하지 않습니다. 반복 실패가 staging 디렉터리를 계속 늘리지 않도록 매니페스트마다 조립 영역을 하나만 사용합니다. 로컬 저널은 마지막 시도 상태일 뿐 중앙 `READY` 증적이 아닙니다. `READY`는 현재 준비 시도의 전체 검증 성공과 같은 트랜잭션에서만 만들어지고, 이미 새 시도로 교체된 늦은 완료는 상태를 되살리지 못합니다.
 
-0.3.20은 `node_artifact_caches`에 노드 UUID와 정확한 캐시 identity별 현재 상태를 저장하고, 모든 상태 변화의 원인·원본 작업·증적 다이제스트를 추가 전용 `artifact_cache_events`에 남깁니다.
+0.3.20은 준비 시도에 모델 준비 byte high-water를 선택적으로 저장하고, `node_artifact_caches`에 노드 UUID와 정확한 캐시 identity별 현재 상태를 저장하며, 모든 상태 변화의 원인·원본 작업·증적 다이제스트를 추가 전용 `artifact_cache_events`에 남깁니다. high-water는 로컬 재사용과 쓰기를 포함하는 단조 증가 운영 telemetry라서 네트워크 전송량이나 `READY` 증적이 아니며, 완료 전체 검증과 캐시 상태는 별도입니다.
 
 | 상태 | 의미와 실행 영향 |
 |---|---|
@@ -190,7 +190,7 @@ verified_at 롤백 증거 기록
 
 전체 배정 노드를 정확히 대상으로 한 `VERIFY`가 모두 성공하고 backend별 최소 Agent 버전을 충족할 때만 `verified_at`을 기록합니다. legacy 배포는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이며 `STAGE` 준비·실행은 0.3.19 이상이 필요합니다. 엄격한 backend에서는 각 노드의 정확한 `pipeline-rank-contract`와 head의 API 검증도 성공해야 합니다. 일부 노드 검증, API 검증을 생략한 엄격한 결과, 전체 배정 집합이 아닌 Ray head 전용 검증과 구 Agent 결과는 운영 상태 조회에는 남지만 롤백 증거가 되지 않습니다. `dure admin deployment show`는 한 세대와 연결된 작업을, `dure admin deployment generations`는 같은 계보의 모든 세대를 조회합니다.
 
-롤백 요청에서 서버가 대상 계획을 선택하므로 클라이언트는 대상 세대, 계획, 다운로드 또는 이미지 내려받기 값을 지정할 수 없습니다. 소스는 계보의 최신 세대여야 하고 대상은 그 소스가 직접 가리키는 직전 세대여야 하며, 대상 상태가 `VERIFIED`이고 `verified_at`이 있어야 합니다. 두 세대는 전체 노드 배정과 토폴로지가 정확히 같아야 합니다. 요청한 정규 UUID 노드 집합도 전체 배정 집합과 정확히 같아야 하고, 모든 노드는 승인됨·온라인이며 legacy는 Agent 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이어야 합니다. `STAGE` 대상 시작에는 0.3.19 이상과 현재 검증된 exact variant·로컬 캐시가 필요합니다. 두 계획의 이미지가 OCI 다이제스트로 고정되지 않았으면 거부합니다.
+롤백 요청에서 서버가 대상 계획을 선택하므로 클라이언트는 대상 세대, 계획, 다운로드 또는 이미지 내려받기 값을 지정할 수 없습니다. 소스는 계보의 최신 세대여야 하고 대상은 그 소스가 직접 가리키는 직전 세대여야 하며, 대상 상태가 `VERIFIED`이고 `verified_at`이 있어야 합니다. 두 세대는 전체 노드 배정과 실제 실행 토폴로지가 정확히 같아야 합니다. 엄격한 backend에서는 노드·GPU·role·rank·expected runtime rank·runtime address와 backend·vLLM·TP/PP·Ray·network 결합을 비교하고, 세대별 모델·revision·layer 범위·매니페스트·variant·cache kind는 독립 검증과 대상 exact 준비 게이트를 통과하면 달라도 됩니다. legacy 계획은 layer 범위도 계속 비교합니다. 요청한 정규 UUID 노드 집합도 전체 배정 집합과 정확히 같아야 하고, 모든 노드는 승인됨·온라인이며 legacy는 Agent 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이어야 합니다. `STAGE` 대상 시작에는 0.3.19 이상과 현재 검증된 exact variant·로컬 캐시가 필요합니다. 두 계획의 이미지가 OCI 다이제스트로 고정되지 않았으면 거부합니다.
 
 기본 롤백 요청은 `PREPARED` operation만 저장하고 task를 만들지 않습니다. `apply=true`를 명시해야 계보의 활성 변경이 되며 다음 단계를 순서대로 실행합니다.
 

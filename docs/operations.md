@@ -392,9 +392,13 @@ dure admin deployment preparation <preparation-id>
 
 API는 `POST /v1/admin/deployments/{deployment_id}/prepare`와 `GET /v1/admin/deployment-preparations/{preparation_id}`를 제공합니다. 요청 ID는 정규 UUID여야 하며 preview와 apply에 같은 값을 사용합니다. preview는 불변 계획과 노드 행만 저장하고 task를 0개 반환합니다. preview와 최초 apply 직전에는 등록 매니페스트와 다이제스트 이미지, 승인·최근 온라인·신선한 인벤토리·보수적인 디스크 여유, 배포와 노드 집합을 다시 검사합니다. 하나라도 달라지거나 불확실하면 어떤 노드의 작업도 새로 만들지 않습니다.
 
+준비 조회의 `progress`는 전체와 노드별 `expected_bytes`, `verified_bytes`, `download_expected_bytes`, `downloaded_bytes`, 현재 `stage`, 모델·이미지 단계의 `current_attempt`·`retry_count`·상태를 함께 보여 줍니다. 기대 바이트와 검증 바이트는 각각 정규 매니페스트 파일 전체 크기와 현재 모델 시도의 완료 무결성 검증 합계입니다. 다운로드 기대 바이트는 중복 제거한 고유 청크의 합이고, 다운로드 바이트는 로컬 CAS·부분 파일·staging·final 재사용과 쓰기에서 관측된 모델 준비 high-water입니다. 실제 네트워크 전송량이나 속도가 아니며 digest 오류 뒤 부분 파일이 초기화돼도 내려가지 않으므로 100%를 `READY`로 해석해서는 안 됩니다. `download_bytes_source`는 `NOT_STARTED`, `MODEL_PREPARATION_HIGH_WATER`, `DERIVED_FROM_COMPLETED_MODEL_VERIFICATION`, `UNAVAILABLE`, 여러 노드가 섞인 `MIXED` 중 하나입니다. 이미지 pull에는 바이트 진행률이 없습니다.
+
+downloader가 한 중앙 모델 시도 안에서 수행하는 제한 재시도와 prepare를 다시 적용해 새 중앙 `attempt_no`를 만드는 재시도는 다릅니다. CLI의 `retry_count`는 후자만 셉니다. 실제 성공은 `verified_bytes`, 모델 단계 성공과 exact `READY`로 판단합니다.
+
 적용은 먼저 모든 대상 노드에 `PREPARE_MODEL`을 큐잉합니다. 한 노드의 모델이 전체 청크·파일 해시와 marker-last 검사를 통과하면 그 현재 시도와 exact identity를 같은 트랜잭션에서 중앙 `READY`로 투영하고, 그 뒤에만 같은 노드의 `PREPARE_IMAGE`를 만듭니다. 이미지 작업은 정확한 digest 참조를 inspect하고 없을 때만 pull한 뒤 다시 inspect하며, 컨테이너를 실행·중지·삭제하지 않습니다. 준비 상태는 `PREPARED`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `PARTIAL_FAILED`, `FAILED` 중 하나입니다.
 
-실패 뒤 같은 request ID와 `--apply`를 다시 사용하면 현재 실패 단계만 새 시도 번호로 재시도합니다. 모델이 실패한 노드는 모델부터 다시 시작하고 이미지 작업을 만들지 않으며, 모델 성공 뒤 이미지가 실패한 노드는 이미 검증된 모델을 반복하지 않습니다. 두 단계를 성공한 노드도 다시 실행하지 않습니다. task ID, preparation·노드·단계와 현재 시도 번호가 모두 일치하지 않는 늦은 완료·실패 보고는 준비 상태나 중앙 cache state를 바꾸지 못합니다. 과거 성공은 이후 `CORRUPT`·`QUARANTINED` 캐시를 되살리지 않으며 현재 준비 성공만 `READY`를 복구합니다.
+실패 뒤 같은 request ID와 `--apply`를 다시 사용하면 현재 실패 단계만 새 시도 번호로 재시도합니다. 모델이 실패한 노드는 모델부터 다시 시작하고 이미지 작업을 만들지 않으며, 모델 성공 뒤 이미지가 실패한 노드는 이미 검증된 모델을 반복하지 않습니다. 두 단계를 성공한 노드도 다시 실행하지 않습니다. task ID, preparation·노드·단계와 현재 시도 번호가 모두 일치하지 않는 늦은 진행률 heartbeat·완료·실패 보고는 준비 상태나 중앙 cache state를 바꾸지 못합니다. 과거 성공은 이후 `CORRUPT`·`QUARANTINED` 캐시를 되살리지 않으며 현재 준비 성공만 `READY`를 복구합니다.
 
 재시도 시 중앙은 부분 CAS·staging의 실제 할당량을 알 수 없어 최초의 전체 크기 최악 조건 디스크 검사를 반복하지 않습니다. 대신 승인·온라인·프로필 신선도·안정 하드웨어·활성 작업과 불변 아티팩트·런타임 결합을 다시 확인하고, Agent가 작업 시작 전에 실제 파일시스템별 남은 바이트를 계산합니다. 이 검사에서 부족하면 다운로드나 final 활성화 전에 실패하므로, 재시도 task 생성은 디스크 충분 증적이 아닙니다.
 
@@ -626,7 +630,7 @@ API는 `POST /v1/admin/deployments/{source_id}/rollback`에 다음과 같은 닫
 
 - 소스는 해당 계보의 최신 세대입니다.
 - 대상은 소스의 `previous_generation_id`가 직접 가리키는 세대이며 상태가 `VERIFIED`이고 `verified_at`이 있습니다.
-- 소스와 대상의 전체 배정 노드와 토폴로지가 정확히 같습니다.
+- 소스와 대상의 전체 배정 노드와 실제 실행 토폴로지가 정확히 같습니다. 엄격한 backend에서는 노드·GPU·role·rank·expected runtime rank·runtime address와 backend·vLLM·TP/PP·Ray·network 결합을 비교합니다. 모델·revision·layer 범위·매니페스트·variant와 `FULL_SNAPSHOT`/`STAGE` identity는 세대별 독립 검증과 대상 exact 준비 게이트를 통과하면 달라도 되며, legacy만 layer 범위를 계속 토폴로지로 비교합니다.
 - 요청한 중복 없는 정규 UUID 목록이 전체 배정 노드 집합과 정확히 같습니다.
 - 모든 노드가 승인 상태이고 최근 30초 안에 온라인으로 관측됐으며 legacy는 Agent
   0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상입니다.
@@ -654,11 +658,11 @@ legacy에서 선택적, 엄격 backend에서 필수 VERIFY_API (Ray head)
 
 ## 업그레이드와 복구
 
-0.3.20에서는 PostgreSQL을 백업하고 controller 코드와 migration 0010을 먼저 적용합니다. 이 migration은 `node_artifact_caches`, append-only `artifact_cache_events`와 stage variant 복합 참조 제약을 추가하지만 과거 preparation 행을 추측해 `READY`로 backfill하지 않습니다. controller 시작 뒤 새 모델 준비 성공으로 필요한 exact cache row가 생성되는지 확인합니다. 이어서 Agent를 작은 batch로 0.3.20 이상에 올리고 새 probe에서 `artifact_cache_observations`와 `artifact_cache_scan_complete`가 함께 보고되는지 확인합니다. legacy·불완전 조사는 상태를 강등하지 않습니다.
+0.3.20에서는 PostgreSQL을 백업하고 controller 코드와 migration 0010을 먼저 적용합니다. 이 migration은 `artifact_preparation_attempts.download_progress`, `node_artifact_caches`, append-only `artifact_cache_events`와 stage variant 복합 참조 제약을 추가하지만 과거 preparation 행을 추측해 진행률이나 `READY`로 backfill하지 않습니다. PostgreSQL 이벤트 테이블에는 `UPDATE`·`DELETE`·`TRUNCATE` 거부 트리거를 설치합니다. 저장소 단위 suite는 SQLite 트리거를 실제 실행하지만 PostgreSQL은 DDL mock/compile까지만 검증하므로, 운영 업그레이드에서는 별도 PostgreSQL staging DB에서 migration과 거부 쿼리를 실행해 확인합니다. controller 시작 뒤 새 모델 준비 성공으로 필요한 exact cache row가 생성되는지 확인합니다. 이어서 Agent를 작은 batch로 0.3.20 이상에 올리고 새 probe에서 `artifact_cache_observations`와 `artifact_cache_scan_complete`가 함께 보고되는지 확인합니다. legacy·불완전 조사는 상태를 강등하지 않습니다.
 
 격리를 시작하기 전에 `artifact-cache quarantine <cache-id>` preview가 task 0개인지 확인하고, current generation·direct verified rollback predecessor·활성 준비/배포/벤치마크·operation blocker를 의도대로 표시하는지 검토합니다. `--apply`는 Agent 0.3.20 이상에서만 사용합니다. `/var/lib/dure/models/.dure-quarantine`은 보존 영역이며 업그레이드 스크립트나 Agent가 자동 삭제하지 않습니다.
 
-0010 downgrade는 `node_artifact_caches` 또는 `artifact_cache_events`에 행이 하나라도 있으면 감사·상태 손실을 피하기 위해 거부합니다. downgrade를 위해 캐시 상태·event를 수동 삭제하거나 외래 키를 우회하지 말고, 백업과 별도 이관 계획이 없다면 0010을 유지합니다.
+0010 downgrade는 `node_artifact_caches` 또는 `artifact_cache_events`에 행이 하나라도 있거나 `artifact_preparation_attempts.download_progress`에 SQL `NULL`·JSON `null`이 아닌 진행 데이터가 하나라도 있으면 감사·상태 손실을 피하기 위해 거부합니다. PostgreSQL에서는 관련 세 테이블을 write 순서대로 잠근 뒤 검사합니다. downgrade를 위해 캐시 상태·event·진행 데이터를 수동 삭제하거나 외래 키를 우회하지 말고, 백업과 별도 이관 계획이 없다면 0010을 유지합니다.
 
 0.3.19에는 데이터베이스 migration이 없습니다. 기존 0009 stage 레지스트리와 0008 준비 증적을 사용합니다. controller를 먼저 올린 뒤 대상 Agent를 작은 batch로 0.3.19 이상에 올리고, 새 heartbeat·probe에서 버전과 rank별 `STAGE` marker projection을 확인합니다. Agent가 0.3.18이면 기존 `FULL_SNAPSHOT` 엄격 실행은 유지할 수 있지만 `--stage-variant` 준비·시작·재시작·롤백 대상 시작은 거부됩니다. 첫 STAGE 적용 전에 preview가 task 0개인지, 각 rank 매니페스트가 기대 UUID에 결합됐는지, 실제 GPU harness 기본값이 `NOT_RUN(77)`인지 확인합니다.
 

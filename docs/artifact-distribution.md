@@ -131,6 +131,47 @@ dure admin deployment prepare <deployment-id> \
 dure admin deployment preparation <preparation-id>
 ```
 
+준비 조회 응답과 CLI의 기존 JSON 출력에는 전체 `progress`와 각 노드의
+`progress`가 함께 들어갑니다. `expected_bytes`는 노드에 고정된 정규
+매니페스트 파일 전체 바이트의 합이고, `verified_bytes`는 **현재 모델 시도가
+완료되어 전체 매니페스트 검증에 성공한 바이트만** 합산합니다.
+`bytes_source=COMPLETED_MODEL_VERIFICATION`은 완료된 무결성 검증의 출처를
+명시합니다.
+
+다운로드 관측은 별도의 `download_expected_bytes`, `downloaded_bytes`,
+`download_bytes_source`로 표시합니다. `download_expected_bytes`는 한
+매니페스트가 참조하는 불변 청크를 digest 기준으로 중복 제거한 바이트 합입니다.
+`downloaded_bytes`는 현재 중앙 모델 시도에서 각 고유 청크에 대해 한 번이라도
+관측한 가장 큰 로컬 준비 위치를 합한 단조 증가 high-water입니다. 새로 받은
+부분 파일 쓰기뿐 아니라 이미 검증된 CAS 청크, 완성 staging·final 재사용을
+포함하며, task 큐잉 시 서버가 0으로 초기화하고 성공 완료 시 서버가 전체 값으로
+정규화할 수 있습니다.
+
+이 값은 실제 네트워크 전송량·순간 속도·현재 디스크에 남은 검증 바이트가
+아닙니다. digest 불일치 때문에 부분 파일을 0으로 되돌려도 중앙 high-water는
+감소하지 않으므로 100%가 먼저 보일 수 있으며, 이는 `READY`나 전체 검증 성공의
+증거가 아닙니다. `verified_bytes`, 모델 단계 성공과 exact 중앙 `READY`를 함께
+확인해야 합니다. 이미지 pull에는 같은 바이트 계측이 없습니다.
+
+`download_bytes_source`의 폐쇄형 의미는 다음과 같습니다.
+
+- `NOT_STARTED`: 모델 시도가 아직 만들어지지 않아 서버가 0으로 표시합니다.
+- `MODEL_PREPARATION_HIGH_WATER`: 0으로 초기화된 현재 시도의 로컬 준비 high-water이며 Agent 보고와 성공 완료 정규화를 포함합니다.
+- `DERIVED_FROM_COMPLETED_MODEL_VERIFICATION`: 구 버전의 성공 시도에 진행 JSON이 없지만 완료 검증으로 전체 로컬 준비를 도출했습니다.
+- `UNAVAILABLE`: 현재 시도의 진행 JSON이 없거나 형식·범위가 잘못되어 수치를 안전하게 알 수 없습니다.
+- `MIXED`: 전체 투영에 서로 다른 노드별 출처가 섞였습니다.
+
+downloader 내부의 제한 재시도는 같은 중앙 모델 시도 안에서 일어나므로
+`retry_count`를 늘리지 않습니다. 중앙 task가 실패하고 명시적 prepare 재적용으로
+새 `attempt_no`가 생길 때만 중앙 재시도 횟수가 증가합니다.
+
+`stage`는 `MODEL`, `IMAGE`, `COMPLETE`, `FAILED`의 폐쇄형 값입니다. 여러 노드가
+서로 다른 단계를 동시에 수행하면 전체 단계는 배포가 아직 통과하지 못한 가장
+이른 gate인 `MODEL`을 먼저 표시합니다. 노드별 `model`·`image`에는 `status`,
+`current_attempt`, `retry_count`, `failure_code`가 있고, 전체에는 단계별 누적
+재시도 횟수와 현재 재시도 실행 여부가 표시됩니다. 이 투영은 기존 준비·시도
+행을 읽어 결정론적으로 계산하며 별도의 작업이나 호스트 변경을 만들지 않습니다.
+
 추천이 `STAGE`를 선택한 경우 `--stage-variant sha256:<64-hex>`를 preview와 apply에 같은 값으로 추가할 수 있습니다. 이 옵션은 세대에 이미 고정된 digest와의 일치 assertion이며, 생략해도 선택은 유지됩니다. 다른 digest, `FULL_SNAPSHOT` 세대의 digest 주입, preview와 apply 사이의 변경은 충돌로 거부합니다.
 
 ```text
@@ -174,11 +215,13 @@ PREPARE_IMAGE
 
 모든 노드의 두 단계가 성공하면 준비 계획의 정확한 콘텐츠 주소 캐시 identity와 이미지 다이제스트가 해당 추천 세대의 실행 증거가 됩니다. 추천 세대의 apply·start·restart·verify는 매번 exact 캐시가 `READY`인지, 그 `READY`가 현재 성공한 모델 시도인지, 현재 이미지 시도가 계획의 최신 OCI digest를 성공적으로 검사했는지를 다시 확인합니다. `STALE`·`MISSING`·`CORRUPT`·`QUARANTINED`, 오래된 모델 시도, 과거 이미지 성공이나 digest 불일치는 `DEPLOYMENT_ARTIFACT_CACHE_NOT_READY` 또는 준비 증적 오류로 거부합니다. 기존 수동 deployment의 명시적 로컬 캐시 경로는 호환되지만, 추천 세대가 그 legacy 경로로 준비 게이트를 우회할 수는 없습니다. 중앙 배포 `VERIFY`가 실패하면 해당 노드의 exact 캐시는 `CORRUPT`로 투영돼 다음 소비를 차단합니다.
 
-롤백은 준비 서비스의 네트워크 복구 경로가 아닙니다. 추천으로 만들어진 롤백 대상에는 과거에 성공한 정확한 준비 증적과 현재 exact `READY` 캐시가 있어야 하며, 기존 검증 캐시와 로컬 다이제스트 이미지만 사용합니다. 롤백 중 새 `PREPARE_MODEL`·`PREPARE_IMAGE`, 모델 다운로드나 이미지 pull은 만들지 않습니다. 적용 전 검사에 더해 모든 노드의 `STOP_SOURCE` 성공 직후, `START_TARGET` task를 만들기 전에 target의 `READY`, 현재 모델 시도와 최신 이미지 digest 증적을 잠금 상태에서 다시 검사합니다. 이 사이 캐시가 사라지거나 손상되면 `ROLLBACK_TARGET_CACHE_NOT_READY`로 operation을 실패시키고 시작 task는 0개입니다. 소스는 이미 중지됐을 수 있으므로 별도 준비 절차로 증적을 복구할 때까지 중단이 계속될 수 있습니다.
+롤백은 준비 서비스의 네트워크 복구 경로가 아닙니다. 추천으로 만들어진 롤백 대상에는 과거에 성공한 정확한 준비 증적과 현재 exact `READY` 캐시가 있어야 하며, 기존 검증 캐시와 로컬 다이제스트 이미지만 사용합니다. 롤백 중 새 `PREPARE_MODEL`·`PREPARE_IMAGE`, 모델 다운로드나 이미지 pull은 만들지 않습니다. 엄격한 backend에서는 노드·GPU·role·rank·expected runtime rank·runtime address와 backend·vLLM·TP/PP·Ray·network 토폴로지가 소스와 대상에서 같아야 합니다. 모델·revision·layer 범위·매니페스트·variant 및 `FULL_SNAPSHOT`/`STAGE` identity는 세대별로 독립 검증되고 대상 exact 준비 게이트를 통과하면 달라도 됩니다. legacy 계획은 layer 범위도 계속 같은 토폴로지로 비교합니다. 적용 전 검사에 더해 모든 노드의 `STOP_SOURCE` 성공 직후, `START_TARGET` task를 만들기 전에 target의 `READY`, 현재 모델 시도와 최신 이미지 digest 증적을 잠금 상태에서 다시 검사합니다. 이 사이 캐시가 사라지거나 손상되면 `ROLLBACK_TARGET_CACHE_NOT_READY`로 operation을 실패시키고 시작 task는 0개입니다. 소스는 이미 중지됐을 수 있으므로 별도 준비 절차로 증적을 복구할 때까지 중단이 계속될 수 있습니다.
 
 ## 중앙 캐시 상태와 권위 있는 증거
 
 중앙은 성공한 준비가 확인한 노드별 exact identity만 `node_artifact_caches`에 투영하고, 모든 상태 변경 근거를 순번이 증가하는 append-only `artifact_cache_events`에 남깁니다. `FULL_SNAPSHOT` identity는 매니페스트 digest이고, `STAGE` identity는 source·variant·runtime·topology·rank·tensor-key 계약 전체에서 계산한 digest입니다. 같은 digest에 다른 계약을 연결할 수 없습니다.
+
+추가 전용 계약은 서비스 코드만의 관례가 아닙니다. SQLite는 `WITHOUT ROWID` 테이블과 `UPDATE`·`DELETE` 및 충돌 `INSERT OR REPLACE` 거부 트리거를 사용하고 실제 SQLite raw SQL·ORM 변경 테스트를 수행합니다. PostgreSQL migration은 `UPDATE`·`DELETE` 행 트리거와 `TRUNCATE` 문장 트리거를 생성합니다. 일반 단위 suite의 PostgreSQL 범위는 이 DDL 생성·정리의 mock/compile 검증이며 실제 PostgreSQL 서버에서 실행한 증거가 아닙니다. DB 소유자나 상위 권한의 DDL까지 막는 WORM 저장소도 아니므로 DB 권한 분리·백업·외부 감사 보존을 별도로 운영해야 합니다.
 
 | 상태 | 의미 | 배포 소비 |
 | --- | --- | --- |
@@ -322,6 +365,8 @@ Agent 준비기는 노드 로컬 설정으로 생성한 검증된 `TrustedHTTPSO
 - 현재 HTTPS 전송기는 인증 token, cookie 또는 사용자 지정 header를 지원하지 않습니다. 별도 인증 정보 없이 네트워크와 TLS 경계에서 접근 가능한 신뢰 origin이 필요합니다.
 - 중앙 캐시의 exact final 참조 검사와 보존형 quarantine는 제공하지만 자동 경보, CAS 청크 단위 전역 참조 수집, 자동 eviction·삭제·보존 만료는 없습니다.
 - 추천기는 `STAGE` variant를 자동 선택하지만 수락 뒤 자동 fallback하지 않습니다. rank별 노드 다운로드·원자적 활성화와 stage-local `sharded_state` 소비는 제공하지만 P2P 청크 전송은 없습니다.
+- 공유 파일시스템을 모델 전달 계층으로 자동 구성하거나 여러 노드가 하나의 가변 모델 디렉터리를 함께 사용하게 하지 않습니다. erasure coding도 제공하지 않으며 각 노드는 선택된 불변 매니페스트에서 자신의 exact 파일을 로컬 캐시로 준비합니다.
+- 지원 목록 밖의 모델 family·quantization·TP/PP 조합을 자동 추정하지 않습니다. 캐시 자동 삭제·퇴출과 추천 직후 자동 준비·배포도 없으며, 준비와 배포에는 각각 운영자의 명시적 `--apply`가 필요합니다.
 
 ## 무결성과 신뢰 경계
 

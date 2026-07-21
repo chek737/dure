@@ -195,7 +195,7 @@ DISCOVERED → PROBING → ELIGIBLE → PLANNED
 ## 현재 제한 사항
 
 - 현재 `--model auto`는 버전이 있는 Qwen2.5 AWQ 정적 카탈로그와 결정론적 선택기를 사용합니다. 중앙 추천의 다중 노드 후보는 정확히 정렬된 노드 UUID 조합·릴리스·배치 프로필·런타임·현재 인벤토리 지문에 결합된 24시간 이내의 최신 `PASSED` 네트워크·NCCL 증적이 있어야 합니다. 로컬 `dure plan --model auto`는 기존 3×24GB 계획 호환성을 위해 이 중앙 증적 검사만 예외로 두고 계획에 검증 경고를 남깁니다. 중앙 모델 레지스트리, 벤치마크 증적 기반 `ACTIVE` 승격 게이트, 추천 스냅샷과 명시적 수락, 세대별 적용·검증 상태와 명시적 롤백도 제공합니다.
-- 롤백은 최신 세대의 검증된 직전 세대로만 가능하며, 전체 배정 노드·동일 토폴로지·승인·온라인 상태와 backend별 최소 Agent 버전을 요구합니다. legacy는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이고 `STAGE` 대상을 다시 시작할 때는 0.3.19 이상입니다. 추천으로 만든 대상에는 exact `READY`, 현재 모델 시도와 최신 이미지 digest 준비 증적이 필요합니다. 롤백 중에는 모델 다운로드나 이미지 pull을 허용하지 않고, 소스 중지 뒤 대상 시작 직전에 이 증적을 다시 검사합니다. 같은 GPU에서 이전 세대 컨테이너를 다시 만드는 절차이므로 서비스 중단이 생길 수 있으며 블루·그린 전환이 아닙니다.
+- 롤백은 최신 세대의 검증된 직전 세대로만 가능하며, 전체 배정 노드와 실제 실행 토폴로지·승인·온라인 상태, backend별 최소 Agent 버전을 요구합니다. 엄격한 `VLLM_RAY_PP_V1`에서 동일해야 하는 실행 토폴로지는 노드·GPU·role·rank·expected runtime rank·runtime address와 backend·vLLM·TP/PP·Ray·network 결합입니다. 각 세대의 모델·revision·layer 범위·매니페스트·variant와 `FULL_SNAPSHOT`/`STAGE` cache identity는 독립적으로 유효하고 대상의 exact 준비 게이트를 통과하면 달라도 됩니다. legacy 계획은 layer 범위도 토폴로지로 계속 비교합니다. legacy는 Agent 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이고 `STAGE` 대상을 다시 시작할 때는 0.3.19 이상입니다. 추천으로 만든 대상에는 exact `READY`, 현재 모델 시도와 최신 이미지 digest 준비 증적이 필요합니다. 롤백 중에는 모델 다운로드나 이미지 pull을 허용하지 않고, 소스 중지 뒤 대상 시작 직전에 이 증적을 다시 검사합니다. 같은 GPU에서 이전 세대 컨테이너를 다시 만드는 절차이므로 서비스 중단이 생길 수 있으며 블루·그린 전환이 아닙니다.
 - 중앙 제어면은 승인된 단일 노드에서 고정된 네 가지 작업 부하를 `BENCHMARK` 작업으로 실행하고 결과를 증적으로 수집할 수 있습니다. 자동 실행은 `/var/lib/dure/models`에 펼쳐지고 `.dure-model.json`으로 고정 식별자를 결합한 모델과 로컬 다이제스트 이미지를 요구하며, Hugging Face hub snapshot, 다중 노드 네트워크·NCCL 시험, 전체 동시성 매트릭스와 24시간 복구 검증은 아직 지원하지 않습니다.
 - 중앙 아티팩트 매니페스트 등록·조회, 콘텐츠 주소 기반 `FULL_SNAPSHOT`·rank별 `STAGE` 준비기와 명시적 중앙 준비 흐름은 구현되었습니다. 준비 preview는 DB 계획만 만들고, 별도 적용 뒤 각 노드에서 `PREPARE_MODEL → PREPARE_IMAGE`를 순서대로 수행합니다. 모델은 전체 청크·파일 해시와 marker를 검증하고 이미지는 다이제스트 고정 참조를 pull한 뒤 다시 inspect합니다. 추천이나 수락 자체는 다운로드를 시작하지 않으며, 현재 성공 시도에 결합된 exact `READY` 캐시와 최신 이미지 digest 증적이 없는 추천 세대는 apply·start·restart·verify할 수 없습니다.
 - 오염된 CAS·staging·final은 덮어쓰거나 자동 삭제하지 않고 실패합니다. `artifact-cache quarantine`은 preview에서 참조만 검사하고, `--apply` 뒤 exact final 캐시 디렉터리 하나만 `.dure-quarantine` 아래로 원자 이동해 보존합니다. 공유 CAS 청크, staging, 다른 캐시는 옮기지 않으며 자동 퇴출·삭제는 제공하지 않습니다.
@@ -205,6 +205,7 @@ DISCOVERED → PROBING → ELIGIBLE → PLANNED
 - 중앙 캐시는 `READY`·`STALE`·`MISSING`·`CORRUPT`·`QUARANTINED`로 추적합니다. stage variant 철회는 `STALE`, 완전한 probe의 부재는 `MISSING`, unsafe·무결성 이상과 중앙 배포 검증 실패는 `CORRUPT`로 닫습니다. 현재 준비 성공만 다시 `READY`를 만들 수 있습니다.
 - 명시적 `deployment create` 긴급 복구 경로는 여전히 프로필 JSON 파일이 필요합니다. 중앙에 저장된 프로필만으로 계획을 만드는 경로는 유효한 추천을 명시적으로 수락할 때만 제공됩니다.
 - 적용 모드는 Docker만 지원하며, 물리 노드당 GPU 한 장만 배정합니다.
+- 노드 간 P2P 청크 전송, 공유 파일시스템을 이용한 단일 모델 저장소, erasure coding은 지원하지 않습니다. 지원 목록 밖의 모델 family를 자동 추정하지 않고, 캐시 자동 삭제·퇴출이나 추천 직후 자동 준비·배포도 수행하지 않습니다.
 - Dure가 직접 실행하는 다중 노드 네트워크 벤치마크와 NCCL 집합 연산 조사는 아직 구현되지 않았습니다.
 - 정규화된 모델·stage 아티팩트 매니페스트 등록은 제공하지만 SHA-256과 exporter 다이제스트는 게시자 서명이나 신뢰 provenance가 아닙니다. 게시자·이미지 서명 검증은 계획 단계입니다.
 - 게이트웨이, 최종 사용자 인증, 크레딧 원장, WireGuard 자동화, 공개 노드 샌드박스는 아직 제공하지 않습니다.
@@ -287,6 +288,8 @@ dure admin deployment rollback <latest-deployment-id> \
 ```
 
 `recommend`는 추천과 정규화된 인벤토리 스냅샷 한 건만 멱등하게 저장합니다. 같은 품질에서는 exact `VALIDATED` `STAGE`를 먼저 평가하고 `FULL_SNAPSHOT`도 독립 후보로 평가하며, 가능한 후보가 없으면 더 작은 `ACTIVE` 모델이나 다른 노드 조합의 탈락 사유를 남깁니다. `accept`는 저장 당시와 현재의 추천 ID·카탈로그·정책·인벤토리 지문·선택 결과가 모두 같을 때만 `CREATED` 배포 세대 한 건을 만들며, 같은 요청의 재시도는 기존 세대를 반환합니다. 이전 세대를 지정하면 해당 계보의 최신 세대에만 연결할 수 있습니다. 수락 뒤 준비 preview는 task를 0개 만들고, 같은 요청에 `--apply`를 명시해야 모델 준비를 큐잉합니다. 각 노드의 모델 준비가 성공한 뒤에만 그 노드의 이미지 준비를 시작하며, 실패 뒤 같은 적용 요청은 성공한 단계를 반복하지 않고 현재 실패 단계만 새 시도 번호로 재시도합니다. 과거 시도의 늦은 완료는 현재 시도와 맞지 않으면 상태를 바꾸지 못합니다.
+
+`deployment preparation` 조회는 전체와 노드별 `expected_bytes`·`verified_bytes`, `download_expected_bytes`·`downloaded_bytes`, 현재 모델·이미지 단계와 중앙 시도·재시도 횟수를 `progress`로 반환합니다. `verified_bytes`는 현재 모델 시도의 전체 매니페스트 검증 성공만 집계합니다. `downloaded_bytes`는 중복을 제거한 청크별 로컬 준비 위치의 단조 증가 high-water로, 부분 파일 쓰기뿐 아니라 검증된 CAS·staging·final 재사용과 성공 시 정규화를 포함합니다. 따라서 실제 네트워크 전송량·속도·현재 유효 바이트가 아니며 100%여도 `READY`를 뜻하지 않습니다. 정확한 의미는 `download_bytes_source`로 구분하며 이미지 pull의 바이트 진행률은 제공하지 않습니다.
 
 중앙 추천이 선택한 다중 노드 세대는 `VLLM_RAY_PP_V1`로 고정됩니다. 저장과 작업 생성 시 전체 배정 노드 집합을 요구하고, hostname을 UUID로 추측해 보정하지 않으며, `FULL_SNAPSHOT` 실행은 모든 대상 Agent 0.3.18 이상, `STAGE` 준비·실행은 0.3.19 이상이어야 합니다. 추천기는 GPU 건강·VRAM·compute capability, driver 관측값, 런타임 GPU 아키텍처, Docker/NVIDIA runtime, 디스크와 네트워크 증적을 검사합니다. 사전 검사가 실패하면 컨테이너를 변경하지 않습니다. 적용 중 일부 노드가 실패하면 다음 단계로 진행하지 않으며, 전환이 이미 시작됐다면 이전 세대가 계속 실행된다고 가정하지 않고 상태를 확인해 명시적으로 복구합니다. 실패 노드는 `dure admin credential revoke <node-id>`로 작업 수신에서 격리하고, 새 probe·recommend로 다른 적격 노드나 더 작은 모델의 독립 `FULL_SNAPSHOT` 후보를 선택할 수 있습니다. 이미 수락한 세대 안에서 모델·캐시 형식을 자동 교체하지는 않습니다. Dure는 이 과정에서도 NVIDIA host driver를 자동 설치·변경하지 않습니다.
 

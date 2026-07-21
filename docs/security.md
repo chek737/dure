@@ -184,7 +184,7 @@ probe는 최대 256개의 marker metadata만 보고합니다. `scan_complete=tru
 
 롤백 API는 `node_ids`, 엄격한 `apply`, `serve`만 받습니다. 클라이언트가 대상 세대, 계획, 모델 다운로드, 이미지 내려받기, 임의 명령, Docker 옵션, 환경 변수, 마운트나 호스트 경로를 지정할 수 없습니다. 서버는 계보의 최신 소스와 그 소스가 직접 가리키는 상태가 `VERIFIED`이고 `verified_at`을 보유한 직전 세대를 선택하고 다음을 다시 검사합니다.
 
-- 소스와 대상의 전체 배정 노드·토폴로지가 정확히 같습니다.
+- 소스와 대상의 전체 배정 노드와 실제 실행 토폴로지가 정확히 같습니다. 엄격한 backend에서는 노드·GPU·role·rank·expected runtime rank·runtime address와 backend·vLLM·TP/PP·Ray·network 결합을 비교합니다. 모델·revision·layer 범위·매니페스트·variant·cache kind는 대상 exact 증적과 독립 계획 검증을 통과하면 세대 사이에 달라도 되며, legacy는 layer 범위도 비교합니다.
 - 요청 노드 집합이 전체 배정 노드와 정확히 같고 각 노드가 승인됨·온라인입니다.
 - 모든 노드의 Agent가 legacy는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이며 `STAGE` 대상은 0.3.19 이상입니다.
 - 소스와 대상 이미지가 OCI 다이제스트로 고정돼 있습니다.

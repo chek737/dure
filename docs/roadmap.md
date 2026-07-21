@@ -42,7 +42,7 @@ v0.3 계열의 모델 선택 기능은 독립적인 버전 브랜치와 Draft PR
 
 노드별 중앙 캐시는 `READY`·`STALE`·`MISSING`·`CORRUPT`·`QUARANTINED` 현재 상태와 추가 전용 이벤트를 사용합니다. 완전한 probe만 알려진 캐시를 강등하고, 불완전·legacy probe와 정상 관찰은 `READY`를 만들지 않습니다. 일반 적용·시작·재시작·검증과 롤백 대상 시작은 exact `READY`와 최신 이미지 준비 증적을 요구하며, 롤백은 `STOP_SOURCE` 뒤에도 이를 다시 검사합니다. 수동 격리는 활성 작업·operation·현재 세대·검증된 직접 롤백 선행 세대의 참조가 없을 때만 정확한 디렉터리를 보존 영역으로 원자적 이동합니다. 자동 퇴출·삭제와 노드 간 P2P 전송은 없습니다. Dure는 NVIDIA host driver를 자동 설치·교체하지 않습니다. 이 누적 브랜치는 공식 `main`에 병합되기 전까지 Draft 개발 상태입니다.
 
-롤백은 전체 노드·동일 토폴로지·승인·온라인·다이제스트 이미지 조건을 강제하고, `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 모든 노드 성공 게이트로 진행합니다. 실패 노드 재시도는 새 시도 번호로 펜싱합니다. 같은 GPU에서 컨테이너를 다시 만드는 방식이므로 중단 가능성이 있고 블루·그린 전환이 아닙니다. 네트워크·NCCL 자동 시험과 24시간 복구 검증은 여전히 후속 범위입니다.
+롤백은 전체 노드와 동일한 실제 실행 토폴로지·승인·온라인·다이제스트 이미지 조건을 강제하고, `STOP_SOURCE → START_TARGET(serve=false) → VERIFY_TARGET`과 선택적 `START_API → VERIFY_API`를 모든 노드 성공 게이트로 진행합니다. 엄격한 backend에서 모델·revision·layer 범위·매니페스트·variant 및 `FULL_SNAPSHOT`/`STAGE` identity는 세대별 exact 게이트를 통과하면 달라도 되며, legacy layer 범위 비교는 유지합니다. 실패 노드 재시도는 새 시도 번호로 펜싱합니다. 같은 GPU에서 컨테이너를 다시 만드는 방식이므로 중단 가능성이 있고 블루·그린 전환이 아닙니다. 네트워크·NCCL 자동 시험과 24시간 복구 검증은 여전히 후속 범위입니다.
 
 ## 단계별 계획
 

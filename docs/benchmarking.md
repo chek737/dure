@@ -1,6 +1,6 @@
 # 벤치마크 및 모델 자격 검증
 
-> 상태: **부분 구현**. 중앙 제어면의 벤치마크 증적 저장, 고정 식별자 검증, SLO 판정, `ACTIVE` 승격 게이트, 정확한 노드 조합의 최신 증적을 소비하는 읽기 전용 중앙 추천과 승인된 단일 GPU 노드의 폐쇄형 Agent 작업은 구현되었습니다. vLLM 단계 아티팩트의 export/load 증적은 별도 레지스트리에서 관리하며 모델 릴리스 자격 증적을 대신하지 않습니다. 전체 작업 부하 매트릭스, 다중 노드 네트워크·NCCL 시험 자동 실행, 실제 GPU stage 배포와 24시간 복구 검증은 후속 범위입니다.
+> 상태: **부분 구현**. 중앙 제어면의 벤치마크 증적 저장, 고정 식별자 검증, SLO 판정, `ACTIVE` 승격 게이트, 정확한 노드 조합의 최신 증적을 소비하는 읽기 전용 중앙 추천과 승인된 단일 GPU 노드의 폐쇄형 Agent 작업은 구현되었습니다. 중앙 아티팩트 캐시 수명 주기와 배포의 exact `READY` 소비 게이트도 구현되었지만, 자동 벤치마크는 아직 단일 GPU의 `FULL_SNAPSHOT` 캐시와 `dure-benchmark` 컨테이너 계약만 지원합니다. vLLM 단계 아티팩트의 export/load 증적은 별도 레지스트리에서 관리하며 모델 릴리스 자격 증적을 대신하지 않습니다. 전체 작업 부하 매트릭스, 다중 노드 네트워크·NCCL 시험 자동 실행, 실제 GPU stage 배포와 24시간 복구 검증은 후속 범위입니다.
 
 ## 현재 제공 범위
 
@@ -29,7 +29,15 @@
 6. 고정 이미지는 `dure-benchmark` 진입점을 제공해야 합니다. 실행 직전 `nvidia-smi`로 선택 GPU의 compute process가 없음을 다시 확인하고, MIG process는 상위 GPU를 안전하게 식별할 수 없으므로 하나라도 있으면 거부합니다. 컨테이너는 가장 큰 정상 GPU 한 장만 UUID로 할당하고, 읽기 전용 루트, 네트워크 없음, capability 제거, 권한 상승 금지, 비 root 사용자, `restart=no`와 고정 Dure 벤치마크 레이블로 실행됩니다. 메모리는 `min(전체 RAM, 가용 RAM) / 2`와 32GiB 중 작은 값으로 제한하고 8GiB 미만이면 실행하지 않으며, `memory-swap`을 같은 값으로 두어 추가 swap을 막습니다. CPU quota는 논리 CPU 수의 절반과 8코어 중 작은 값입니다. stdout·stderr는 실행 중 합계 64KiB로 제한하고 중앙에는 원문을 보내지 않습니다.
 7. Agent와 서버가 동일한 폐쇄형 결과 스키마와 유한 수치 범위를 검사합니다. 성공 결과는 자동으로 증적에 등록되고, SLO 미달도 정상 수집된 `FAILED` 증적으로 남습니다.
 
-`0.3.16`의 중앙 deployment 준비 기능은 이 벤치마크 실행기가 자동 호출하지 않습니다. `POST /v1/admin/benchmark-runs/prepare`는 모델 바이트를 준비하는 API가 아니라 DB에 고정 실행 문맥만 저장합니다. 벤치마크 캐시와 다이제스트 이미지는 실행 전에 별도의 명시적 deployment 준비 또는 검증된 운영 절차로 이미 존재해야 합니다. probe와 조정되는 독립 `READY` 캐시 수명주기는 후속 버전 범위입니다.
+`POST /v1/admin/benchmark-runs/prepare`는 모델 바이트를 준비하는 API가 아니라 DB에 고정 실행 문맥만 저장합니다. `0.3.20`의 중앙 deployment 준비는 추천 세대의 exact 모델 캐시와 다이제스트 고정 이미지를 준비하고, 현재 준비 시도의 성공만 노드별 `READY`로 투영합니다. 그러나 벤치마크 준비 API가 deployment 준비를 자동 호출하지는 않으므로, 모델 캐시와 다이제스트 이미지는 실행 전에 명시적 deployment 준비 또는 검증된 운영 절차로 이미 존재해야 합니다.
+
+## 아티팩트 캐시 게이트와 실패 대응
+
+추천으로 만든 배포의 apply·start·restart·verify와 rollback target 시작은 모든 대상 노드에서 선택된 exact 캐시가 현재 준비 시도에 결합된 `READY`이고 최신 이미지 digest 준비 증적이 있을 때만 작업을 만듭니다. `STALE`·`MISSING`·`CORRUPT`·`QUARANTINED`, 철회된 stage variant, 이전 시도의 늦은 보고나 이미지 drift는 실행 전에 거부됩니다. 추천과 수락 자체는 여전히 다운로드, pull, 배포 작업을 만들지 않습니다.
+
+자동 `BENCHMARK`는 배포 backend를 선택하는 경로가 아니며, 단일 GPU의 폐쇄형 `dure-benchmark` 컨테이너만 실행합니다. Agent는 실행 직전에 repository·revision·manifest·양자화·verification version이 모두 일치하는 Dure `FULL_SNAPSHOT` 캐시가 딱 하나인지 다시 검사합니다. `STAGE` 캐시, `VLLM_RAY_PP_V1` 다중 노드 backend, 다중 GPU 위치는 이 실행기가 지원하지 않으며 잘못된 조합은 `BENCHMARK_ARTIFACT_UNAVAILABLE` 또는 `MULTI_NODE_BENCHMARK_UNSUPPORTED`로 닫힙니다. 현재 중앙 benchmark apply는 `node_artifact_caches` 행 자체를 실행 증거로 소비하지 않으며, Agent의 exact 로컬 캐시·marker·이미지 재검사가 실행 게이트입니다.
+
+`dure admin artifact-cache verify <cache-id>`는 중앙 캐시 행과 참조 투영만 읽는 조회이며, 파일 전체 재해시나 벤치마크를 실행하지 않습니다. `artifact-cache quarantine`도 기본은 task 0개인 preview입니다. `--apply`는 현재·직전 세대, 활성 준비·배포·벤치마크 작업과 컨테이너 mount가 참조하지 않는 exact final 하나만 보존 영역으로 원자 이동합니다. 자동 삭제·퇴출·복구는 제공하지 않으며, 오염된 캐시는 격리한 뒤 현재 준비를 새로 성공시켜야 `READY`로 복구됩니다.
 
 작업 페이로드는 임의 명령, Docker 인자, 환경 변수, 마운트, 호스트 경로, Python 코드, 프롬프트, 토큰, 비밀값 또는 로그 필드를 허용하지 않습니다. 실패 시 중앙 DB와 감사 이벤트에는 고정 실패 코드만 저장하고 원문 stdout·stderr·예외문은 저장하지 않습니다.
 
