@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from dure.agent import TaskExecutor
+from dure.agent import Agent, TaskExecutor
 from dure.command import CommandResult
 from dure.planner import build_plan
+from dure.state import StateStore
 from tests.helpers import profile
 
 
@@ -60,6 +61,9 @@ class AgentTaskExecutorTests(unittest.TestCase):
                 self.assertEqual(stopped["checks"][0]["name"], "deployment-stop")
                 restarted = executor.execute({"type": "RESTART_DEPLOYMENT", "payload": payload})
                 self.assertTrue(restarted["checks"])
+                unjoined = executor.execute({"type": "UNJOIN_NODE", "payload": {}})
+                self.assertTrue(unjoined["unjoined"])
+                self.assertEqual(StateStore(state_path).load().phase, "UNJOINING")
         stop_calls = [call for call in runner.calls if call[:2] == ("docker", "stop")]
         self.assertTrue(stop_calls)
         self.assertNotIn("sh", {part for call in runner.calls for part in call})
@@ -67,3 +71,33 @@ class AgentTaskExecutorTests(unittest.TestCase):
     def test_arbitrary_task_type_is_rejected(self):
         with self.assertRaises(ValueError):
             TaskExecutor("node").execute({"type": "SHELL", "payload": {"command": "id"}})
+
+    def test_remote_unjoin_disables_agent_and_scrubs_local_credential(self):
+        runner = AgentRunner()
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "agent.json"
+            state_path = Path(temporary) / "state.json"
+            history_path = Path(temporary) / "history.json"
+            config = {
+                "server": "https://control.example",
+                "node_id": "node-1",
+                "credential": "secret",
+                "install_id": "install-12345678",
+                "state_file": str(state_path),
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            agent = Agent(
+                config,
+                config_path=config_path,
+                history_path=history_path,
+                runner=runner,
+            )
+
+            agent._finish_unjoin()
+
+            self.assertFalse(agent.running)
+            self.assertEqual(
+                json.loads(config_path.read_text(encoding="utf-8")),
+                {"install_id": "install-12345678"},
+            )
+            self.assertIn(("systemctl", "disable", "dure-agent"), runner.calls)

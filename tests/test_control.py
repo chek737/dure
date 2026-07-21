@@ -8,7 +8,14 @@ from pathlib import Path
 from sqlalchemy import select
 
 from dure.control.db import Base, make_engine, make_session_factory
-from dure.control.models import EnrollmentToken, NodeCredential, TaskStatus, TaskType, utcnow
+from dure.control.models import (
+    EnrollmentToken,
+    NodeCredential,
+    NodeProfileRecord,
+    TaskStatus,
+    TaskType,
+    utcnow,
+)
 from dure.control.service import (
     authenticate_node,
     claim_enrollment,
@@ -103,6 +110,84 @@ class ControlServiceTests(unittest.TestCase):
             )
             self.assertEqual(len(tasks), 1)
             self.assertFalse(errors)
+
+    def test_successful_unjoin_revokes_only_after_agent_cleanup(self):
+        with self.factory() as session:
+            node, credential = self.enroll(session)
+            _, tasks, errors = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.UNJOIN_NODE,
+                deployment_id=None,
+                options={},
+            )
+            self.assertFalse(errors)
+            _, blocked_tasks, blocked_errors = create_tasks(
+                session,
+                node_ids=[node.id],
+                task_type=TaskType.PROBE,
+                deployment_id=None,
+                options={},
+            )
+            self.assertFalse(blocked_tasks)
+            self.assertEqual(blocked_errors[node.id], "node is pending unjoin")
+            task = claim_task(session, node.id)
+            self.assertEqual(task.id, tasks[0].id)
+            self.assertTrue(
+                finish_task(session, task, node.id, result={"unjoined": True}, error=None)
+            )
+            self.assertFalse(session.get(type(node), node.id).approved)
+            self.assertIsNone(authenticate_node(session, credential))
+
+    def test_failed_unjoin_keeps_node_joined_and_cpu_node_is_rejected(self):
+        with self.factory() as session:
+            gpu, credential = self.enroll(session, "gpu")
+            _, tasks, errors = create_tasks(
+                session,
+                node_ids=[gpu.id],
+                task_type=TaskType.UNJOIN_NODE,
+                deployment_id=None,
+                options={},
+            )
+            self.assertFalse(errors)
+            task = claim_task(session, gpu.id)
+            self.assertTrue(
+                finish_task(session, task, gpu.id, result=None, error="docker stop failed")
+            )
+            self.assertIsNotNone(authenticate_node(session, credential))
+
+            cpu, _ = self.enroll(session, "cpu")
+            profile_record = session.get(NodeProfileRecord, cpu.id)
+            profile_record.profile = profile("cpu", gpu_memory_mib=None).to_dict()
+            session.commit()
+            _, tasks, errors = create_tasks(
+                session,
+                node_ids=[cpu.id],
+                task_type=TaskType.UNJOIN_NODE,
+                deployment_id=None,
+                options={},
+            )
+            self.assertFalse(tasks)
+            self.assertEqual(errors[cpu.id], "unjoin is limited to registered GPU nodes")
+
+    def test_unjoined_installation_can_rejoin_as_pending(self):
+        with self.factory() as session:
+            node, _ = join_node(
+                session,
+                install_id="install-rejoin",
+                profile=profile("first").to_dict(),
+                agent_version="0.3.0",
+            )
+            self.assertTrue(revoke_node(session, node.id))
+            rejoined, credential = join_node(
+                session,
+                install_id="install-rejoin",
+                profile=profile("second").to_dict(),
+                agent_version="0.3.1",
+            )
+            self.assertEqual(rejoined.id, node.id)
+            self.assertFalse(rejoined.approved)
+            self.assertEqual(authenticate_node(session, credential).id, node.id)
 
     def test_connectivity_thresholds(self):
         now = utcnow()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from dure.cli import _profiles_from_inventory
+from dure.cli import _gpu_node_ids_from_inventory, _profiles_from_inventory
 
 from .helpers import profile
 
@@ -30,6 +30,22 @@ class InventoryPlanningTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "pending, offline"):
             _profiles_from_inventory(inventory, ["pending", "offline"])
+
+    def test_unjoin_all_selects_only_approved_gpu_nodes(self):
+        cpu = node("cpu")
+        cpu["profile"] = profile("cpu", gpu_memory_mib=None).to_dict()
+        inventory = {
+            "nodes": [node("gpu-b"), cpu, node("pending", approved=False), node("gpu-a")]
+        }
+        self.assertEqual(_gpu_node_ids_from_inventory(inventory), ["gpu-a", "gpu-b"])
+
+    def test_unjoin_one_rejects_cpu_or_pending_node(self):
+        cpu = node("cpu")
+        cpu["profile"] = profile("cpu", gpu_memory_mib=None).to_dict()
+        inventory = {"nodes": [cpu, node("pending", approved=False)]}
+        for node_id in ("cpu", "pending", "missing"):
+            with self.subTest(node_id=node_id), self.assertRaisesRegex(ValueError, "non-GPU"):
+                _gpu_node_ids_from_inventory(inventory, node_id)
 
 
 if __name__ == "__main__":

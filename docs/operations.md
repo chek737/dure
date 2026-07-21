@@ -49,6 +49,35 @@ dure admin probe --nodes <node-id>
 
 hostname, GPU inventory, network 주소, 운영자 소유권을 검토한 뒤에만 승인합니다. pending 노드는 heartbeat는 가능하지만 task 생성과 claim 양쪽에서 거부됩니다.
 
+## GPU 노드 unjoin
+
+현재 GPU 노드 한 대에서 직접 Dure를 해제합니다.
+
+```bash
+sudo dure unjoin
+```
+
+이 명령은 state에 기록된 deployment ID와 정확히 일치하는 Dure 컨테이너를 중지하고,
+`dure-agent`를 비활성화한 뒤 중앙 credential과 로컬 credential을 폐기합니다. 모델 cache,
+NVIDIA driver, Dure label이 없는 컨테이너는 삭제하지 않습니다.
+
+중앙 관리자는 단일 GPU 또는 승인된 전체 GPU pool을 비동기로 해제할 수 있습니다.
+
+```bash
+dure admin unjoin --node <node-id>
+dure admin unjoin --all
+dure admin tasks --watch
+```
+
+`--all`은 저장된 profile에 GPU가 있는 승인 노드만 선택하며 CPU utility 노드는 제외합니다.
+오프라인 노드의 작업은 queued 상태로 남아 해당 agent가 다시 연결되면 수행됩니다. 각 노드는
+로컬 정리에 성공한 뒤에만 `UNJOINED`로 전환되고 credential이 폐기됩니다. 실패한 노드는
+승인과 credential을 유지하므로 원인을 해결한 뒤 재시도할 수 있습니다.
+
+단일 worker unjoin은 실행 중인 pipeline을 자동으로 n-1로 재구성하지 않습니다. 남은 GPU로
+replacement deployment를 생성하고 검증해야 합니다. 다시 참가하는 노드는 같은 node UUID로
+pending 등록되며 중앙 승인을 다시 받아야 합니다.
+
 ## Codex 기반 용량 진단
 
 Codex는 관리자 컴퓨터에만 설치·로그인합니다.

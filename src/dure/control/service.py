@@ -83,23 +83,49 @@ def join_node(
 ) -> tuple[Node, str]:
     """Register an unauthenticated node as pending operator approval."""
     parsed = NodeProfile.from_dict(profile)
-    if session.scalar(select(Node).where(Node.install_id == install_id)) is not None:
-        raise ValueError("installation is already joined")
-    node = Node(
-        install_id=install_id,
-        display_name=parsed.hostname,
-        hostname=parsed.hostname,
-        agent_version=agent_version,
-        approved=False,
-        last_seen=utcnow(),
-        observed_phase="DISCOVERED",
-    )
-    session.add(node)
-    session.flush()
-    session.add(NodeProfileRecord(node_id=node.id, profile=profile))
+    node = session.scalar(select(Node).where(Node.install_id == install_id))
+    action = "node.join"
+    if node is not None:
+        active_credential = session.scalar(
+            select(NodeCredential.id).where(
+                NodeCredential.node_id == node.id,
+                NodeCredential.revoked_at.is_(None),
+            )
+        )
+        if active_credential is not None:
+            raise ValueError("installation is already joined")
+        action = "node.rejoin"
+        node.display_name = parsed.hostname
+        node.hostname = parsed.hostname
+        node.agent_version = agent_version
+        node.approved = False
+        node.last_seen = utcnow()
+        node.observed_phase = "DISCOVERED"
+        node.observed_role = None
+        node.observed_deployment_id = None
+        node.desired_state = None
+        profile_record = session.get(NodeProfileRecord, node.id)
+        if profile_record is None:
+            session.add(NodeProfileRecord(node_id=node.id, profile=profile))
+        else:
+            profile_record.profile = profile
+            profile_record.updated_at = utcnow()
+    else:
+        node = Node(
+            install_id=install_id,
+            display_name=parsed.hostname,
+            hostname=parsed.hostname,
+            agent_version=agent_version,
+            approved=False,
+            last_seen=utcnow(),
+            observed_phase="DISCOVERED",
+        )
+        session.add(node)
+        session.flush()
+        session.add(NodeProfileRecord(node_id=node.id, profile=profile))
     raw_credential = secrets.token_urlsafe(48)
     session.add(NodeCredential(node_id=node.id, credential_hash=secret_hash(raw_credential)))
-    audit(session, f"node:{node.id}", "node.join", node.id, "pending")
+    audit(session, f"node:{node.id}", action, node.id, "pending")
     session.commit()
     return node, raw_credential
 
@@ -135,6 +161,32 @@ def revoke_node(session: Session, node_id: str) -> bool:
     ):
         credential.revoked_at = now
     audit(session, "admin", "node.revoke", node_id, "success")
+    session.commit()
+    return True
+
+
+def _mark_node_unjoined(session: Session, node: Node, *, actor: str) -> None:
+    node.approved = False
+    node.observed_phase = "UNJOINED"
+    node.observed_role = None
+    node.observed_deployment_id = None
+    node.desired_state = None
+    now = utcnow()
+    for credential in session.scalars(
+        select(NodeCredential).where(
+            NodeCredential.node_id == node.id,
+            NodeCredential.revoked_at.is_(None),
+        )
+    ):
+        credential.revoked_at = now
+    audit(session, actor, "node.unjoin", node.id, "success")
+
+
+def unjoin_node(session: Session, node_id: str) -> bool:
+    node = session.get(Node, node_id)
+    if node is None:
+        return False
+    _mark_node_unjoined(session, node, actor=f"node:{node_id}")
     session.commit()
     return True
 
@@ -254,6 +306,21 @@ def create_tasks(
         if node is None or not node.approved:
             errors[node_id] = "unknown, pending, or revoked node"
             continue
+        pending_unjoin = session.scalar(
+            select(Task.id).where(
+                Task.node_id == node_id,
+                Task.type == TaskType.UNJOIN_NODE.value,
+                Task.status.in_([TaskStatus.QUEUED.value, TaskStatus.RUNNING.value]),
+            ).limit(1)
+        )
+        if pending_unjoin is not None:
+            errors[node_id] = "node is pending unjoin"
+            continue
+        if task_type == TaskType.UNJOIN_NODE:
+            profile_record = session.get(NodeProfileRecord, node_id)
+            if profile_record is None or not NodeProfile.from_dict(profile_record.profile).gpus:
+                errors[node_id] = "unjoin is limited to registered GPU nodes"
+                continue
         if deployment is not None and node_id not in assignments:
             errors[node_id] = "node is not assigned to deployment"
             continue
@@ -343,6 +410,8 @@ def finish_task(session: Session, task: Task, node_id: str, *, result: dict | No
     node = session.get(Node, node_id)
     if node is not None:
         node.desired_state = None
+    if not error and task.type == TaskType.UNJOIN_NODE.value and node is not None:
+        _mark_node_unjoined(session, node, actor=f"node:{node_id}")
     if not error and task.type == TaskType.PROBE.value and result and isinstance(result.get("profile"), dict):
         NodeProfile.from_dict(result["profile"])
         profile_record = session.get(NodeProfileRecord, node_id)

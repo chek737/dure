@@ -18,7 +18,7 @@ from .orchestrator import InitOrchestrator
 from .probe import NodeProbe
 from .readiness import ReadinessVerifier
 from .runtime import ContainerRuntime
-from .state import StateStore
+from .state import NodeState, StateStore
 from .task import TaskType
 
 
@@ -96,6 +96,60 @@ def _enable_agent_service(runner=None) -> None:
         raise RuntimeError(f"dure-agent could not be started: {detail}")
 
 
+def _retire_local_registration(
+    config_path: Path,
+    config: dict,
+    *,
+    state_path: Path,
+) -> None:
+    """Remove the credential while preserving the install ID for a later rejoin."""
+    install_id = config.get("install_id")
+    if install_id:
+        _atomic_json(config_path, {"install_id": install_id})
+    else:
+        config_path.unlink(missing_ok=True)
+    StateStore(state_path).save(
+        NodeState(
+            phase="UNJOINED",
+            node_id=config.get("node_id"),
+            detail="Node left the Dure control plane and released its deployment GPU",
+        )
+    )
+
+
+def unjoin_control_plane(
+    *,
+    config_path: Path = DEFAULT_CONFIG,
+    runner=None,
+) -> dict:
+    """Safely stop this node's Dure deployment and revoke its registration."""
+    if os.geteuid() != 0:
+        raise PermissionError("dure unjoin must run as root")
+    config = _read_json(config_path)
+    if not {"server", "node_id", "credential"} <= set(config):
+        raise ValueError("node is not joined")
+    service_runner = runner or SubprocessRunner()
+    state_path = Path(config.get("state_file", DEFAULT_STATE))
+    state = StateStore(state_path).load()
+    if state.deployment_id:
+        stopped = ContainerRuntime(service_runner, "docker").stop_deployment(state.deployment_id)
+        if not stopped.ok:
+            raise RuntimeError(stopped.detail)
+    disabled = service_runner.run(
+        ["systemctl", "disable", "--now", "dure-agent"], timeout=60
+    )
+    if not disabled.ok:
+        raise RuntimeError(disabled.stderr or disabled.stdout or "dure-agent could not be disabled")
+    client = JSONClient(
+        config["server"],
+        config["credential"],
+        verify_tls=config.get("verify_tls", True),
+    )
+    response = client.request("POST", "/v1/agent/unjoin")
+    _retire_local_registration(config_path, config, state_path=state_path)
+    return {"node_id": response.get("node_id", config["node_id"]), "status": "unjoined"}
+
+
 def join_control_plane(
     *,
     server: str | None = None,
@@ -161,6 +215,21 @@ class TaskExecutor:
         payload = task.get("payload") or {}
         if kind == TaskType.PROBE:
             return {"profile": self._profile().to_dict()}
+        if kind == TaskType.UNJOIN_NODE:
+            store = StateStore(self.state_path or DEFAULT_STATE)
+            state = store.load()
+            checks = []
+            if state.deployment_id:
+                check = ContainerRuntime(self.runner, "docker").stop_deployment(
+                    state.deployment_id
+                )
+                checks.append(check)
+                if not check.ok:
+                    raise RuntimeError(check.detail)
+            state.phase = "UNJOINING"
+            state.detail = "Deployment GPU released; waiting for control-plane revocation"
+            store.save(state)
+            return {"checks": [item.to_dict() for item in checks], "unjoined": True}
         plan = None
         if kind != TaskType.PROBE:
             if kind == TaskType.VERIFY and "plan" not in payload:
@@ -216,18 +285,44 @@ class TaskExecutor:
 
 
 class Agent:
-    def __init__(self, config: dict, *, history_path: Path = DEFAULT_HISTORY, runner=None) -> None:
+    def __init__(
+        self,
+        config: dict,
+        *,
+        config_path: Path = DEFAULT_CONFIG,
+        history_path: Path = DEFAULT_HISTORY,
+        runner=None,
+    ) -> None:
         self.config = config
         if config.get("verify_tls", True) and not config["server"].startswith("https://"):
             raise ValueError("agent control-plane URL must use HTTPS")
         self.client = JSONClient(config["server"], config["credential"], verify_tls=config.get("verify_tls", True))
+        self.config_path = config_path
         self.history_path = history_path
         self.history = _read_json(history_path, {"completed": {}})
         self.state_path = Path(config.get("state_file", DEFAULT_STATE))
-        self.executor = TaskExecutor(config["node_id"], runner=runner, state_path=self.state_path)
+        self.runner = runner or SubprocessRunner()
+        self.executor = TaskExecutor(
+            config["node_id"], runner=self.runner, state_path=self.state_path
+        )
         self.running = True
 
     def stop(self, *_args) -> None:
+        self.running = False
+
+    def _finish_unjoin(self) -> None:
+        disabled = self.runner.run(["systemctl", "disable", "dure-agent"], timeout=60)
+        if not disabled.ok:
+            LOG.warning(
+                "node was unjoined but dure-agent could not be disabled: %s",
+                disabled.stderr or disabled.stdout,
+            )
+        try:
+            _retire_local_registration(
+                self.config_path, self.config, state_path=self.state_path
+            )
+        except OSError as exc:
+            LOG.error("node was unjoined but local credential cleanup failed: %s", exc)
         self.running = False
 
     def once(self) -> bool:
@@ -244,6 +339,8 @@ class Agent:
             else:
                 result = previous.get("result", previous)
                 self.client.request("POST", f"/v1/agent/tasks/{task_id}/complete", {"result": result})
+                if task.get("type") == TaskType.UNJOIN_NODE.value:
+                    self._finish_unjoin()
             return True
         renewal_stop = threading.Event()
 
@@ -262,6 +359,8 @@ class Agent:
             self.history["completed"] = dict(list(self.history["completed"].items())[-1000:])
             _atomic_json(self.history_path, self.history)
             self.client.request("POST", f"/v1/agent/tasks/{task_id}/complete", {"result": result})
+            if task.get("type") == TaskType.UNJOIN_NODE.value:
+                self._finish_unjoin()
         except Exception as exc:
             LOG.exception("task %s failed", task_id)
             error = str(exc)[:8192]
@@ -341,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         config = _read_json(args.config)
         if not {"server", "node_id", "credential"} <= set(config):
             parser.error("agent is not enrolled")
-        agent = Agent(config, history_path=args.history)
+        agent = Agent(config, config_path=args.config, history_path=args.history)
         signal.signal(signal.SIGTERM, agent.stop)
         signal.signal(signal.SIGINT, agent.stop)
         agent.run(args.interval)

@@ -24,6 +24,7 @@ class ControlAPITests(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+        self.client.app.state.engine.dispose()
         self.temporary.cleanup()
 
     def test_enroll_heartbeat_list_and_revoke(self):
@@ -44,6 +45,27 @@ class ControlAPITests(unittest.TestCase):
         self.assertEqual(nodes[0]["connectivity"], "online")
         self.assertEqual(self.client.post(f"/v1/admin/nodes/{node_id}/revoke", headers=self.admin).status_code, 200)
         self.assertEqual(self.client.post("/v1/agent/heartbeat", headers=agent_headers, json={"state": {}}).status_code, 401)
+
+    def test_node_can_unjoin_itself_and_credential_is_revoked(self):
+        created = self.client.post(
+            "/v1/nodes/join",
+            json={
+                "install_id": "install-self-unjoin",
+                "agent_version": "0.3.6",
+                "profile": profile("self-unjoin").to_dict(),
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+        headers = {"Authorization": f"Bearer {created.json()['credential']}"}
+        response = self.client.post("/v1/agent/unjoin", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "unjoined")
+        self.assertEqual(
+            self.client.post(
+                "/v1/agent/heartbeat", headers=headers, json={"state": {}}
+            ).status_code,
+            401,
+        )
 
     def test_admin_auth_is_required(self):
         self.assertEqual(self.client.get("/v1/admin/nodes").status_code, 401)

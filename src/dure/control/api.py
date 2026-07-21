@@ -29,6 +29,7 @@ from .service import (
     rotate_node_credential,
     save_deployment,
     save_heartbeat,
+    unjoin_node,
 )
 
 
@@ -124,6 +125,7 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         Base.metadata.create_all(engine)
     factory = make_session_factory(engine)
     app = FastAPI(title="Dure Control Plane", version=__version__)
+    app.state.engine = engine
     app.state.session_factory = factory
     expected_admin = admin_token or os.environ.get("DURE_ADMIN_TOKEN")
     get_session = partial(session_dependency, factory)
@@ -172,6 +174,12 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
     def heartbeat(body: Heartbeat, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
         save_heartbeat(session, node, body.state, body.profile)
         return {"ok": True, "approved": node.approved}
+
+    @app.post("/v1/agent/unjoin")
+    def agent_unjoin(node: Node = Depends(node_auth), session: Session = Depends(get_session)):
+        if not unjoin_node(session, node.id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "node not found")
+        return {"ok": True, "node_id": node.id, "status": "unjoined"}
 
     @app.post("/v1/agent/tasks/claim")
     def agent_claim(node: Node = Depends(node_auth), session: Session = Depends(get_session)):

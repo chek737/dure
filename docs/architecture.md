@@ -75,8 +75,14 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 - `START_DEPLOYMENT`
 - `STOP_DEPLOYMENT`
 - `RESTART_DEPLOYMENT`
+- `UNJOIN_NODE`
 
 에이전트는 HTTPS 폴링으로 한 번에 하나의 작업을 5분 임대로 요청하고 실행 중 임대를 갱신합니다. 완료한 작업 ID와 결과는 로컬에 보관하므로 재전달된 작업은 가능한 한 변경을 반복하지 않고 이전 결과를 보고합니다. PostgreSQL 노드 행 잠금은 같은 노드의 요청을 직렬화합니다.
+
+`UNJOIN_NODE`는 노드 state의 현재 deployment ID와 정확히 일치하는 Dure label 컨테이너만
+중지합니다. 노드가 정리 성공을 보고한 뒤 중앙에서 credential을 폐기하며, agent는 로컬
+credential을 제거하고 종료합니다. 전체 unjoin도 동일한 고정 작업을 GPU 노드별로 생성할
+뿐이며 임의 원격 명령이나 Dure 외부 컨테이너 정리를 허용하지 않습니다.
 
 계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
 
