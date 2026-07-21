@@ -200,6 +200,7 @@ class FakeRunner:
         self.response_factory = response_factory
         self.calls: list[tuple[str, ...]] = []
         self.limited_output_calls: list[tuple[tuple[str, ...], int]] = []
+        self.limited_output_timeouts: list[float] = []
 
     def exists(self, executable: str) -> bool:
         return executable in self.executables
@@ -234,6 +235,7 @@ class FakeRunner:
     ):
         command = tuple(argv)
         self.limited_output_calls.append((command, max_output_bytes))
+        self.limited_output_timeouts.append(timeout)
         result = self.run(argv, timeout=timeout, env=env)
         size = len(result.stdout.encode("utf-8")) + len(result.stderr.encode("utf-8"))
         if size > max_output_bytes:

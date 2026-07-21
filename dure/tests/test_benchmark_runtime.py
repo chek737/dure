@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dure.benchmark_runtime import (
+    BENCHMARK_CONTAINER_GRACE_SECONDS,
     BENCHMARK_ENTRYPOINT_CONTAINER_PATH,
     BENCHMARK_WORKLOADS,
     MAX_BENCHMARK_OUTPUT_BYTES,
@@ -290,6 +291,10 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(
             runner.limited_output_calls,
             [(command, MAX_BENCHMARK_OUTPUT_BYTES)],
+        )
+        self.assertEqual(
+            runner.limited_output_timeouts,
+            [900.0 + BENCHMARK_CONTAINER_GRACE_SECONDS],
         )
 
     def test_unsafe_packaged_entrypoint_is_rejected_before_docker(self):
