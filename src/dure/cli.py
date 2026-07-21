@@ -81,7 +81,18 @@ def _parser() -> argparse.ArgumentParser:
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
     deployment_create = deployment_sub.add_parser("create")
-    deployment_create.add_argument("--profile", type=Path, action="append", required=True)
+    deployment_source = deployment_create.add_mutually_exclusive_group(required=True)
+    deployment_source.add_argument("--profile", type=Path, action="append")
+    deployment_source.add_argument("--nodes", nargs="+")
+    deployment_source.add_argument(
+        "--all-online",
+        action="store_true",
+        help="Use every approved online GPU node in the next pipeline generation",
+    )
+    deployment_create.add_argument(
+        "--refresh", action="store_true", help="Refresh selected node profiles before planning"
+    )
+    deployment_create.add_argument("--timeout", type=float, default=180)
     deployment_create.add_argument("--model", default="auto")
     deployment_create.add_argument("--image", required=True)
     deployment_create.add_argument("--network-interface")
@@ -279,6 +290,36 @@ def _duration_seconds(value: str) -> int:
         raise ValueError(f"invalid duration: {value}") from exc
 
 
+def _profiles_from_inventory(
+    inventory: dict, node_ids: list[str] | None = None
+) -> list[NodeProfile]:
+    requested = list(dict.fromkeys(node_ids or []))
+    eligible = {
+        item.get("id"): item
+        for item in inventory.get("nodes", [])
+        if item.get("approved")
+        and item.get("connectivity") == "online"
+        and isinstance(item.get("profile"), dict)
+    }
+    if requested:
+        missing = [node_id for node_id in requested if node_id not in eligible]
+        if missing:
+            raise ValueError(
+                "unknown, pending, offline, or unprofiled node(s): " + ", ".join(missing)
+            )
+        values = [eligible[node_id] for node_id in requested]
+    else:
+        values = [eligible[node_id] for node_id in sorted(eligible)]
+    profiles: list[NodeProfile] = []
+    for item in values:
+        profile = NodeProfile.from_dict(item["profile"])
+        profile.node_id = item["id"]
+        profiles.append(profile)
+    if not profiles:
+        raise ValueError("no approved online node profiles are available")
+    return profiles
+
+
 def _admin(args: argparse.Namespace) -> int:
     import os
     from .agent import resolve_join_settings
@@ -322,7 +363,24 @@ def _admin(args: argparse.Namespace) -> int:
         print(f"Expires: {value['expires_at']}", file=sys.stderr)
         return 0
     if args.admin_command == "deployment":
-        profiles = _load_profiles(args.profile)
+        if args.profile:
+            profiles = _load_profiles(args.profile)
+        else:
+            from .diagnostics import refresh_node_profiles
+
+            inventory = client.request("GET", "/v1/admin/inventory")
+            selected_ids = args.nodes
+            if args.refresh:
+                refresh_ids = [
+                    item["id"]
+                    for item in inventory.get("nodes", [])
+                    if item.get("approved")
+                    and item.get("connectivity") == "online"
+                    and (selected_ids is None or item.get("id") in selected_ids)
+                ]
+                refresh_node_profiles(client, refresh_ids, timeout=args.timeout)
+                inventory = client.request("GET", "/v1/admin/inventory")
+            profiles = _profiles_from_inventory(inventory, selected_ids)
         plan = build_plan(profiles, model_id=args.model, image=args.image, network_interface=args.network_interface)
         if plan is None:
             raise ValueError("no eligible GPU deployment could be planned")
@@ -330,6 +388,11 @@ def _admin(args: argparse.Namespace) -> int:
             "plan": plan.to_dict(), "accept_model_download": args.accept_model_download, "pull_image": args.pull,
         })
         print(value["deployment"]["id"])
+        print(
+            f"Planned {plan.pipeline_parallel_size} GPU stage(s); apply this replacement "
+            "generation explicitly after review.",
+            file=sys.stderr,
+        )
         return 0
     if args.admin_command in {"apply", "start", "stop", "restart", "verify", "probe"}:
         types = {

@@ -106,7 +106,7 @@ def build_plan(
         raise ValueError(f"duplicate node profile(s): {', '.join(duplicates)}")
 
     healthy: list[tuple[NodeProfile, int]] = []
-    for profile in profiles:
+    for profile in sorted(profiles, key=lambda item: item.node_id):
         node_gpus = [gpu for gpu in profile.gpus if gpu.healthy]
         if node_gpus:
             # The MVP launches one Ray container per node. Prefer the largest GPU
@@ -121,12 +121,24 @@ def build_plan(
         large_nodes = [item for item in healthy if _gpu_for(item[0], item[1]).memory_mib >= 22528]
         if len(large_nodes) >= 3:
             model = MODELS["qwen2.5-72b-awq"]
-            selected = large_nodes[:3]
+            # Pipeline parallelism can split uneven layer counts. Keep every
+            # eligible node in the next generation so a newly approved GPU
+            # changes an n-stage plan into an n+1-stage plan.
+            selected = large_nodes
         else:
-            model = recommend_local_model(healthy[0][0])
+            source = max(
+                healthy,
+                key=lambda item: (_gpu_for(item[0], item[1]).memory_mib, item[0].node_id),
+            )[0]
+            model = recommend_local_model(source)
             if model is None:
                 return None
-            selected = [healthy[0]]
+            selected = [
+                item
+                for item in healthy
+                if _gpu_for(item[0], item[1]).memory_mib / 1024
+                >= model.min_gpu_memory_gib
+            ]
     else:
         if model_id not in MODELS:
             raise ValueError(f"unknown model: {model_id}")
@@ -141,7 +153,13 @@ def build_plan(
             raise ValueError(
                 f"{model_id} requires {required_stages} eligible GPU node(s), found {len(eligible)}"
             )
-        selected = eligible[:required_stages]
+        selected = eligible
+
+    if len(selected) > model.layer_count:
+        raise ValueError(
+            f"{model.model_id} has {model.layer_count} layers and cannot use "
+            f"{len(selected)} pipeline stages"
+        )
 
     stages = len(selected)
     partitions = _layer_partitions(model.layer_count, stages)

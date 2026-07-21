@@ -80,6 +80,25 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 
 계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
 
+## GPU 추가와 replacement generation
+
+새 노드는 `join` 직후 pending이므로 기존 배포에 포함되지 않습니다. 운영자가 승인하고 Agent가
+최신 profile을 보고한 뒤, planner는 승인된 온라인 GPU 노드를 UUID로 정렬하고 모델의 VRAM
+조건을 만족하는 노드를 모두 pipeline stage로 사용합니다.
+
+```text
+n개 GPU의 기존 deployment
+        + 새 노드 join (pending)
+        + 운영자 승인 및 profile refresh
+        ↓
+n+1개 GPU의 replacement plan 생성
+        ↓
+검토 → apply/verify → 명시적 traffic 전환
+```
+
+Dure는 실행 중인 pipeline에 worker를 삽입하거나 기존 컨테이너를 자동 중지하지 않습니다.
+새 deployment를 별도로 준비하며 자동 traffic 전환도 수행하지 않습니다.
+
 ## 신뢰 경계
 
 - 공개 관리 경계는 HTTPS이며 데이터베이스와 Ray 포트는 사설망에 남아야 합니다.

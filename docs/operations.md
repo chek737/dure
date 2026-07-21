@@ -100,6 +100,22 @@ dure admin apply <deployment-id> --nodes <node-a> <node-b> <node-c>
 dure admin tasks --watch
 ```
 
+새 GPU를 추가할 때는 승인된 전체 pool을 다시 조사하고 replacement deployment를 생성합니다.
+
+```bash
+sudo dure join
+dure admin node approve <new-node-id>
+
+dure admin deployment create \
+  --all-online --refresh \
+  --model qwen2.5-72b-awq \
+  --image registry.example/vllm@sha256:<digest>
+```
+
+출력된 plan의 stage 수와 assignment를 확인한 뒤 새 deployment에 `apply`, `start`, `verify`를
+수행합니다. 실패하면 기존 deployment를 계속 사용합니다. 설치나 승인만으로 실행 중인
+컨테이너를 자동 교체하지는 않습니다.
+
 현재 vLLM API는 Ray head에서만 listen합니다. worker와 head 검증을 분리합니다.
 
 ```bash

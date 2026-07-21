@@ -55,6 +55,34 @@ class PlannerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate node"):
             build_plan([profile("same"), profile("same")])
 
+    def test_new_gpu_expands_existing_pipeline_from_n_to_n_plus_one(self):
+        three = [
+            profile(f"gpu-{index}", address=f"192.168.1.{index + 10}")
+            for index in range(3)
+        ]
+        before = build_plan(three, model_id="qwen2.5-72b-awq")
+        after = build_plan(
+            [*three, profile("gpu-3", address="192.168.1.13")],
+            model_id="qwen2.5-72b-awq",
+        )
+
+        assert before is not None and after is not None
+        self.assertEqual(before.pipeline_parallel_size, 3)
+        self.assertEqual(after.pipeline_parallel_size, 4)
+        self.assertEqual(len(after.assignments), 4)
+        self.assertEqual(
+            [(item.layer_start, item.layer_end) for item in after.assignments],
+            [(0, 19), (20, 39), (40, 59), (60, 79)],
+        )
+
+    def test_two_eligible_gpus_share_smaller_auto_model(self):
+        plan = build_plan([profile("gpu-b"), profile("gpu-a")])
+
+        assert plan is not None
+        self.assertEqual(plan.model.model_id, "qwen2.5-32b-awq")
+        self.assertEqual(plan.pipeline_parallel_size, 2)
+        self.assertEqual([item.node_id for item in plan.assignments], ["gpu-a", "gpu-b"])
+
 
 if __name__ == "__main__":
     unittest.main()
