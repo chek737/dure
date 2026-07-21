@@ -242,6 +242,12 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(command[cpus + 1], "8")
         restart = command.index("--restart")
         self.assertEqual(command[restart + 1], "no")
+        tmpfs = command.index("--tmpfs")
+        self.assertEqual(
+            command[tmpfs + 1],
+            "/tmp:rw,exec,nosuid,nodev,size=1g",
+        )
+        self.assertNotIn("noexec", command[tmpfs + 1].split(","))
         gpus = command.index("--gpus")
         self.assertEqual(command[gpus + 1], f"device=GPU-{NODE_ID}")
         self.assertNotIn("--user", command)

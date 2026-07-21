@@ -930,7 +930,7 @@ class SafeBenchmarkRuntime:
             "--shm-size",
             "4g",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=1g",
+            "/tmp:rw,exec,nosuid,nodev,size=1g",
         ]
         for label in labels:
             command.extend(("--label", label))
