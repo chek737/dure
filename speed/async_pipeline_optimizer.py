@@ -20,7 +20,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from torch import device as TorchDevice
+    from torch.cuda import Event as CUDAEvent
+    from torch.cuda import Stream as CUDAStream
+    from torch.distributed import Work
 
 try:
     import torch
@@ -85,7 +92,7 @@ class AsyncPipelineOptimizer:
         model_dim: int = 4096,
         micro_batch_size: int = 4,
         seq_len: int = 2048,
-        device: Optional[torch.device] = None,
+        device: TorchDevice | None = None,
     ) -> None:
         self.rank = rank
         self.world_size = world_size
@@ -98,17 +105,17 @@ class AsyncPipelineOptimizer:
 
         # Two independent streams: compute never blocks waiting on comm and
         # vice versa unless we explicitly insert a wait_event.
-        self.compute_stream: torch.cuda.Stream = torch.cuda.Stream(device=self.device)
-        self.comm_stream: torch.cuda.Stream = torch.cuda.Stream(device=self.device)
+        self.compute_stream: CUDAStream = torch.cuda.Stream(device=self.device)
+        self.comm_stream: CUDAStream = torch.cuda.Stream(device=self.device)
 
-        self.send_buffer: torch.Tensor = torch.randn(self.tensor_shape, device=self.device)
-        self.recv_buffer: torch.Tensor = torch.zeros(self.tensor_shape, device=self.device)
+        self.send_buffer: Tensor = torch.randn(self.tensor_shape, device=self.device)
+        self.recv_buffer: Tensor = torch.zeros(self.tensor_shape, device=self.device)
 
         # Dummy weight standing in for one Qwen3-style transformer layer's
         # projection matrix (real layer would be attention + MLP block).
-        self.weight: torch.Tensor = torch.randn((model_dim, model_dim), device=self.device)
+        self.weight: Tensor = torch.randn((model_dim, model_dim), device=self.device)
 
-    def dummy_compute_kernel(self, input_tensor: torch.Tensor) -> torch.Tensor:
+    def dummy_compute_kernel(self, input_tensor: Tensor) -> Tensor:
         """Simulate a heavy transformer-layer forward: matmul + SiLU."""
         x = torch.matmul(input_tensor, self.weight)
         x = F.silu(x)
@@ -152,11 +159,11 @@ class AsyncPipelineOptimizer:
 
         current_input = self.send_buffer.clone()
         current_output = self.send_buffer  # placeholder until step 0 fills it
-        work_handles: List[dist.Work] = []
+        work_handles: list[Work] = []
 
         # One event per step: records "compute for this step is done" so the
         # comm stream can gate its send on it without a CPU round-trip.
-        compute_done_events: List[torch.cuda.Event] = [
+        compute_done_events: list[CUDAEvent] = [
             torch.cuda.Event() for _ in range(steps)
         ]
 
