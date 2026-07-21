@@ -146,7 +146,7 @@ def _parser() -> argparse.ArgumentParser:
     bootstrap.add_argument(
         "--allow-docker-restart",
         action="store_true",
-        help="Allow the required Docker restart after reviewing running containers",
+        help="Compatibility flag; --apply already includes the required Docker restart",
     )
     bootstrap.add_argument(
         "--json", action="store_true", help="Print the closed bootstrap report as JSON"

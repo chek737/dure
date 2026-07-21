@@ -94,13 +94,13 @@ sudo dure join
 
 적용은 Docker 공식 Ubuntu stable 저장소와 NVIDIA 공식 stable 저장소의 고정 URL을 추가해 사용하고, bootstrap이 새로 사용하거나 Dure의 고정 경로에 이미 있는 keyring에 기대한 primary key 하나만 있는지 fingerprint로 검사합니다. key와 부모는 APT의 비권한 key reader가 읽고 통과할 수 있어야 합니다. 실행 명령은 고정된 system `PATH`와 C locale을 사용하고 호출 셸의 proxy·APT·GPG 환경 설정 및 curl 사용자 설정은 상속하지 않습니다. 폐쇄망이나 proxy 전용 환경은 신뢰된 시스템 APT 설정과 별도 오프라인 provisioning 절차를 먼저 준비해야 합니다. Docker 설치는 제거를 허용하지 않는 닫힌 패키지 목록을 사용하고, Toolkit 네 패키지는 `1.19.1-1`로 설치해 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 우선순위 1001로 고정합니다. pin 파일이 다르면 자동 덮어쓰지 않습니다. 기존 `daemon.json`은 NVIDIA 설정 전에 `/var/lib/dure/bootstrap/daemon.json.before-nvidia-ctk`에 root 전용으로 보존합니다. `nvidia-ctk` 설정이 실패하면 원래 내용·권한·소유자만 복원하고 Docker를 재시작하지 않습니다. Docker 재시작을 이미 시도한 뒤 실패하거나 runtime이 확인되지 않으면 설정을 복원하고 기존 설정으로 복구 재시작을 한 번 시도합니다.
 
-NVIDIA runtime을 처음 등록하면 Docker 재시작이 필요합니다. bootstrap은 사전 검사와 재시작 직전에 실행 중 컨테이너를 다시 조사합니다. 하나라도 있으면 기본 적용을 중단하므로 workload를 직접 확인하고 유지보수 시간을 확보한 경우에만 다음 승인을 추가합니다.
+NVIDIA runtime을 처음 등록하면 Docker 재시작이 필요합니다. bootstrap은 사전 검사와 재시작 직전에 실행 중 컨테이너를 다시 조사합니다. 미리보기는 workload 개수와 영향을 경고하지만 차단하지 않으며, `--apply`는 검토한 폐쇄형 계획에 필요한 Docker 재시작까지 승인합니다. workload를 직접 확인하고 유지보수 시간을 확보한 뒤 실행합니다.
 
 ```bash
-sudo dure bootstrap --apply --allow-docker-restart
+sudo dure bootstrap --apply
 ```
 
-이 승인은 특정 Dure 컨테이너가 아니라 해당 Docker daemon의 모든 실행 workload가 잠시 중단될 수 있음을 뜻합니다. bootstrap은 host firewall을 수정하지 않지만 Docker Engine 설치 자체가 netfilter 규칙과 forwarding 동작에 영향을 줄 수 있으므로 적용 전후 방화벽을 별도로 검증합니다. 사용자를 `docker` 그룹에 추가하지 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. 이 명령은 NVIDIA driver, 모델, 이미지, 컨테이너, 배포와 Agent 자격 증명을 만들거나 바꾸지 않습니다. 미설정 패키지 Agent는 `/etc/dure/agent.json`이 없으면 시작되지 않고 `dure join`이 설정을 쓴 뒤 활성화합니다. bootstrap apply와 join은 `/run/lock/dure-host-setup.lock`을 공유하며, 등록이 먼저 시작됐거나 노드가 이미 등록·활성화된 경우 bootstrap은 별도의 drain 절차를 추측하지 않고 거부합니다.
+이 승인은 특정 Dure 컨테이너가 아니라 해당 Docker daemon의 모든 실행 workload가 잠시 중단될 수 있음을 뜻합니다. 기존 `--allow-docker-restart`는 호환성을 위해 계속 받지만 추가 권한을 뜻하지 않습니다. bootstrap은 host firewall을 수정하지 않지만 Docker Engine 설치 자체가 netfilter 규칙과 forwarding 동작에 영향을 줄 수 있으므로 적용 전후 방화벽을 별도로 검증합니다. 사용자를 `docker` 그룹에 추가하지 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. 이 명령은 NVIDIA driver, 모델, 이미지, 컨테이너, 배포와 Agent 자격 증명을 만들거나 바꾸지 않습니다. 미설정 패키지 Agent는 `/etc/dure/agent.json`이 없으면 시작되지 않고 `dure join`이 설정을 쓴 뒤 활성화합니다. bootstrap apply와 join은 `/run/lock/dure-host-setup.lock`을 공유하며, 등록이 먼저 시작됐거나 노드가 이미 등록·활성화된 경우 bootstrap은 별도의 drain 절차를 추측하지 않고 거부합니다.
 
 ## 노드 등록과 승인
 

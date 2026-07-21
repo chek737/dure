@@ -113,13 +113,13 @@ sudo dure doctor
 sudo dure join
 ```
 
-Ubuntu 22.04·24.04와 `amd64`·`arm64`, Docker CLI와 Engine 20.10 이상만 지원합니다. 기존에 정상 동작하는 로컬 systemd Docker는 보존하며, 배포판 Docker 29가 `Platform.Name`을 비워도 공식 version 응답의 단일 `Engine` 구성요소가 서버 version·Linux OS·지원 architecture와 일치하면 Docker Engine으로 확인합니다. Docker CLI 없이 package·service·socket이 남아 미설치를 증명할 수 없거나 Docker 신규 설치가 필요한데 충돌 패키지가 있거나, 부분 또는 지원 버전과 다른 Toolkit 설치·원격 또는 rootless Docker·안전하지 않은 설정 경로가 있으면 자동 수정하지 않고 중단합니다. Toolkit 네 패키지는 `1.19.1-1`로 설치하고 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 같은 버전으로 고정합니다. NVIDIA runtime 등록에는 Docker 재시작이 필요합니다. 실행 중인 컨테이너가 있으면 기본 적용을 중단하며, 점검한 유지보수 시간에만 영향 범위를 이해하고 다음처럼 명시적으로 허용합니다.
+Ubuntu 22.04·24.04와 `amd64`·`arm64`, Docker CLI와 Engine 20.10 이상만 지원합니다. 기존에 정상 동작하는 로컬 systemd Docker는 보존하며, 배포판 Docker 29가 `Platform.Name`을 비워도 공식 version 응답의 단일 `Engine` 구성요소가 서버 version·Linux OS·지원 architecture와 일치하면 Docker Engine으로 확인합니다. Docker CLI 없이 package·service·socket이 남아 미설치를 증명할 수 없거나 Docker 신규 설치가 필요한데 충돌 패키지가 있거나, 부분 또는 지원 버전과 다른 Toolkit 설치·원격 또는 rootless Docker·안전하지 않은 설정 경로가 있으면 자동 수정하지 않고 중단합니다. Toolkit 네 패키지는 `1.19.1-1`로 설치하고 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 같은 버전으로 고정합니다. NVIDIA runtime 등록에는 Docker 재시작이 필요합니다. 실행 중인 컨테이너가 있으면 미리보기에서 개수와 영향을 경고하며, `--apply`는 검토한 계획에 포함된 Docker 재시작 승인까지 의미합니다. 유지보수 시간을 확보한 뒤 적용합니다.
 
 ```bash
-sudo dure bootstrap --apply --allow-docker-restart
+sudo dure bootstrap --apply
 ```
 
-bootstrap은 모델 다운로드, OCI 이미지 pull, Docker 컨테이너 실행·중지, 배포 생성이나 Agent 등록을 수행하지 않습니다. credential이 있는 `/etc/dure/agent.json`이 생겼거나 Agent가 활성화된 뒤에는 적용을 거부합니다. `dure unjoin`이 credential을 제거하고 안전한 `install_id`만 남긴 비활성 노드는 다시 pre-join 경계로 인정합니다. bootstrap은 `dure join`·`dure unjoin`과 `/run/lock/dure-host-setup.lock`을 공유해 등록과 host 변경을 직렬화합니다. 사용자를 `docker` 그룹에 추가하지도 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. Docker 설치가 host netfilter 정책에 미치는 영향과 방화벽 규칙은 운영자가 별도로 검토해야 합니다. CPU utility 노드는 이 절차를 건너뛰고 `sudo dure join`을 실행할 수 있습니다.
+기존 `--allow-docker-restart`도 CLI 호환성을 위해 허용하지만 `--apply`와 동작이 같습니다. bootstrap은 모델 다운로드, OCI 이미지 pull, Docker 컨테이너 실행·중지, 배포 생성이나 Agent 등록을 수행하지 않습니다. credential이 있는 `/etc/dure/agent.json`이 생겼거나 Agent가 활성화된 뒤에는 적용을 거부합니다. `dure unjoin`이 credential을 제거하고 안전한 `install_id`만 남긴 비활성 노드는 다시 pre-join 경계로 인정합니다. bootstrap은 `dure join`·`dure unjoin`과 `/run/lock/dure-host-setup.lock`을 공유해 등록과 host 변경을 직렬화합니다. 사용자를 `docker` 그룹에 추가하지도 않으므로 준비 직후 검증은 `sudo dure doctor`로 실행합니다. Docker 설치가 host netfilter 정책에 미치는 영향과 방화벽 규칙은 운영자가 별도로 검토해야 합니다. CPU utility 노드는 이 절차를 건너뛰고 `sudo dure join`을 실행할 수 있습니다.
 
 ## 노드 조사
 
