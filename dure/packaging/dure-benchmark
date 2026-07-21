@@ -171,7 +171,9 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         started = time.perf_counter()
         first = None
         final = None
-        async for output in engine.generate(tokens, sampling, str(uuid.uuid4())):
+        async for output in engine.generate(
+            {"prompt_token_ids": tokens}, sampling, str(uuid.uuid4())
+        ):
             if first is None:
                 first = time.perf_counter()
             final = output

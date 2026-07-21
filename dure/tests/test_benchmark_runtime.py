@@ -205,7 +205,12 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             raise AssertionError(f"unexpected command: {command}")
 
         runner = FakeRunner(response_factory=respond)
-        result = SafeBenchmarkRuntime(runner)(payload(), self.profile, self.cached_model)
+        source_entrypoint = (
+            Path(__file__).resolve().parents[1] / "packaging" / "dure-benchmark"
+        )
+        result = SafeBenchmarkRuntime(
+            runner, entrypoint_path=source_entrypoint
+        )(payload(), self.profile, self.cached_model)
 
         self.assertEqual(set(result), {"benchmark_id", "workload_id", "metrics"})
         self.assertEqual(
@@ -269,7 +274,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(
             command[entrypoint_mount + 1],
             "type=bind,src="
-            f"{Path(__file__).resolve().parents[1] / 'packaging' / 'dure-benchmark'},"
+            f"{source_entrypoint},"
             f"dst={BENCHMARK_ENTRYPOINT_CONTAINER_PATH},readonly",
         )
         serialized = json.dumps(result, sort_keys=True)

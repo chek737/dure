@@ -4,8 +4,12 @@ import asyncio
 import importlib.machinery
 import importlib.util
 import os
+import sys
+import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ENTRYPOINT = Path(__file__).resolve().parents[1] / "packaging" / "dure-benchmark"
@@ -67,6 +71,112 @@ class PackagedBenchmarkEntrypointTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "dimensions"):
             asyncio.run(module._run(args))
+
+    def test_vllm_receives_tokens_prompt_mapping(self):
+        module = _load_entrypoint()
+        args = module._parser().parse_args(
+            [
+                "run",
+                "--suite",
+                "dure-serving-slo-v1",
+                "--workload",
+                "quality-eval",
+                "--model",
+                "/models/model",
+                "--artifact-revision",
+                "a" * 40,
+                "--artifact-manifest-digest",
+                "sha256:" + "b" * 64,
+                "--quantization",
+                "awq",
+                "--input-tokens",
+                "1024",
+                "--output-tokens",
+                "256",
+                "--concurrency",
+                "1",
+                "--warmup-requests",
+                "20",
+                "--request-count",
+                "200",
+                "--duration-seconds",
+                "900",
+                "--output-format",
+                "json-summary-v1",
+            ]
+        )
+        observed_prompts = []
+
+        class FakeTokenizer:
+            def encode(self, _text, *, add_special_tokens):
+                self.assert_false(add_special_tokens)
+                return [1]
+
+            def apply_chat_template(self, _messages, *, tokenize, add_generation_prompt):
+                if not tokenize or not add_generation_prompt:
+                    raise AssertionError("chat template flags changed")
+                return [2, 3]
+
+            @staticmethod
+            def assert_false(value):
+                if value:
+                    raise AssertionError("special tokens must remain disabled")
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(_model, *, local_files_only, trust_remote_code):
+                if not local_files_only or trust_remote_code:
+                    raise AssertionError("tokenizer trust boundary changed")
+                return FakeTokenizer()
+
+        class FakeAsyncEngineArgs:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeAsyncLLMEngine:
+            @classmethod
+            def from_engine_args(cls, _args):
+                return cls()
+
+            def generate(self, prompt, _sampling, _request_id):
+                observed_prompts.append(prompt)
+
+                async def stream():
+                    yield SimpleNamespace(
+                        outputs=[SimpleNamespace(token_ids=[1] * 256, text="")]
+                    )
+
+                return stream()
+
+        class FakeSamplingParams:
+            def __init__(self, **_kwargs):
+                pass
+
+        transformers = types.ModuleType("transformers")
+        transformers.AutoTokenizer = FakeAutoTokenizer
+        vllm = types.ModuleType("vllm")
+        vllm.AsyncEngineArgs = FakeAsyncEngineArgs
+        vllm.AsyncLLMEngine = FakeAsyncLLMEngine
+        vllm.SamplingParams = FakeSamplingParams
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"transformers": transformers, "vllm": vllm},
+            ),
+            mock.patch.object(module, "_gpu_headroom", return_value=50.0),
+            mock.patch.object(module.asyncio, "sleep", new=mock.AsyncMock()),
+        ):
+            asyncio.run(module._run(args))
+
+        self.assertEqual(len(observed_prompts), 220)
+        self.assertTrue(
+            all(
+                set(prompt) == {"prompt_token_ids"}
+                and len(prompt["prompt_token_ids"]) == 1024
+                for prompt in observed_prompts
+            )
+        )
 
 
 if __name__ == "__main__":
