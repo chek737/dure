@@ -113,7 +113,7 @@ sudo dure doctor
 sudo dure join
 ```
 
-Ubuntu 22.04·24.04와 `amd64`·`arm64`, Docker CLI와 Engine 20.10 이상만 지원합니다. 기존에 정상 동작하는 로컬 systemd Docker는 보존하고, Docker CLI 없이 package·service·socket이 남아 미설치를 증명할 수 없거나 Docker 신규 설치가 필요한데 충돌 패키지가 있거나, 부분 또는 지원 버전과 다른 Toolkit 설치·원격 또는 rootless Docker·안전하지 않은 설정 경로가 있으면 자동 수정하지 않고 중단합니다. Toolkit 네 패키지는 `1.19.1-1`로 설치하고 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 같은 버전으로 고정합니다. NVIDIA runtime 등록에는 Docker 재시작이 필요합니다. 실행 중인 컨테이너가 있으면 기본 적용을 중단하며, 점검한 유지보수 시간에만 영향 범위를 이해하고 다음처럼 명시적으로 허용합니다.
+Ubuntu 22.04·24.04와 `amd64`·`arm64`, Docker CLI와 Engine 20.10 이상만 지원합니다. 기존에 정상 동작하는 로컬 systemd Docker는 보존하며, 배포판 Docker 29가 `Platform.Name`을 비워도 공식 version 응답의 단일 `Engine` 구성요소가 서버 version·Linux OS·지원 architecture와 일치하면 Docker Engine으로 확인합니다. Docker CLI 없이 package·service·socket이 남아 미설치를 증명할 수 없거나 Docker 신규 설치가 필요한데 충돌 패키지가 있거나, 부분 또는 지원 버전과 다른 Toolkit 설치·원격 또는 rootless Docker·안전하지 않은 설정 경로가 있으면 자동 수정하지 않고 중단합니다. Toolkit 네 패키지는 `1.19.1-1`로 설치하고 `/etc/apt/preferences.d/dure-nvidia-container-toolkit`에서 같은 버전으로 고정합니다. NVIDIA runtime 등록에는 Docker 재시작이 필요합니다. 실행 중인 컨테이너가 있으면 기본 적용을 중단하며, 점검한 유지보수 시간에만 영향 범위를 이해하고 다음처럼 명시적으로 허용합니다.
 
 ```bash
 sudo dure bootstrap --apply --allow-docker-restart

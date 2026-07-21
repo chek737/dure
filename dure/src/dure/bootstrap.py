@@ -656,10 +656,7 @@ class Bootstrapper:
             version_data = None
         client = version_data.get("Client") if isinstance(version_data, dict) else None
         server = version_data.get("Server") if isinstance(version_data, dict) else None
-        platform_data = server.get("Platform") if isinstance(server, dict) else None
-        engine_name = (
-            platform_data.get("Name") if isinstance(platform_data, dict) else None
-        )
+        engine_name = self._docker_engine_name(server)
         version = server.get("Version") if isinstance(server, dict) else None
         client_version = client.get("Version") if isinstance(client, dict) else None
         parsed_version = self._parse_docker_version(version)
@@ -698,6 +695,47 @@ class Bootstrapper:
             )
         )
         return True, True
+
+    @staticmethod
+    def _docker_engine_name(server: object) -> str | None:
+        if not isinstance(server, dict):
+            return None
+        platform_data = server.get("Platform")
+        if not isinstance(platform_data, dict):
+            return None
+        platform_name = platform_data.get("Name")
+        if not isinstance(platform_name, str):
+            return None
+        if platform_name.strip():
+            return platform_name if platform_name.startswith("Docker Engine") else None
+
+        version = server.get("Version")
+        server_os = server.get("Os")
+        server_arch = server.get("Arch")
+        components = server.get("Components")
+        if (
+            not isinstance(version, str)
+            or not version
+            or server_os != "linux"
+            or server_arch not in SUPPORTED_ARCHITECTURES
+            or not isinstance(components, list)
+        ):
+            return None
+        engines = [
+            component
+            for component in components
+            if isinstance(component, dict) and component.get("Name") == "Engine"
+        ]
+        if len(engines) != 1 or engines[0].get("Version") != version:
+            return None
+        details = engines[0].get("Details")
+        if not isinstance(details, dict):
+            return None
+        if details.get("Os", server_os) != server_os:
+            return None
+        if details.get("Arch", server_arch) != server_arch:
+            return None
+        return "Docker Engine"
 
     @staticmethod
     def _parse_docker_version(value: object) -> tuple[int, int, int] | None:

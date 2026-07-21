@@ -49,7 +49,7 @@ sudo dure bootstrap --json
 - NVIDIA Toolkit이 일부 패키지나 실행 파일만 가진 부분 설치 상태이거나 네 패키지가 지원 고정 버전과 다릅니다.
 - 기존 Docker가 로컬 `/var/run/docker.sock`의 systemd `docker.service`가 아니거나 daemon에 연결할 수 없거나, 재부팅 뒤 `docker.service` 또는 `docker.socket` 기동이 유지됨을 증명할 수 없습니다.
 - Docker CLI가 없더라도 Docker CE 패키지 일부, `dockerd`, `docker.service`나 `/var/run/docker.sock`이 남아 있어 미설치를 증명할 수 없습니다.
-- Docker CLI 또는 Engine 버전이 GPU runtime과 `--pull never` 계약에 필요한 20.10보다 낮거나 버전을 해석할 수 없습니다.
+- Docker CLI 또는 Engine 버전이 GPU runtime과 `--pull never` 계약에 필요한 20.10보다 낮거나 버전을 해석할 수 없습니다. 배포판 Docker 29의 빈 `Platform.Name`은 단일 `Engine` 구성요소의 version·Linux OS·지원 architecture가 서버 응답과 일치할 때만 허용합니다.
 - Dure Agent systemd unit이 없거나 Agent가 활성 상태이거나 `/etc/dure/agent.json`이 이미 존재합니다.
 - APT key/source, `/etc/docker/daemon.json`, Dure backup 또는 그 부모가 예상과 다르거나 symbolic link입니다. 현재 `daemon.json` 없이 과거 backup만 남은 경우도 자동 해석하지 않습니다.
 

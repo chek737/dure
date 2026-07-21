@@ -1,3 +1,10 @@
+dure (0.3.22) UNRELEASED; urgency=medium
+
+  * Docker 29가 빈 platform 이름을 반환해도 검증된 Engine 구성요소로 식별합니다.
+  * 버전·OS·architecture가 불일치하는 Docker 호환 shim은 계속 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 16:10:00 +0900
+
 dure (0.3.21) UNRELEASED; urgency=medium
 
   * Docker Engine과 NVIDIA Container Toolkit의 로컬 명시적 준비 기능을 추가합니다.
