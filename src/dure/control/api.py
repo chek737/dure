@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dure import __version__
+from dure.model_store import MAX_TRACKED_BYTES
 from dure.task import MAX_BENCHMARK_INTEGER
 
 from .db import Base, make_engine, make_session_factory, session_dependency
@@ -55,6 +56,7 @@ from .service import (
     MAX_ARTIFACT_PATH_LENGTH,
     ArtifactManifestConflictError,
     ArtifactManifestNotFoundError,
+    ArtifactCacheControlError,
     BENCHMARK_TASK_FAILURE_CODES,
     BenchmarkRunError,
     BenchmarkRunNotFoundError,
@@ -62,6 +64,7 @@ from .service import (
     apply_benchmark_run,
     approve_node,
     artifact_manifest_dict,
+    artifact_cache_detail,
     benchmark_run_dict,
     cancel_task,
     claim_enrollment,
@@ -82,12 +85,19 @@ from .service import (
     rotate_node_credential,
     save_deployment,
     save_heartbeat,
+    list_artifact_caches,
+    prepare_or_apply_artifact_cache_quarantine,
     add_placement_profile,
     RegistryConflictError,
     prepare_benchmark_run,
     register_artifact_manifest,
     complete_benchmark_task,
     transition_model_release,
+    verify_artifact_cache,
+)
+from .cache_lifecycle import (
+    ArtifactCacheLifecycleError,
+    ArtifactCacheNotFoundError,
 )
 from .recommendation import (
     RecommendationError,
@@ -173,12 +183,24 @@ class TasksCreate(BaseModel):
     options: dict = Field(default_factory=dict)
 
 
+class ArtifactCacheQuarantine(StrictBody):
+    apply: StrictBool = False
+
+
 class TaskComplete(StrictBody):
     result: dict = Field(default_factory=dict)
 
 
 class TaskFail(StrictBody):
     error: str = Field(min_length=1, max_length=8192)
+
+
+class TaskHeartbeatProgress(StrictBody):
+    downloaded_bytes: int = Field(ge=0, le=MAX_TRACKED_BYTES)
+
+
+class TaskHeartbeat(StrictBody):
+    progress: TaskHeartbeatProgress | None = None
 
 
 class ModelArtifactCreate(StrictBody):
@@ -560,6 +582,14 @@ def _preparation_error_detail(exc: ArtifactPreparationError) -> dict:
     return exc.to_detail()
 
 
+def _artifact_cache_error_detail(exc: Exception) -> dict:
+    return {
+        "code": getattr(exc, "code", "ARTIFACT_CACHE_CONTROL_FAILED"),
+        "message": str(exc),
+        "details": getattr(exc, "details", {}),
+    }
+
+
 def _task_dict(task: Task) -> dict:
     return {
         "id": task.id,
@@ -800,9 +830,24 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         return {"task": _task_dict(task) if task else None}
 
     @app.post("/v1/agent/tasks/{task_id}/heartbeat")
-    def agent_task_heartbeat(task_id: str, node: Node = Depends(node_auth), session: Session = Depends(get_session)):
+    def agent_task_heartbeat(
+        task_id: str,
+        body: TaskHeartbeat | None = None,
+        node: Node = Depends(node_auth),
+        session: Session = Depends(get_session),
+    ):
         task = session.get(Task, task_id)
-        if task is None or not extend_task(session, task, node.id):
+        progress = (
+            body.progress.model_dump()
+            if body is not None and body.progress is not None
+            else None
+        )
+        if task is None or not extend_task(
+            session,
+            task,
+            node.id,
+            progress=progress,
+        ):
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be extended")
         return {"ok": True, "lease_until": task.lease_until}
 
@@ -872,6 +917,11 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 _preparation_error_detail(exc),
             ) from exc
+        except (ArtifactCacheLifecycleError, ArtifactCacheControlError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _artifact_cache_error_detail(exc),
+            ) from exc
         if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be completed")
         return {"ok": True}
@@ -913,6 +963,11 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 status.HTTP_409_CONFLICT,
                 _preparation_error_detail(exc),
             ) from exc
+        except (ArtifactCacheLifecycleError, ArtifactCacheControlError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _artifact_cache_error_detail(exc),
+            ) from exc
         if not accepted:
             raise HTTPException(status.HTTP_409_CONFLICT, "task cannot be failed")
         return {"ok": True}
@@ -952,6 +1007,90 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 )
                 for node in records
             ],
+        }
+
+    @app.get(
+        "/v1/admin/artifact-caches",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_caches(session: Session = Depends(get_session)):
+        return {"caches": list_artifact_caches(session)}
+
+    @app.get(
+        "/v1/admin/artifact-caches/{cache_id}",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_cache_show(
+        cache_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            cache = artifact_cache_detail(session, cache_id)
+        except ArtifactCacheNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+        except (ArtifactCacheLifecycleError, ArtifactCacheControlError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+        return {"cache": cache}
+
+    @app.get(
+        "/v1/admin/artifact-caches/{cache_id}/verify",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_cache_verify(
+        cache_id: str,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            return verify_artifact_cache(session, cache_id)
+        except ArtifactCacheNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+        except (ArtifactCacheLifecycleError, ArtifactCacheControlError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+
+    @app.post(
+        "/v1/admin/artifact-caches/{cache_id}/quarantine",
+        dependencies=[Depends(admin_auth)],
+    )
+    def artifact_cache_quarantine(
+        cache_id: str,
+        body: ArtifactCacheQuarantine,
+        session: Session = Depends(get_session),
+    ):
+        try:
+            cache, references, tasks, changed = (
+                prepare_or_apply_artifact_cache_quarantine(
+                    session,
+                    cache_id,
+                    apply=body.apply,
+                )
+            )
+        except ArtifactCacheNotFoundError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+        except (ArtifactCacheLifecycleError, ArtifactCacheControlError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+        return {
+            "cache": cache,
+            "references": references,
+            "tasks": [_task_dict(task) for task in tasks],
+            "changed": changed,
         }
 
     @app.get("/v1/admin/nodes/{node_id}", dependencies=[Depends(admin_auth)])
@@ -1612,7 +1751,14 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
         task = session.get(Task, task_id)
         if task is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "task not found")
-        if not cancel_task(session, task):
+        try:
+            canceled = cancel_task(session, task)
+        except (ArtifactCacheLifecycleError, ArtifactCacheControlError) as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                _artifact_cache_error_detail(exc),
+            ) from exc
+        if not canceled:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 "only queued tasks or expired running BENCHMARK/operation tasks can be canceled",

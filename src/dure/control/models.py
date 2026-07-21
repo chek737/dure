@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    DDL,
     DateTime,
     Float,
     ForeignKey,
@@ -18,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -543,6 +545,11 @@ class StageArtifactVariant(Base):
         UniqueConstraint(
             "contract_identity_digest",
             name="uq_stage_variant_contract_identity",
+        ),
+        UniqueConstraint(
+            "artifact_set_digest",
+            "source_manifest_digest",
+            name="uq_stage_variant_set_source",
         ),
         Index("ix_stage_variants_source_manifest", "source_manifest_digest"),
         Index("ix_stage_variants_runtime_release", "runtime_release_id"),
@@ -1340,6 +1347,9 @@ class ArtifactPreparationAttempt(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     failure_code: Mapped[str | None] = mapped_column(String(64))
     result: Mapped[dict | None] = mapped_column(JSON)
+    download_progress: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -1347,6 +1357,506 @@ class ArtifactPreparationAttempt(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NodeArtifactCache(Base):
+    __tablename__ = "node_artifact_caches"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_node_artifact_cache_id_length",
+        ),
+        CheckConstraint(
+            "cache_kind IN ('FULL_SNAPSHOT', 'STAGE')",
+            name="ck_node_artifact_cache_kind",
+        ),
+        CheckConstraint(
+            "length(cache_identity_digest) = 71 "
+            "AND cache_identity_digest LIKE 'sha256:%'",
+            name="ck_node_artifact_cache_identity_sha256",
+        ),
+        CheckConstraint(
+            "length(manifest_digest) = 71 "
+            "AND manifest_digest LIKE 'sha256:%'",
+            name="ck_node_artifact_cache_manifest_sha256",
+        ),
+        CheckConstraint(
+            "length(source_manifest_digest) = 71 "
+            "AND source_manifest_digest LIKE 'sha256:%'",
+            name="ck_node_artifact_cache_source_sha256",
+        ),
+        CheckConstraint(
+            "artifact_set_digest IS NULL OR "
+            "(length(artifact_set_digest) = 71 "
+            "AND artifact_set_digest LIKE 'sha256:%')",
+            name="ck_node_artifact_cache_variant_sha256",
+        ),
+        CheckConstraint(
+            "tensor_keys_digest IS NULL OR "
+            "(length(tensor_keys_digest) = 71 "
+            "AND tensor_keys_digest LIKE 'sha256:%')",
+            name="ck_node_artifact_cache_tensor_keys_sha256",
+        ),
+        CheckConstraint(
+            "(cache_kind = 'FULL_SNAPSHOT' "
+            "AND cache_identity_digest = manifest_digest "
+            "AND source_manifest_digest = manifest_digest "
+            "AND artifact_set_digest IS NULL "
+            "AND artifact_rank IS NULL "
+            "AND pipeline_rank IS NULL "
+            "AND tensor_rank IS NULL "
+            "AND tensor_parallel_size IS NULL "
+            "AND pipeline_parallel_size IS NULL "
+            "AND tensor_keys_digest IS NULL) OR "
+            "(cache_kind = 'STAGE' "
+            "AND artifact_set_digest IS NOT NULL "
+            "AND artifact_rank IS NOT NULL "
+            "AND pipeline_rank IS NOT NULL "
+            "AND tensor_rank IS NOT NULL "
+            "AND tensor_parallel_size IS NOT NULL "
+            "AND pipeline_parallel_size IS NOT NULL "
+            "AND tensor_keys_digest IS NOT NULL "
+            "AND tensor_parallel_size = 1 "
+            "AND tensor_rank = 0 "
+            "AND artifact_rank = pipeline_rank "
+            "AND pipeline_rank >= 0 "
+            "AND pipeline_rank < pipeline_parallel_size "
+            "AND pipeline_parallel_size >= 1 "
+            "AND pipeline_parallel_size <= 64)",
+            name="ck_node_artifact_cache_identity_shape",
+        ),
+        CheckConstraint(
+            "status IN ('READY', 'STALE', 'MISSING', 'CORRUPT', "
+            "'QUARANTINED')",
+            name="ck_node_artifact_cache_status",
+        ),
+        CheckConstraint(
+            "(status = 'READY' AND reason_code = 'PREPARATION_SUCCEEDED') OR "
+            "(status = 'STALE' AND reason_code IN ("
+            "'PROBE_IDENTITY_MISMATCH', 'VARIANT_REVOKED', "
+            "'QUARANTINE_REQUESTED', 'QUARANTINE_FAILED')) OR "
+            "(status = 'MISSING' AND reason_code = 'PROBE_MISSING') OR "
+            "(status = 'CORRUPT' AND reason_code IN ("
+            "'PROBE_UNSAFE', 'PROBE_CORRUPT', 'VERIFICATION_FAILED')) OR "
+            "(status = 'QUARANTINED' "
+            "AND reason_code = 'QUARANTINE_SUCCEEDED')",
+            name="ck_node_artifact_cache_status_reason",
+        ),
+        CheckConstraint(
+            "verification_version IS NULL OR verification_version = 1",
+            name="ck_node_artifact_cache_verification_version",
+        ),
+        CheckConstraint(
+            "verified_size_bytes IS NULL OR verified_size_bytes > 0",
+            name="ck_node_artifact_cache_verified_size_positive",
+        ),
+        CheckConstraint(
+            "verified_file_count IS NULL OR verified_file_count > 0",
+            name="ck_node_artifact_cache_verified_files_positive",
+        ),
+        CheckConstraint(
+            "(last_ready_attempt_id IS NULL AND verified_at IS NULL "
+            "AND verified_size_bytes IS NULL AND verified_file_count IS NULL "
+            "AND verification_version IS NULL) OR "
+            "(last_ready_attempt_id IS NOT NULL AND verified_at IS NOT NULL "
+            "AND verified_size_bytes IS NOT NULL "
+            "AND verified_file_count IS NOT NULL "
+            "AND verification_version IS NOT NULL)",
+            name="ck_node_artifact_cache_verification_shape",
+        ),
+        CheckConstraint(
+            "status <> 'READY' OR last_ready_attempt_id IS NOT NULL",
+            name="ck_node_artifact_cache_ready_evidence",
+        ),
+        CheckConstraint(
+            "quarantine_request_id IS NULL OR length(quarantine_request_id) = 36",
+            name="ck_node_artifact_cache_quarantine_request_length",
+        ),
+        CheckConstraint(
+            "(status = 'QUARANTINED' AND quarantined_at IS NOT NULL "
+            "AND quarantine_request_id IS NULL) OR "
+            "(status <> 'QUARANTINED' AND quarantined_at IS NULL)",
+            name="ck_node_artifact_cache_quarantine_shape",
+        ),
+        CheckConstraint(
+            "event_sequence >= 0",
+            name="ck_node_artifact_cache_event_sequence_nonnegative",
+        ),
+        ForeignKeyConstraint(
+            ["artifact_set_digest", "source_manifest_digest"],
+            [
+                "stage_artifact_variants.artifact_set_digest",
+                "stage_artifact_variants.source_manifest_digest",
+            ],
+            name="fk_node_artifact_cache_stage_source",
+        ),
+        ForeignKeyConstraint(
+            [
+                "artifact_set_digest",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+            ],
+            [
+                "stage_artifact_variants.artifact_set_digest",
+                "stage_artifact_variants.tensor_parallel_size",
+                "stage_artifact_variants.pipeline_parallel_size",
+            ],
+            name="fk_node_artifact_cache_stage_topology",
+        ),
+        ForeignKeyConstraint(
+            [
+                "artifact_set_digest",
+                "artifact_rank",
+                "manifest_digest",
+                "tensor_keys_digest",
+            ],
+            [
+                "stage_artifact_ranks.variant_id",
+                "stage_artifact_ranks.rank",
+                "stage_artifact_ranks.manifest_digest",
+                "stage_artifact_ranks.tensor_keys_digest",
+            ],
+            name="fk_node_artifact_cache_stage_rank",
+        ),
+        UniqueConstraint(
+            "node_id",
+            "cache_identity_digest",
+            name="uq_node_artifact_caches_node_identity",
+        ),
+        UniqueConstraint(
+            "last_ready_attempt_id",
+            name="uq_node_artifact_caches_ready_attempt",
+        ),
+        Index(
+            "ix_node_artifact_caches_node_status",
+            "node_id",
+            "status",
+        ),
+        Index(
+            "ix_node_artifact_caches_manifest_status",
+            "manifest_digest",
+            "status",
+        ),
+        Index(
+            "ix_node_artifact_caches_variant_status",
+            "artifact_set_digest",
+            "status",
+        ),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey("nodes.id", name="fk_node_artifact_caches_node_id"),
+        nullable=False,
+    )
+    cache_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    cache_identity_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    manifest_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifests.digest",
+            name="fk_node_artifact_caches_manifest_digest",
+        ),
+        nullable=False,
+    )
+    source_manifest_digest: Mapped[str] = mapped_column(
+        ForeignKey(
+            "artifact_manifests.digest",
+            name="fk_node_artifact_caches_source_manifest_digest",
+        ),
+        nullable=False,
+    )
+    artifact_set_digest: Mapped[str | None] = mapped_column(String(71))
+    artifact_rank: Mapped[int | None] = mapped_column(Integer)
+    pipeline_rank: Mapped[int | None] = mapped_column(Integer)
+    tensor_rank: Mapped[int | None] = mapped_column(Integer)
+    tensor_parallel_size: Mapped[int | None] = mapped_column(Integer)
+    pipeline_parallel_size: Mapped[int | None] = mapped_column(Integer)
+    tensor_keys_digest: Mapped[str | None] = mapped_column(String(71))
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_ready_attempt_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "artifact_preparation_attempts.id",
+            name="fk_node_artifact_caches_ready_attempt_id",
+        )
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    verified_file_count: Mapped[int | None] = mapped_column(Integer)
+    verification_version: Mapped[int | None] = mapped_column(Integer)
+    last_probe_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    quarantine_request_id: Mapped[str | None] = mapped_column(String(36))
+    quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    event_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ArtifactCacheEvent(Base):
+    __tablename__ = "artifact_cache_events"
+    __table_args__ = (
+        CheckConstraint(
+            "length(id) = 36",
+            name="ck_artifact_cache_event_id_length",
+        ),
+        CheckConstraint(
+            "sequence > 0",
+            name="ck_artifact_cache_event_sequence_positive",
+        ),
+        CheckConstraint(
+            "(sequence = 1 AND previous_status IS NULL) OR "
+            "(sequence > 1 AND previous_status IS NOT NULL)",
+            name="ck_artifact_cache_event_previous_status",
+        ),
+        CheckConstraint(
+            "previous_status IS NULL OR previous_status IN ("
+            "'READY', 'STALE', 'MISSING', 'CORRUPT', 'QUARANTINED')",
+            name="ck_artifact_cache_event_previous_status_value",
+        ),
+        CheckConstraint(
+            "status IN ('READY', 'STALE', 'MISSING', 'CORRUPT', "
+            "'QUARANTINED')",
+            name="ck_artifact_cache_event_status",
+        ),
+        CheckConstraint(
+            "reason_code IN ("
+            "'PREPARATION_SUCCEEDED', 'PROBE_UNSAFE', 'PROBE_CORRUPT', "
+            "'PROBE_IDENTITY_MISMATCH', 'PROBE_MISSING', "
+            "'VARIANT_REVOKED', 'VERIFICATION_FAILED', "
+            "'QUARANTINE_REQUESTED', 'QUARANTINE_SUCCEEDED', "
+            "'QUARANTINE_FAILED')",
+            name="ck_artifact_cache_event_reason",
+        ),
+        CheckConstraint(
+            "source_kind IN ("
+            "'PREPARATION', 'PROBE', 'VARIANT', 'VERIFICATION', "
+            "'QUARANTINE')",
+            name="ck_artifact_cache_event_source_kind",
+        ),
+        CheckConstraint(
+            "length(source_id) > 0 AND length(source_id) <= 255",
+            name="ck_artifact_cache_event_source_id",
+        ),
+        CheckConstraint(
+            "evidence_kind IN ("
+            "'PREPARATION_RESULT', 'PROBE_OBSERVATION', "
+            "'STAGE_VARIANT_STATUS', 'RUNTIME_VERIFICATION', "
+            "'QUARANTINE_REQUEST', 'QUARANTINE_RESULT')",
+            name="ck_artifact_cache_event_evidence_kind",
+        ),
+        CheckConstraint(
+            "length(evidence_digest) = 71 "
+            "AND evidence_digest LIKE 'sha256:%'",
+            name="ck_artifact_cache_event_evidence_sha256",
+        ),
+        CheckConstraint(
+            "(source_kind = 'PREPARATION' "
+            "AND reason_code = 'PREPARATION_SUCCEEDED' "
+            "AND source_attempt_id IS NOT NULL "
+            "AND source_task_id IS NOT NULL "
+            "AND evidence_kind = 'PREPARATION_RESULT') OR "
+            "(source_kind = 'PROBE' "
+            "AND reason_code IN ("
+            "'PROBE_UNSAFE', 'PROBE_CORRUPT', "
+            "'PROBE_IDENTITY_MISMATCH', 'PROBE_MISSING') "
+            "AND source_attempt_id IS NULL "
+            "AND evidence_kind = 'PROBE_OBSERVATION') OR "
+            "(source_kind = 'VARIANT' "
+            "AND reason_code = 'VARIANT_REVOKED' "
+            "AND source_attempt_id IS NULL "
+            "AND source_task_id IS NULL "
+            "AND evidence_kind = 'STAGE_VARIANT_STATUS') OR "
+            "(source_kind = 'VERIFICATION' "
+            "AND reason_code = 'VERIFICATION_FAILED' "
+            "AND source_attempt_id IS NULL "
+            "AND evidence_kind = 'RUNTIME_VERIFICATION') OR "
+            "(source_kind = 'QUARANTINE' "
+            "AND reason_code = 'QUARANTINE_REQUESTED' "
+            "AND source_attempt_id IS NULL "
+            "AND evidence_kind = 'QUARANTINE_REQUEST') OR "
+            "(source_kind = 'QUARANTINE' "
+            "AND reason_code IN ("
+            "'QUARANTINE_SUCCEEDED', 'QUARANTINE_FAILED') "
+            "AND source_attempt_id IS NULL "
+            "AND evidence_kind = 'QUARANTINE_RESULT')",
+            name="ck_artifact_cache_event_closed_source",
+        ),
+        UniqueConstraint(
+            "cache_id",
+            "sequence",
+            name="uq_artifact_cache_events_cache_sequence",
+        ),
+        UniqueConstraint(
+            "cache_id",
+            "source_kind",
+            "source_id",
+            "reason_code",
+            name="uq_artifact_cache_events_source_replay",
+        ),
+        Index(
+            "ix_artifact_cache_events_cache_created",
+            "cache_id",
+            "created_at",
+        ),
+        Index(
+            "ix_artifact_cache_events_source_task",
+            "source_task_id",
+        ),
+        # Eliminate SQLite's hidden rowid replacement key.  Together with the
+        # explicit replay-key INSERT guard, this prevents INSERT OR REPLACE
+        # from bypassing append-only DELETE protection on external SQLite
+        # connections where recursive_triggers may remain disabled.
+        {"sqlite_with_rowid": False},
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    cache_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "node_artifact_caches.id",
+            name="fk_artifact_cache_events_cache_id",
+        ),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_status: Mapped[str | None] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_attempt_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "artifact_preparation_attempts.id",
+            name="fk_artifact_cache_events_source_attempt_id",
+        )
+    )
+    source_task_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "tasks.id",
+            name="fk_artifact_cache_events_source_task_id",
+        )
+    )
+    evidence_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
+_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE = (
+    "artifact_cache_events is append-only"
+)
+_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION = (
+    "dure_artifact_cache_events_append_only_guard"
+)
+
+
+def _register_artifact_cache_event_append_only_ddl() -> None:
+    """Install the same database guard for metadata-created test databases."""
+
+    table = ArtifactCacheEvent.__table__
+    for operation in ("UPDATE", "DELETE"):
+        trigger_name = f"trg_artifact_cache_events_no_{operation.lower()}"
+        event.listen(
+            table,
+            "after_create",
+            DDL(
+                f"""
+CREATE TRIGGER {trigger_name}
+BEFORE {operation} ON artifact_cache_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, '{_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE}');
+END
+"""
+            ).execute_if(dialect="sqlite"),
+        )
+    event.listen(
+        table,
+        "after_create",
+        DDL(
+            f"""
+CREATE TRIGGER trg_artifact_cache_events_no_replace
+BEFORE INSERT ON artifact_cache_events
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM artifact_cache_events AS existing
+    WHERE existing.id = NEW.id
+       OR (existing.cache_id = NEW.cache_id
+           AND existing.sequence = NEW.sequence)
+       OR (existing.cache_id = NEW.cache_id
+           AND existing.source_kind = NEW.source_kind
+           AND existing.source_id = NEW.source_id
+           AND existing.reason_code = NEW.reason_code)
+)
+BEGIN
+    SELECT RAISE(ABORT, '{_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE}');
+END
+"""
+        ).execute_if(dialect="sqlite"),
+    )
+
+    event.listen(
+        table,
+        "after_create",
+        DDL(
+            f"""
+CREATE OR REPLACE FUNCTION {_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $dure$
+BEGIN
+    RAISE EXCEPTION '{_ARTIFACT_CACHE_EVENT_APPEND_ONLY_MESSAGE}'
+        USING ERRCODE = '23514';
+END;
+$dure$
+"""
+        ).execute_if(dialect="postgresql"),
+    )
+    for operation in ("UPDATE", "DELETE"):
+        trigger_name = f"trg_artifact_cache_events_no_{operation.lower()}"
+        event.listen(
+            table,
+            "after_create",
+            DDL(
+                f"""
+CREATE TRIGGER {trigger_name}
+BEFORE {operation} ON artifact_cache_events
+FOR EACH ROW
+EXECUTE FUNCTION {_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()
+"""
+            ).execute_if(dialect="postgresql"),
+        )
+    event.listen(
+        table,
+        "after_create",
+        DDL(
+            f"""
+CREATE TRIGGER trg_artifact_cache_events_no_truncate
+BEFORE TRUNCATE ON artifact_cache_events
+FOR EACH STATEMENT
+EXECUTE FUNCTION {_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()
+"""
+        ).execute_if(dialect="postgresql"),
+    )
+    event.listen(
+        table,
+        "after_drop",
+        DDL(
+            "DROP FUNCTION IF EXISTS "
+            f"{_ARTIFACT_CACHE_EVENT_POSTGRESQL_GUARD_FUNCTION}()"
+        ).execute_if(dialect="postgresql"),
+    )
+
+
+_register_artifact_cache_event_append_only_ddl()
 
 
 class BenchmarkRun(Base):

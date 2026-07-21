@@ -18,16 +18,19 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    create_mock_engine,
     func,
     inspect,
     select,
     text,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from dure.control.db import Base, make_engine, make_session_factory
 from dure.control.benchmark import register_benchmark_evidence
 from dure.control.models import (
+    ArtifactCacheEvent,
     ArtifactChunk,
     ArtifactFileChunk,
     ArtifactManifest,
@@ -43,6 +46,7 @@ from dure.control.models import (
     DeploymentRecommendationRecord,
     ModelArtifact,
     ModelRelease,
+    NodeArtifactCache,
     PlacementProfileRecord,
     RuntimeRelease,
     StageArtifactRank,
@@ -85,10 +89,15 @@ STAGE_ARTIFACT_TABLES = {
     "stage_artifact_validation_evidence",
     "stage_artifact_validation_ranks",
 }
+ARTIFACT_CACHE_TABLES = {
+    "node_artifact_caches",
+    "artifact_cache_events",
+}
 HEAD_TABLES = REGISTRY_TABLES | {
     *ARTIFACT_MANIFEST_TABLES,
     *ARTIFACT_PREPARATION_TABLES,
     *STAGE_ARTIFACT_TABLES,
+    *ARTIFACT_CACHE_TABLES,
     "benchmark_evidence",
     "benchmark_runs",
     "deployment_operation_nodes",
@@ -142,6 +151,39 @@ STAGE_EVIDENCE_RANK_CHECKS = {
     "ck_stage_evidence_rank_nonnegative",
     "ck_stage_evidence_rank_tensor_count",
     "ck_stage_evidence_rank_weight_size",
+}
+NODE_ARTIFACT_CACHE_CHECKS = {
+    "ck_node_artifact_cache_event_sequence_nonnegative",
+    "ck_node_artifact_cache_id_length",
+    "ck_node_artifact_cache_identity_sha256",
+    "ck_node_artifact_cache_identity_shape",
+    "ck_node_artifact_cache_kind",
+    "ck_node_artifact_cache_manifest_sha256",
+    "ck_node_artifact_cache_quarantine_request_length",
+    "ck_node_artifact_cache_quarantine_shape",
+    "ck_node_artifact_cache_ready_evidence",
+    "ck_node_artifact_cache_source_sha256",
+    "ck_node_artifact_cache_status",
+    "ck_node_artifact_cache_status_reason",
+    "ck_node_artifact_cache_tensor_keys_sha256",
+    "ck_node_artifact_cache_variant_sha256",
+    "ck_node_artifact_cache_verification_shape",
+    "ck_node_artifact_cache_verification_version",
+    "ck_node_artifact_cache_verified_files_positive",
+    "ck_node_artifact_cache_verified_size_positive",
+}
+ARTIFACT_CACHE_EVENT_CHECKS = {
+    "ck_artifact_cache_event_closed_source",
+    "ck_artifact_cache_event_evidence_kind",
+    "ck_artifact_cache_event_evidence_sha256",
+    "ck_artifact_cache_event_id_length",
+    "ck_artifact_cache_event_previous_status",
+    "ck_artifact_cache_event_previous_status_value",
+    "ck_artifact_cache_event_reason",
+    "ck_artifact_cache_event_sequence_positive",
+    "ck_artifact_cache_event_source_id",
+    "ck_artifact_cache_event_source_kind",
+    "ck_artifact_cache_event_status",
 }
 BENCHMARK_INDEXES = {
     "ix_benchmark_evidence_release_id",
@@ -382,6 +424,32 @@ def true_0008_database(url: str) -> Config:
     return migration_config
 
 
+def true_0009_database(url: str) -> Config:
+    """Materialize released 0009 without executing revision 0010."""
+    migration_config = config(url)
+    command.upgrade(migration_config, "0009")
+    engine = make_engine(url)
+    with engine.begin() as connection:
+        ArtifactCacheEvent.__table__.drop(connection, checkfirst=True)
+        NodeArtifactCache.__table__.drop(connection, checkfirst=True)
+        unique_names = {
+            item["name"]
+            for item in inspect(connection).get_unique_constraints(
+                "stage_artifact_variants"
+            )
+        }
+        if "uq_stage_variant_set_source" in unique_names:
+            operations = Operations(MigrationContext.configure(connection))
+            with operations.batch_alter_table(
+                "stage_artifact_variants"
+            ) as batch:
+                batch.drop_constraint(
+                    "uq_stage_variant_set_source", type_="unique"
+                )
+    engine.dispose()
+    return migration_config
+
+
 def _seed_stage_variant(session, *, suffix: str = "seed") -> tuple:
     artifact = ModelArtifact(
         id=str(uuid.uuid4()),
@@ -448,6 +516,50 @@ def _seed_stage_variant(session, *, suffix: str = "seed") -> tuple:
 
 
 class MigrationTests(unittest.TestCase):
+    def assert_sqlite_artifact_cache_event_guards(self, engine) -> None:
+        if engine.dialect.name != "sqlite":
+            return
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' "
+                    "AND tbl_name = 'artifact_cache_events'"
+                )
+            ).all()
+        triggers = {name: sql for name, sql in rows}
+        self.assertEqual(
+            {
+                "trg_artifact_cache_events_no_update",
+                "trg_artifact_cache_events_no_delete",
+                "trg_artifact_cache_events_no_replace",
+            },
+            set(triggers),
+        )
+        for operation in ("UPDATE", "DELETE"):
+            sql = triggers[
+                f"trg_artifact_cache_events_no_{operation.lower()}"
+            ].upper()
+            self.assertIn(f"BEFORE {operation}", sql)
+            self.assertIn("RAISE(ABORT", sql)
+            self.assertIn("ARTIFACT_CACHE_EVENTS IS APPEND-ONLY", sql)
+        replace_sql = triggers[
+            "trg_artifact_cache_events_no_replace"
+        ].upper()
+        self.assertIn("BEFORE INSERT", replace_sql)
+        self.assertIn("EXISTING.ID = NEW.ID", replace_sql)
+        self.assertIn("EXISTING.CACHE_ID = NEW.CACHE_ID", replace_sql)
+        self.assertIn("RAISE(ABORT", replace_sql)
+        with engine.connect() as connection:
+            table_sql = connection.scalar(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' "
+                    "AND name = 'artifact_cache_events'"
+                )
+            )
+        self.assertIn("WITHOUT ROWID", table_sql.upper())
+
     def assert_artifact_manifest_head(self, inspector) -> None:
         expected_columns = {
             "artifact_manifests": {
@@ -774,6 +886,7 @@ class MigrationTests(unittest.TestCase):
                 "status",
                 "failure_code",
                 "result",
+                "download_progress",
                 "created_at",
                 "updated_at",
                 "completed_at",
@@ -788,6 +901,7 @@ class MigrationTests(unittest.TestCase):
             "artifact_preparation_attempts": {
                 "failure_code",
                 "result",
+                "download_progress",
                 "completed_at",
             },
         }
@@ -916,6 +1030,7 @@ class MigrationTests(unittest.TestCase):
         expected_uniques = {
             "stage_artifact_variants": {
                 ("artifact_set_digest", "tensor_parallel_size", "pipeline_parallel_size"),
+                ("artifact_set_digest", "source_manifest_digest"),
                 ("contract_identity_digest",),
             },
             "stage_artifact_ranks": {
@@ -1245,6 +1360,204 @@ class MigrationTests(unittest.TestCase):
                 f"Base.metadata {table_name}",
             )
 
+    def assert_artifact_cache_head(self, inspector) -> None:
+        expected_columns = {
+            "node_artifact_caches": {
+                "id",
+                "node_id",
+                "cache_kind",
+                "cache_identity_digest",
+                "manifest_digest",
+                "source_manifest_digest",
+                "artifact_set_digest",
+                "artifact_rank",
+                "pipeline_rank",
+                "tensor_rank",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "tensor_keys_digest",
+                "status",
+                "reason_code",
+                "last_ready_attempt_id",
+                "verified_at",
+                "verified_size_bytes",
+                "verified_file_count",
+                "verification_version",
+                "last_probe_observed_at",
+                "quarantine_request_id",
+                "quarantined_at",
+                "event_sequence",
+                "created_at",
+                "updated_at",
+            },
+            "artifact_cache_events": {
+                "id",
+                "cache_id",
+                "sequence",
+                "previous_status",
+                "status",
+                "reason_code",
+                "source_kind",
+                "source_id",
+                "source_attempt_id",
+                "source_task_id",
+                "evidence_kind",
+                "evidence_digest",
+                "created_at",
+            },
+        }
+        nullable = {
+            "node_artifact_caches": {
+                "artifact_set_digest",
+                "artifact_rank",
+                "pipeline_rank",
+                "tensor_rank",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "tensor_keys_digest",
+                "last_ready_attempt_id",
+                "verified_at",
+                "verified_size_bytes",
+                "verified_file_count",
+                "verification_version",
+                "last_probe_observed_at",
+                "quarantine_request_id",
+                "quarantined_at",
+            },
+            "artifact_cache_events": {
+                "previous_status",
+                "source_attempt_id",
+                "source_task_id",
+            },
+        }
+        for table_name, columns in expected_columns.items():
+            migrated = {
+                item["name"]: item
+                for item in inspector.get_columns(table_name)
+            }
+            self.assertEqual(columns, set(migrated), table_name)
+            self.assertEqual(
+                columns,
+                set(Base.metadata.tables[table_name].columns.keys()),
+                f"Base.metadata {table_name}",
+            )
+            for name, column in migrated.items():
+                self.assertEqual(
+                    name in nullable[table_name],
+                    column["nullable"],
+                    f"{table_name}.{name}",
+                )
+
+        expected_checks = {
+            "node_artifact_caches": NODE_ARTIFACT_CACHE_CHECKS,
+            "artifact_cache_events": ARTIFACT_CACHE_EVENT_CHECKS,
+        }
+        for table_name, checks in expected_checks.items():
+            self.assertEqual(
+                checks,
+                {
+                    item["name"]
+                    for item in inspector.get_check_constraints(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                checks,
+                {
+                    item.name
+                    for item in Base.metadata.tables[table_name].constraints
+                    if isinstance(item, CheckConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        expected_uniques = {
+            "node_artifact_caches": {
+                ("node_id", "cache_identity_digest"),
+                ("last_ready_attempt_id",),
+            },
+            "artifact_cache_events": {
+                ("cache_id", "sequence"),
+                ("cache_id", "source_kind", "source_id", "reason_code"),
+            },
+        }
+        for table_name, uniques in expected_uniques.items():
+            self.assertEqual(
+                uniques,
+                {
+                    tuple(item["column_names"])
+                    for item in inspector.get_unique_constraints(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                uniques,
+                {
+                    tuple(column.name for column in item.columns)
+                    for item in Base.metadata.tables[table_name].constraints
+                    if isinstance(item, UniqueConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        expected_indexes = {
+            "node_artifact_caches": {
+                "ix_node_artifact_caches_manifest_status",
+                "ix_node_artifact_caches_node_status",
+                "ix_node_artifact_caches_variant_status",
+            },
+            "artifact_cache_events": {
+                "ix_artifact_cache_events_cache_created",
+                "ix_artifact_cache_events_source_task",
+            },
+        }
+        for table_name, indexes in expected_indexes.items():
+            self.assertEqual(
+                indexes,
+                {item["name"] for item in inspector.get_indexes(table_name)},
+                table_name,
+            )
+            self.assertEqual(
+                indexes,
+                {item.name for item in Base.metadata.tables[table_name].indexes},
+                f"Base.metadata {table_name}",
+            )
+
+        expected_foreign_keys = {
+            "node_artifact_caches": {
+                "fk_node_artifact_caches_node_id",
+                "fk_node_artifact_caches_manifest_digest",
+                "fk_node_artifact_caches_source_manifest_digest",
+                "fk_node_artifact_cache_stage_source",
+                "fk_node_artifact_cache_stage_topology",
+                "fk_node_artifact_cache_stage_rank",
+                "fk_node_artifact_caches_ready_attempt_id",
+            },
+            "artifact_cache_events": {
+                "fk_artifact_cache_events_cache_id",
+                "fk_artifact_cache_events_source_attempt_id",
+                "fk_artifact_cache_events_source_task_id",
+            },
+        }
+        for table_name, names in expected_foreign_keys.items():
+            self.assertEqual(
+                names,
+                {
+                    item["name"]
+                    for item in inspector.get_foreign_keys(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                names,
+                {
+                    item.name
+                    for item in Base.metadata.tables[table_name].constraints
+                    if isinstance(item, ForeignKeyConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
     def assert_benchmark_head(self, url: str) -> None:
         engine = make_engine(url)
         inspector = inspect(engine)
@@ -1252,6 +1565,7 @@ class MigrationTests(unittest.TestCase):
         self.assert_artifact_manifest_head(inspector)
         self.assert_artifact_preparation_head(inspector)
         self.assert_stage_artifact_head(inspector)
+        self.assert_artifact_cache_head(inspector)
         self.assertEqual(
             BENCHMARK_INDEXES,
             {item["name"] for item in inspector.get_indexes("benchmark_evidence")},
@@ -1639,14 +1953,131 @@ class MigrationTests(unittest.TestCase):
             task_foreign_keys[("operation_node_id",)],
             ("deployment_operation_nodes", ("id",)),
         )
+        self.assert_sqlite_artifact_cache_event_guards(engine)
         engine.dispose()
 
-    def test_migration_history_has_single_0009_head(self):
+    def test_postgresql_append_only_ddl_and_cleanup_are_deterministic(self):
+        statements: list[str] = []
+        dialect = postgresql.dialect()
+
+        def record(statement, *_multiparams, **_params) -> None:
+            statements.append(str(statement.compile(dialect=dialect)))
+
+        engine = create_mock_engine("postgresql://", record)
+        Base.metadata.create_all(
+            engine,
+            tables=[ArtifactCacheEvent.__table__],
+            checkfirst=False,
+        )
+        metadata_create_sql = "\n".join(statements)
+        self.assertIn(
+            "CREATE OR REPLACE FUNCTION "
+            "dure_artifact_cache_events_append_only_guard()",
+            metadata_create_sql,
+        )
+        self.assertIn("USING ERRCODE = '23514'", metadata_create_sql)
+        for operation in ("UPDATE", "DELETE"):
+            self.assertIn(
+                f"CREATE TRIGGER "
+                f"trg_artifact_cache_events_no_{operation.lower()}",
+                metadata_create_sql,
+            )
+            self.assertIn(
+                f"BEFORE {operation} ON artifact_cache_events",
+                metadata_create_sql,
+            )
+        self.assertIn(
+            "CREATE TRIGGER trg_artifact_cache_events_no_truncate",
+            metadata_create_sql,
+        )
+        self.assertIn(
+            "BEFORE TRUNCATE ON artifact_cache_events",
+            metadata_create_sql,
+        )
+
+        statements.clear()
+        Base.metadata.drop_all(
+            engine,
+            tables=[ArtifactCacheEvent.__table__],
+            checkfirst=False,
+        )
+        self.assertIn(
+            "DROP FUNCTION IF EXISTS "
+            "dure_artifact_cache_events_append_only_guard()",
+            "\n".join(statements),
+        )
+
+        revision_module = ScriptDirectory.from_config(
+            config("sqlite://")
+        ).get_revision("0010").module
+        migration_create_sql = "\n".join(
+            revision_module._append_only_guard_upgrade_sql("postgresql")
+        )
+        self.assertIn(
+            "CREATE OR REPLACE FUNCTION "
+            "dure_artifact_cache_events_append_only_guard()",
+            migration_create_sql,
+        )
+        self.assertIn("USING ERRCODE = '23514'", migration_create_sql)
+        for operation in ("UPDATE", "DELETE"):
+            trigger_name = (
+                f"trg_artifact_cache_events_no_{operation.lower()}"
+            )
+            self.assertIn(
+                f"DROP TRIGGER IF EXISTS {trigger_name} "
+                "ON artifact_cache_events",
+                migration_create_sql,
+            )
+            self.assertIn(
+                f"CREATE TRIGGER {trigger_name}", migration_create_sql
+            )
+            self.assertIn(
+                f"BEFORE {operation} ON artifact_cache_events",
+                migration_create_sql,
+            )
+        self.assertIn(
+            "DROP TRIGGER IF EXISTS "
+            "trg_artifact_cache_events_no_truncate "
+            "ON artifact_cache_events",
+            migration_create_sql,
+        )
+        self.assertIn(
+            "CREATE TRIGGER trg_artifact_cache_events_no_truncate",
+            migration_create_sql,
+        )
+        self.assertIn(
+            "BEFORE TRUNCATE ON artifact_cache_events",
+            migration_create_sql,
+        )
+        self.assertEqual(
+            (
+                "LOCK TABLE artifact_preparation_attempts, "
+                "node_artifact_caches, artifact_cache_events "
+                "IN ACCESS EXCLUSIVE MODE",
+            ),
+            revision_module._destructive_downgrade_lock_sql(
+                "postgresql",
+                (
+                    "artifact_preparation_attempts",
+                    "node_artifact_caches",
+                    "artifact_cache_events",
+                ),
+            ),
+        )
+        self.assertEqual(
+            (
+                "DROP FUNCTION IF EXISTS "
+                "dure_artifact_cache_events_append_only_guard()",
+            ),
+            revision_module._append_only_guard_downgrade_sql("postgresql"),
+        )
+
+    def test_migration_history_has_single_0010_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0009"])
+            self.assertEqual(heads, ["0010"])
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1655,6 +2086,506 @@ class MigrationTests(unittest.TestCase):
             command.upgrade(config(url), "head")
 
             self.assert_benchmark_head(url)
+
+    def test_true_0009_upgrade_and_empty_round_trip_preserve_stage_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'cache-upgrade.db'}"
+            migration_config = true_0009_database(url)
+            engine = make_engine(url)
+            self.assertFalse(
+                ARTIFACT_CACHE_TABLES & set(inspect(engine).get_table_names())
+            )
+            factory = make_session_factory(engine)
+            with factory() as session:
+                _artifact, _runtime, _source, _stage, variant = _seed_stage_variant(
+                    session, suffix="cache-upgrade"
+                )
+                variant_id = variant.artifact_set_digest
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                self.assertIsNotNone(session.get(StageArtifactVariant, variant_id))
+            engine.dispose()
+
+            command.downgrade(migration_config, "0009")
+            engine = make_engine(url)
+            self.assertFalse(
+                ARTIFACT_CACHE_TABLES & set(inspect(engine).get_table_names())
+            )
+            self.assertNotIn(
+                "uq_stage_variant_set_source",
+                {
+                    item["name"]
+                    for item in inspect(engine).get_unique_constraints(
+                        "stage_artifact_variants"
+                    )
+                },
+            )
+            factory = make_session_factory(engine)
+            with factory() as session:
+                self.assertIsNotNone(session.get(StageArtifactVariant, variant_id))
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+
+    def test_0010_downgrade_rejects_persisted_cache_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'cache-downgrade.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                node = _node(session, "cache-downgrade")
+                artifact = ModelArtifact(
+                    model_id="cache-downgrade",
+                    repository="Example/CacheDowngrade",
+                    revision="d" * 40,
+                    manifest_digest="sha256:" + "e" * 64,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1024,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                session.add(artifact)
+                session.flush()
+                session.add(
+                    ArtifactManifest(
+                        digest=artifact.manifest_digest,
+                        schema_version=1,
+                        model_artifact_id=artifact.id,
+                        total_size_bytes=1,
+                        file_count=1,
+                        chunk_count=1,
+                        canonical_json="{}",
+                    )
+                )
+                session.flush()
+                session.add(
+                    NodeArtifactCache(
+                        node_id=node.id,
+                        cache_kind="FULL_SNAPSHOT",
+                        cache_identity_digest=artifact.manifest_digest,
+                        manifest_digest=artifact.manifest_digest,
+                        source_manifest_digest=artifact.manifest_digest,
+                        status="MISSING",
+                        reason_code="PROBE_MISSING",
+                        event_sequence=0,
+                    )
+                )
+                session.commit()
+            engine.dispose()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refusing to downgrade 0010",
+            ):
+                command.downgrade(migration_config, "0009")
+
+            engine = make_engine(url)
+            self.assertTrue(
+                ARTIFACT_CACHE_TABLES <= set(inspect(engine).get_table_names())
+            )
+            engine.dispose()
+
+    def test_0010_downgrade_rejects_non_null_download_progress(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'progress-downgrade.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            deployment_id = str(uuid.uuid4())
+            manifest_digest = "sha256:" + "7" * 64
+            with factory() as session:
+                node = _node(session, "progress-downgrade")
+                deployment = Deployment(
+                    id=deployment_id,
+                    lineage_id=deployment_id,
+                    generation=1,
+                    plan={
+                        "deployment_id": deployment_id,
+                        "generation": 1,
+                    },
+                    accept_model_download=False,
+                    pull_image=False,
+                    status="CREATED",
+                )
+                manifest = ArtifactManifest(
+                    digest=manifest_digest,
+                    schema_version=1,
+                    model_artifact_id=None,
+                    total_size_bytes=1,
+                    file_count=1,
+                    chunk_count=1,
+                    canonical_json="{}",
+                )
+                session.add_all([deployment, manifest])
+                session.flush()
+                preparation = ArtifactPreparation(
+                    request_id=str(uuid.uuid4()),
+                    request_digest="sha256:" + "8" * 64,
+                    deployment_id=deployment_id,
+                    status="QUEUED",
+                    plan_snapshot={
+                        "deployment_id": deployment_id,
+                        "generation": 1,
+                    },
+                )
+                session.add(preparation)
+                session.flush()
+                preparation_node = ArtifactPreparationNode(
+                    preparation_id=preparation.id,
+                    node_id=node.id,
+                    model_manifest_digest=manifest_digest,
+                    runtime_image=(
+                        "registry.example/runtime@sha256:" + "9" * 64
+                    ),
+                    model_status="QUEUED",
+                    image_status="PREPARED",
+                    model_current_attempt=1,
+                    image_current_attempt=0,
+                )
+                session.add(preparation_node)
+                session.flush()
+                task = Task(
+                    bulk_id=preparation.id,
+                    node_id=node.id,
+                    type="PREPARE_MODEL",
+                    deployment_id=deployment_id,
+                    status="QUEUED",
+                    payload={},
+                )
+                session.add(task)
+                session.flush()
+                attempt = ArtifactPreparationAttempt(
+                    preparation_node_id=preparation_node.id,
+                    stage="MODEL",
+                    attempt_no=1,
+                    task_id=task.id,
+                    status="QUEUED",
+                    download_progress={
+                        "downloaded_bytes": 1,
+                        "expected_bytes": 1,
+                    },
+                )
+                session.add(attempt)
+                session.commit()
+                attempt_id = attempt.id
+            engine.dispose()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "artifact_preparation_attempts.download_progress",
+            ):
+                command.downgrade(migration_config, "0009")
+
+            engine = make_engine(url)
+            self.assertIn(
+                "download_progress",
+                {
+                    item["name"]
+                    for item in inspect(engine).get_columns(
+                        "artifact_preparation_attempts"
+                    )
+                },
+            )
+            factory = make_session_factory(engine)
+            with factory() as session:
+                attempt = session.get(
+                    ArtifactPreparationAttempt, attempt_id
+                )
+                self.assertIsNotNone(attempt)
+                attempt.download_progress = None
+                session.commit()
+                storage_kind = session.scalar(
+                    text(
+                        "SELECT typeof(download_progress) "
+                        "FROM artifact_preparation_attempts "
+                        "WHERE id = :attempt_id"
+                    ),
+                    {"attempt_id": attempt_id},
+                )
+                self.assertEqual(storage_kind, "null")
+                # Draft databases created before none_as_null=True may contain
+                # a JSON literal null.  It is absence, not lifecycle data.
+                session.execute(
+                    text(
+                        "UPDATE artifact_preparation_attempts "
+                        "SET download_progress = 'null' "
+                        "WHERE id = :attempt_id"
+                    ),
+                    {"attempt_id": attempt_id},
+                )
+                session.commit()
+                self.assertEqual(
+                    session.scalar(
+                        text(
+                            "SELECT typeof(download_progress) "
+                            "FROM artifact_preparation_attempts "
+                            "WHERE id = :attempt_id"
+                        ),
+                        {"attempt_id": attempt_id},
+                    ),
+                    "text",
+                )
+            engine.dispose()
+
+            command.downgrade(migration_config, "0009")
+            engine = make_engine(url)
+            self.assertNotIn(
+                "download_progress",
+                {
+                    item["name"]
+                    for item in inspect(engine).get_columns(
+                        "artifact_preparation_attempts"
+                    )
+                },
+            )
+            self.assertFalse(
+                ARTIFACT_CACHE_TABLES
+                & set(inspect(engine).get_table_names())
+            )
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+
+    def test_0010_rejects_invalid_cache_shape_ready_evidence_and_event_reason(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'cache-constraints.db'}"
+            command.upgrade(config(url), "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                node = _node(session, "cache-constraints")
+                artifact = ModelArtifact(
+                    model_id="cache-constraints",
+                    repository="Example/CacheConstraints",
+                    revision="c" * 40,
+                    manifest_digest="sha256:" + "d" * 64,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1024,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                session.add(artifact)
+                session.flush()
+                manifest = ArtifactManifest(
+                    digest=artifact.manifest_digest,
+                    schema_version=1,
+                    model_artifact_id=artifact.id,
+                    total_size_bytes=1,
+                    file_count=1,
+                    chunk_count=1,
+                    canonical_json="{}",
+                )
+                session.add(manifest)
+                session.commit()
+
+                session.add(
+                    NodeArtifactCache(
+                        node_id=node.id,
+                        cache_kind="FULL_SNAPSHOT",
+                        cache_identity_digest="sha256:" + "e" * 64,
+                        manifest_digest=manifest.digest,
+                        source_manifest_digest=manifest.digest,
+                        status="MISSING",
+                        reason_code="PROBE_MISSING",
+                        event_sequence=0,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                session.add(
+                    NodeArtifactCache(
+                        node_id=node.id,
+                        cache_kind="FULL_SNAPSHOT",
+                        cache_identity_digest=manifest.digest,
+                        manifest_digest=manifest.digest,
+                        source_manifest_digest=manifest.digest,
+                        status="READY",
+                        reason_code="PREPARATION_SUCCEEDED",
+                        event_sequence=0,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                cache = NodeArtifactCache(
+                    node_id=node.id,
+                    cache_kind="FULL_SNAPSHOT",
+                    cache_identity_digest=manifest.digest,
+                    manifest_digest=manifest.digest,
+                    source_manifest_digest=manifest.digest,
+                    status="MISSING",
+                    reason_code="PROBE_MISSING",
+                    event_sequence=0,
+                )
+                session.add(cache)
+                session.commit()
+                session.add(
+                    ArtifactCacheEvent(
+                        cache_id=cache.id,
+                        sequence=1,
+                        previous_status=None,
+                        status="MISSING",
+                        reason_code="ARBITRARY_REMOTE_REASON",
+                        source_kind="PROBE",
+                        source_id="scan-1",
+                        evidence_kind="PROBE_OBSERVATION",
+                        evidence_digest="sha256:" + "f" * 64,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+            engine.dispose()
+
+    def test_0010_migration_allows_insert_but_rejects_raw_event_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'cache-append-only.db'}"
+            command.upgrade(config(url), "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                node = _node(session, "cache-append-only")
+                artifact = ModelArtifact(
+                    model_id="cache-append-only",
+                    repository="Example/CacheAppendOnly",
+                    revision="a" * 40,
+                    manifest_digest="sha256:" + "b" * 64,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1024,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                session.add(artifact)
+                session.flush()
+                manifest = ArtifactManifest(
+                    digest=artifact.manifest_digest,
+                    schema_version=1,
+                    model_artifact_id=artifact.id,
+                    total_size_bytes=1,
+                    file_count=1,
+                    chunk_count=1,
+                    canonical_json="{}",
+                )
+                session.add(manifest)
+                session.flush()
+                cache = NodeArtifactCache(
+                    node_id=node.id,
+                    cache_kind="FULL_SNAPSHOT",
+                    cache_identity_digest=manifest.digest,
+                    manifest_digest=manifest.digest,
+                    source_manifest_digest=manifest.digest,
+                    status="MISSING",
+                    reason_code="PROBE_MISSING",
+                    event_sequence=1,
+                )
+                session.add(cache)
+                session.flush()
+                event = ArtifactCacheEvent(
+                    cache_id=cache.id,
+                    sequence=1,
+                    previous_status=None,
+                    status="MISSING",
+                    reason_code="PROBE_MISSING",
+                    source_kind="PROBE",
+                    source_id="migration-scan-1",
+                    evidence_kind="PROBE_OBSERVATION",
+                    evidence_digest="sha256:" + "c" * 64,
+                )
+                session.add(event)
+                session.commit()
+                event_id = event.id
+
+                replay = session.scalar(
+                    select(ArtifactCacheEvent).where(
+                        ArtifactCacheEvent.cache_id == cache.id,
+                        ArtifactCacheEvent.source_kind == "PROBE",
+                        ArtifactCacheEvent.source_id == "migration-scan-1",
+                        ArtifactCacheEvent.reason_code == "PROBE_MISSING",
+                    )
+                )
+                self.assertEqual(replay.id, event_id)
+                with self.assertRaisesRegex(
+                    OperationalError, "no such column: rowid"
+                ):
+                    session.execute(
+                        text(
+                            "SELECT rowid FROM artifact_cache_events "
+                            "WHERE id = :event_id"
+                        ),
+                        {"event_id": event_id},
+                    )
+                session.rollback()
+
+                with self.assertRaisesRegex(IntegrityError, "append-only"):
+                    session.execute(
+                        text(
+                            "UPDATE artifact_cache_events "
+                            "SET source_id = :source_id WHERE id = :event_id"
+                        ),
+                        {
+                            "source_id": "raw-update-must-fail",
+                            "event_id": event_id,
+                        },
+                    )
+                session.rollback()
+
+                with self.assertRaisesRegex(IntegrityError, "append-only"):
+                    session.execute(
+                        text(
+                            "DELETE FROM artifact_cache_events "
+                            "WHERE id = :event_id"
+                        ),
+                        {"event_id": event_id},
+                    )
+                session.rollback()
+
+                with self.assertRaisesRegex(IntegrityError, "append-only"):
+                    session.execute(
+                        text(
+                            "INSERT OR REPLACE INTO artifact_cache_events ("
+                            "id, cache_id, sequence, previous_status, status, "
+                            "reason_code, source_kind, source_id, "
+                            "source_attempt_id, source_task_id, evidence_kind, "
+                            "evidence_digest, created_at) "
+                            "SELECT id, cache_id, sequence, previous_status, "
+                            "status, reason_code, source_kind, :source_id, "
+                            "source_attempt_id, source_task_id, evidence_kind, "
+                            "evidence_digest, created_at "
+                            "FROM artifact_cache_events WHERE id = :event_id"
+                        ),
+                        {
+                            "source_id": "raw-replace-must-fail",
+                            "event_id": event_id,
+                        },
+                    )
+                session.rollback()
+
+                preserved = session.get(ArtifactCacheEvent, event_id)
+                self.assertIsNotNone(preserved)
+                self.assertEqual(preserved.source_id, "migration-scan-1")
+                self.assertEqual(
+                    session.scalar(
+                        select(func.count()).select_from(ArtifactCacheEvent)
+                    ),
+                    1,
+                )
+            engine.dispose()
 
     def test_true_0008_upgrade_and_empty_round_trip_preserve_registry_records(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -22,6 +22,12 @@ from .artifact_prepare import (
     validate_preparation_history,
     validate_preparation_result,
 )
+from .cache_quarantine import (
+    ARTIFACT_CACHE_QUARANTINE_FAILURE_CODES,
+    ArtifactCacheQuarantineExecutor,
+    artifact_cache_quarantine_failure_code,
+    validate_artifact_cache_quarantine_result,
+)
 from .command import SubprocessRunner
 from .http import APIError, JSONClient
 from .model_cache import (
@@ -453,6 +459,7 @@ class TaskExecutor:
         state_path: Path | None = None,
         benchmark_executor: SafeBenchmarkExecutor | None = None,
         preparation_executor: ArtifactPreparationExecutor | None = None,
+        quarantine_executor: ArtifactCacheQuarantineExecutor | None = None,
         artifact_origin_config: object = None,
         manifest_loader: Callable[[str], dict] | None = None,
         build_commit: str | None | object = _BUILD_COMMIT_UNSET,
@@ -481,11 +488,24 @@ class TaskExecutor:
             origin_config=artifact_origin_config,
             manifest_loader=manifest_loader,
         )
+        self.quarantine_executor = quarantine_executor or ArtifactCacheQuarantineExecutor(
+            node_id,
+            runner=runner,
+        )
 
     def _profile(self):
         profile = NodeProbe(self.runner).collect()
         profile.node_id = self.node_id
         return profile
+
+    def preparation_progress(self, task_id: str) -> dict[str, int] | None:
+        reader = getattr(self.preparation_executor, "progress_snapshot", None)
+        return reader(task_id) if callable(reader) else None
+
+    def clear_preparation_progress(self, task_id: str) -> None:
+        clearer = getattr(self.preparation_executor, "clear_progress", None)
+        if callable(clearer):
+            clearer(task_id)
 
     def _deployment_task(self, task: dict, kind: TaskType):
         payload = task.get("payload")
@@ -565,6 +585,8 @@ class TaskExecutor:
         payload = task.get("payload") or {}
         if kind == TaskType.PROBE:
             return {"profile": self._profile().to_dict()}
+        if kind == TaskType.QUARANTINE_ARTIFACT_CACHE:
+            return self.quarantine_executor.execute(task)
         if kind == TaskType.BENCHMARK:
             benchmark = _validated_benchmark_payload(payload)
             if not benchmark.apply:
@@ -875,6 +897,21 @@ class Agent:
             raise ValueError("artifact manifest response is invalid")
         return response["manifest"]
 
+    def _task_heartbeat_payload(
+        self, task_id: str, *, is_preparation: bool
+    ) -> dict | None:
+        if not is_preparation:
+            return None
+        progress_reader = getattr(
+            self.executor,
+            "preparation_progress",
+            None,
+        )
+        progress = (
+            progress_reader(task_id) if callable(progress_reader) else None
+        )
+        return {"progress": progress} if progress is not None else None
+
     def stop(self, *_args) -> None:
         self.running = False
 
@@ -893,6 +930,9 @@ class Agent:
         task_id = task["id"]
         is_benchmark = task.get("type") == TaskType.BENCHMARK.value
         is_preparation = is_artifact_preparation_task(task.get("type"))
+        is_quarantine = (
+            task.get("type") == TaskType.QUARANTINE_ARTIFACT_CACHE.value
+        )
         previous = self.history.get("completed", {}).get(task_id)
         if previous is not None:
             if is_preparation:
@@ -1007,6 +1047,50 @@ class Agent:
                                 f"/v1/agent/tasks/{task_id}/complete",
                                 {"result": result},
                             )
+            elif is_quarantine:
+                if type(previous) is not dict or previous.get("status") == "failed":
+                    error = (
+                        previous.get("error")
+                        if type(previous) is dict
+                        else None
+                    )
+                    if error not in ARTIFACT_CACHE_QUARANTINE_FAILURE_CODES:
+                        error = "CACHE_QUARANTINE_EXECUTION_FAILED"
+                        self.history.setdefault("completed", {})[task_id] = {
+                            "status": "failed",
+                            "error": error,
+                        }
+                        _atomic_json(self.history_path, self.history)
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/fail",
+                        {"error": error},
+                    )
+                else:
+                    try:
+                        result = validate_artifact_cache_quarantine_result(
+                            task,
+                            previous.get("result", previous),
+                            self.executor.node_id,
+                        )
+                    except Exception:
+                        error = "CACHE_QUARANTINE_EXECUTION_FAILED"
+                        self.history.setdefault("completed", {})[task_id] = {
+                            "status": "failed",
+                            "error": error,
+                        }
+                        _atomic_json(self.history_path, self.history)
+                        self.client.request(
+                            "POST",
+                            f"/v1/agent/tasks/{task_id}/fail",
+                            {"error": error},
+                        )
+                    else:
+                        self.client.request(
+                            "POST",
+                            f"/v1/agent/tasks/{task_id}/complete",
+                            {"result": result},
+                        )
             elif previous.get("status") == "failed":
                 self.client.request("POST", f"/v1/agent/tasks/{task_id}/fail", {"error": previous["error"]})
             else:
@@ -1018,7 +1102,15 @@ class Agent:
         def renew_lease() -> None:
             while not renewal_stop.wait(60):
                 try:
-                    self.client.request("POST", f"/v1/agent/tasks/{task_id}/heartbeat")
+                    heartbeat_payload = self._task_heartbeat_payload(
+                        task_id,
+                        is_preparation=is_preparation,
+                    )
+                    self.client.request(
+                        "POST",
+                        f"/v1/agent/tasks/{task_id}/heartbeat",
+                        heartbeat_payload,
+                    )
                 except APIError as exc:
                     LOG.warning("could not renew task %s lease: %s", task_id, exc)
 
@@ -1029,6 +1121,12 @@ class Agent:
                 result = self.executor.execute(task)
                 if is_preparation:
                     result = validate_preparation_result(
+                        task,
+                        result,
+                        self.executor.node_id,
+                    )
+                elif is_quarantine:
+                    result = validate_artifact_cache_quarantine_result(
                         task,
                         result,
                         self.executor.node_id,
@@ -1047,6 +1145,13 @@ class Agent:
                         error = preparation_failure_code(exc)
                         LOG.error(
                             "artifact preparation task %s failed with %s",
+                            task_id,
+                            error,
+                        )
+                    elif is_quarantine:
+                        error = artifact_cache_quarantine_failure_code(exc)
+                        LOG.error(
+                            "artifact cache quarantine task %s failed with %s",
                             task_id,
                             error,
                         )
@@ -1076,6 +1181,14 @@ class Agent:
         finally:
             renewal_stop.set()
             renewal.join(timeout=2)
+            if is_preparation:
+                progress_clearer = getattr(
+                    self.executor,
+                    "clear_preparation_progress",
+                    None,
+                )
+                if callable(progress_clearer):
+                    progress_clearer(task_id)
         return True
 
     def run(self, interval: float = 10) -> None:

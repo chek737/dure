@@ -5,6 +5,7 @@ import unittest
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import func, select
 
@@ -464,6 +465,101 @@ class DeploymentRolloutTests(unittest.TestCase):
             )
             self.assertIsNone(failed_record.failure_code)
 
+    def test_rollback_rechecks_target_cache_after_stop_and_retries_without_network(self) -> None:
+        from dure.control.preparation import ArtifactPreparationError
+
+        with self.factory() as session:
+            self._node(session, NODE_A)
+            target, source = self._lineage(session, [NODE_A])
+            gate = {"blocked": False}
+
+            def effective_plan(
+                _session,
+                deployment,
+                *,
+                require_prepared=True,
+                lock_ready_caches=True,
+            ):
+                if (
+                    gate["blocked"]
+                    and deployment.id == target.id
+                    and require_prepared
+                ):
+                    raise ArtifactPreparationError(
+                        "target cache is no longer ready",
+                        code="DEPLOYMENT_ARTIFACT_CACHE_NOT_READY",
+                    )
+                return deployment.plan
+
+            with patch(
+                "dure.control.preparation.effective_deployment_plan",
+                side_effect=effective_plan,
+            ):
+                operation, stop_tasks, changed = prepare_or_apply_rollback(
+                    session,
+                    source.id,
+                    [NODE_A],
+                    apply=True,
+                    serve=False,
+                )
+                self.assertTrue(changed)
+                self.assertEqual(len(stop_tasks), 1)
+                self._claim(session, stop_tasks[0])
+
+                # The cache can disappear or become corrupt while the source
+                # is stopping. The second gate must fail before START_TARGET.
+                gate["blocked"] = True
+                self._finish(session, stop_tasks[0])
+                session.refresh(operation)
+                session.refresh(source)
+                session.refresh(target)
+                self.assertEqual(operation.phase, "START_TARGET")
+                self.assertEqual(operation.status, "FAILED")
+                self.assertEqual(source.status, "ROLLBACK_FAILED")
+                self.assertEqual(target.status, "ROLLBACK_FAILED")
+                self.assertFalse(
+                    self._phase_tasks(session, operation.id, "START_TARGET")
+                )
+                start_record = session.scalar(
+                    select(DeploymentOperationNode).where(
+                        DeploymentOperationNode.operation_id == operation.id,
+                        DeploymentOperationNode.phase == "START_TARGET",
+                        DeploymentOperationNode.node_id == NODE_A,
+                    )
+                )
+                self.assertIsNotNone(start_record)
+                self.assertEqual(
+                    start_record.failure_code,
+                    "ROLLBACK_TARGET_CACHE_NOT_READY",
+                )
+
+                # Restoring exact READY evidence permits retrying only the
+                # blocked phase. Rollback never prepares, downloads, or pulls.
+                gate["blocked"] = False
+                same, retry_tasks, retried = prepare_or_apply_rollback(
+                    session,
+                    source.id,
+                    [NODE_A],
+                    apply=True,
+                    serve=False,
+                )
+                self.assertEqual(same.id, operation.id)
+                self.assertTrue(retried)
+                self.assertEqual(len(retry_tasks), 1)
+                self.assertEqual(
+                    retry_tasks[0].type, TaskType.START_DEPLOYMENT.value
+                )
+                self.assertNotIn(
+                    "accept_model_download", retry_tasks[0].payload
+                )
+                self.assertNotIn("pull_image", retry_tasks[0].payload)
+                self.assertFalse(
+                    self._tasks(session, operation.id, TaskType.PREPARE_MODEL)
+                )
+                self.assertFalse(
+                    self._tasks(session, operation.id, TaskType.PREPARE_IMAGE)
+                )
+
     def test_rollback_denies_unverified_mismatched_or_unsafe_inputs(self) -> None:
         with self.factory() as session:
             node = self._node(session, NODE_A)
@@ -569,6 +665,36 @@ class DeploymentRolloutTests(unittest.TestCase):
                 ),
                 0,
             )
+
+    def test_rollback_rejects_type_confused_legacy_topology(self) -> None:
+        with self.factory() as session:
+            self._node(session, NODE_A)
+            _target, source = self._lineage(session, [NODE_A])
+            source_plan = dict(source.plan)
+            source_plan["assignments"] = [
+                dict(item) for item in source.plan["assignments"]
+            ]
+            # Python considers False == 0.  Stored JSON topology comparison
+            # must still fail closed when the wire types differ.
+            source_plan["assignments"][0]["gpu_index"] = False
+            source.plan = source_plan
+            session.commit()
+
+            with self.assertRaises(DeploymentRolloutError) as context:
+                prepare_or_apply_rollback(
+                    session, source.id, [NODE_A], apply=True, serve=False
+                )
+
+            self.assertEqual(
+                context.exception.code, "ROLLBACK_TOPOLOGY_UNSUPPORTED"
+            )
+            session.rollback()
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(DeploymentOperation)
+                ),
+                0,
+            )
             self.assertEqual(session.scalar(select(func.count()).select_from(Task)), 0)
 
     def test_multiple_prepares_are_allowed_but_only_one_can_be_applied(self) -> None:
@@ -598,6 +724,48 @@ class DeploymentRolloutTests(unittest.TestCase):
                 )
             self.assertEqual(context.exception.code, "DEPLOYMENT_OPERATION_ACTIVE")
             self.assertEqual(context.exception.details["operation_id"], first.id)
+
+    def test_queued_cache_quarantine_blocks_rollback_activation(self) -> None:
+        with self.factory() as session:
+            self._node(session, NODE_A)
+            _target, source = self._lineage(session, [NODE_A])
+            quarantine = Task(
+                bulk_id=str(uuid.uuid4()),
+                node_id=NODE_A,
+                type=TaskType.QUARANTINE_ARTIFACT_CACHE.value,
+                payload={
+                    "node_id": NODE_A,
+                    "cache_kind": "FULL_SNAPSHOT",
+                    "cache_identity_digest": "sha256:" + "b" * 64,
+                },
+            )
+            session.add(quarantine)
+            session.commit()
+
+            with self.assertRaises(DeploymentRolloutConflictError) as context:
+                prepare_or_apply_rollback(
+                    session,
+                    source.id,
+                    [NODE_A],
+                    apply=True,
+                    serve=False,
+                )
+
+            self.assertEqual(context.exception.code, "DEPLOYMENT_MUTATION_ACTIVE")
+            self.assertEqual(context.exception.details["task_id"], quarantine.id)
+            session.rollback()
+            active = list(
+                session.scalars(
+                    select(Task).where(
+                        Task.status.in_(
+                            {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}
+                        )
+                    )
+                )
+            )
+            self.assertEqual([task.type for task in active], [
+                TaskType.QUARANTINE_ARTIFACT_CACHE.value
+            ])
 
     def test_generic_apply_and_verify_are_linked_and_full_verify_qualifies(self) -> None:
         with self.factory() as session:

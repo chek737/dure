@@ -17,6 +17,10 @@ from dure.agent import (
     benchmark_profile_fingerprint,
 )
 from dure.benchmark_runtime import SafeBenchmarkRuntime
+from dure.cache_quarantine import (
+    ArtifactCacheQuarantineError,
+    ArtifactCacheQuarantineExecutor,
+)
 from dure.command import CommandResult
 from dure.http import APIError
 from dure.model_cache import (
@@ -39,6 +43,47 @@ from tests.helpers import (
     strict_pipeline_fixture,
     strict_stage_pipeline_fixture,
 )
+
+
+class QuarantineRunner:
+    def __init__(self, *, active_source: Path | None = None):
+        self.active_source = active_source
+        self.calls: list[tuple[str, ...]] = []
+
+    def exists(self, executable):
+        return executable == "docker"
+
+    def run(self, argv, *, timeout=15, env=None):
+        command = tuple(argv)
+        self.calls.append(command)
+        if command == (
+            "docker",
+            "ps",
+            "--filter",
+            "label=dure.deployment",
+            "--format",
+            "{{.ID}}",
+        ):
+            return CommandResult(
+                command,
+                0,
+                "a" * 12 if self.active_source is not None else "",
+            )
+        if command[:4] == ("docker", "inspect", "--format", "{{json .Mounts}}"):
+            return CommandResult(
+                command,
+                0,
+                json.dumps(
+                    [
+                        {
+                            "Type": "bind",
+                            "Source": str(self.active_source),
+                            "Destination": "/models/model",
+                        }
+                    ]
+                ),
+            )
+        return CommandResult(command, 1, stderr="unexpected command")
 
 
 class AgentRunner:
@@ -1572,3 +1617,117 @@ class AgentBenchmarkFailureTests(unittest.TestCase):
         self.assertEqual(
             fail_request[2], {"error": "ordinary verification failure"}
         )
+
+
+class ArtifactCacheQuarantineAgentTests(unittest.TestCase):
+    node_id = "4ec02dee-c5f5-4466-96c5-adc754ef52b8"
+    task_id = "5ec02dee-c5f5-4466-96c5-adc754ef52b8"
+    identity = "sha256:" + "b" * 64
+
+    def _task(self, **extra):
+        payload = {
+            "node_id": self.node_id,
+            "cache_kind": "FULL_SNAPSHOT",
+            "cache_identity_digest": self.identity,
+            **extra,
+        }
+        return {
+            "id": self.task_id,
+            "type": "QUARANTINE_ARTIFACT_CACHE",
+            "payload": payload,
+        }
+
+    def test_exact_inactive_cache_is_atomically_quarantined_and_retry_safe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            source = model_root / ("sha256-" + "b" * 64)
+            source.mkdir(parents=True)
+            (source / "damaged-file").write_text("retained", encoding="utf-8")
+            quarantine = ArtifactCacheQuarantineExecutor(
+                self.node_id,
+                runner=QuarantineRunner(),
+                model_root=model_root,
+            )
+            executor = TaskExecutor(
+                self.node_id,
+                runner=FakeRunner(),
+                quarantine_executor=quarantine,
+            )
+
+            first = executor.execute(self._task())
+            quarantine.runner = FakeRunner()
+            second = executor.execute(self._task())
+
+            target = (
+                model_root
+                / ".dure-quarantine"
+                / (self.task_id + "-full_snapshot-sha256-" + "b" * 64)
+            )
+            self.assertFalse(source.exists())
+            self.assertEqual((target / "damaged-file").read_text(), "retained")
+            self.assertEqual(first["status"], "QUARANTINED")
+            self.assertEqual(second["status"], "ALREADY_QUARANTINED")
+            self.assertNotIn("path", first)
+
+    def test_active_cache_mount_is_denied_before_the_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            source = model_root / ("sha256-" + "b" * 64)
+            source.mkdir(parents=True)
+            executor = ArtifactCacheQuarantineExecutor(
+                self.node_id,
+                runner=QuarantineRunner(active_source=source),
+                model_root=model_root,
+            )
+
+            with self.assertRaises(ArtifactCacheQuarantineError) as raised:
+                executor.execute(self._task())
+
+            self.assertEqual(
+                raised.exception.failure_code, "CACHE_QUARANTINE_CACHE_ACTIVE"
+            )
+            self.assertTrue(source.exists())
+
+    def test_stage_cache_uses_the_fixed_stage_root_and_same_quarantine_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_root = Path(temporary) / "models"
+            source = model_root / "stages" / ("sha256-" + "b" * 64)
+            source.mkdir(parents=True)
+            executor = ArtifactCacheQuarantineExecutor(
+                self.node_id,
+                runner=QuarantineRunner(),
+                model_root=model_root,
+            )
+
+            result = executor.execute(self._task(cache_kind="STAGE"))
+
+            target = (
+                model_root
+                / ".dure-quarantine"
+                / (self.task_id + "-stage-sha256-" + "b" * 64)
+            )
+            self.assertEqual(result["status"], "QUARANTINED")
+            self.assertFalse(source.exists())
+            self.assertTrue(target.is_dir())
+
+    def test_payload_is_closed_and_cannot_supply_a_host_path(self):
+        executor = ArtifactCacheQuarantineExecutor(
+            self.node_id,
+            runner=QuarantineRunner(),
+        )
+
+        for field, value in (
+            ("path", "/etc"),
+            ("url", "https://example.invalid/model"),
+            ("command", "rm"),
+            ("env", {"TOKEN": "secret"}),
+            ("docker_args", ["--privileged"]),
+        ):
+            with self.subTest(field=field), self.assertRaises(
+                ArtifactCacheQuarantineError
+            ) as raised:
+                executor.execute(self._task(**{field: value}))
+            self.assertEqual(
+                raised.exception.failure_code,
+                "CACHE_QUARANTINE_PAYLOAD_REJECTED",
+            )

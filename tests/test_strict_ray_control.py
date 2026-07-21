@@ -923,6 +923,191 @@ class StrictRayControlTests(unittest.TestCase):
             self.assertFalse(tasks)
             self.assertTrue(changed)
 
+    def test_strict_rollback_allows_different_model_and_stage_identity(self) -> None:
+        with self.factory() as session:
+            self._add_nodes(session)
+            for node_id in (NODE_A, NODE_B):
+                session.get(Node, node_id).agent_version = "0.3.19"
+
+            for source_cache_kind in (
+                MODEL_CACHE_KIND_FULL_SNAPSHOT,
+                MODEL_CACHE_KIND_STAGE,
+            ):
+                with self.subTest(source_cache_kind=source_cache_kind):
+                    target_id = str(uuid.uuid4())
+                    source_id = str(uuid.uuid4())
+                    target_plan = _strict_stage_plan(target_id).to_dict()
+                    if source_cache_kind == MODEL_CACHE_KIND_STAGE:
+                        source_plan = _strict_stage_plan(source_id).to_dict()
+                        source_manifest_digest = "sha256:" + "1" * 64
+                        exporter_build_digest = "sha256:" + "2" * 64
+                        stage_artifact = source_plan["stage_artifact"]
+                        stage_artifact.update(
+                            {
+                                "artifact_set_digest": "sha256:" + "3" * 64,
+                                "source_manifest_digest": source_manifest_digest,
+                                "exporter_build_digest": exporter_build_digest,
+                                "contract_identity_digest": (
+                                    stage_contract_identity_digest(
+                                        source_manifest_digest=(
+                                            source_manifest_digest
+                                        ),
+                                        runtime_image=stage_artifact[
+                                            "runtime_image"
+                                        ],
+                                        vllm_version=stage_artifact[
+                                            "vllm_version"
+                                        ],
+                                        exporter_build_digest=(
+                                            exporter_build_digest
+                                        ),
+                                        architecture=stage_artifact[
+                                            "architecture"
+                                        ],
+                                        quantization=stage_artifact[
+                                            "quantization"
+                                        ],
+                                        tensor_parallel_size=stage_artifact[
+                                            "tensor_parallel_size"
+                                        ],
+                                        pipeline_parallel_size=stage_artifact[
+                                            "pipeline_parallel_size"
+                                        ],
+                                        loader_format=stage_artifact[
+                                            "loader_format"
+                                        ],
+                                    )
+                                ),
+                            }
+                        )
+                        for rank, assignment in enumerate(
+                            source_plan["assignments"]
+                        ):
+                            assignment["stage_manifest_digest"] = (
+                                "sha256:" + str(rank + 8) * 64
+                            )
+                            assignment["stage_tensor_keys_digest"] = (
+                                "sha256:" + ("a" if rank == 0 else "b") * 64
+                            )
+                    else:
+                        source_plan = _strict_plan(
+                            source_id, generation=2
+                        ).to_dict()
+                        source_plan["model_path"] = (
+                            "/var/lib/dure/models/sha256-" + "f" * 64
+                        )
+
+                    source_plan["generation"] = 2
+                    source_plan["model"]["model_id"] = "strict-new-model"
+                    source_plan["model"]["repository"] = (
+                        "example/strict-new-model"
+                    )
+                    source_plan["model"]["layer_count"] = 6
+                    source_plan["model_revision"] = "b" * 40
+                    source_plan["assignments"][0]["layer_start"] = 0
+                    source_plan["assignments"][0]["layer_end"] = 2
+                    source_plan["assignments"][1]["layer_start"] = 3
+                    source_plan["assignments"][1]["layer_end"] = 5
+                    # Both immutable plans remain valid in isolation; only
+                    # their artifact/model identity and model-specific layer
+                    # ranges differ.
+                    DeploymentPlan.from_dict(target_plan)
+                    DeploymentPlan.from_dict(source_plan)
+
+                    target = Deployment(
+                        id=target_id,
+                        lineage_id=target_id,
+                        generation=1,
+                        plan=target_plan,
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="VERIFIED",
+                        verified_at=utcnow() - timedelta(hours=1),
+                    )
+                    source = Deployment(
+                        id=source_id,
+                        lineage_id=target_id,
+                        previous_generation_id=target_id,
+                        generation=2,
+                        plan=source_plan,
+                        accept_model_download=False,
+                        pull_image=False,
+                        status="APPLIED",
+                    )
+                    session.add_all([target, source])
+                    session.commit()
+
+                    operation, tasks, changed = prepare_or_apply_rollback(
+                        session,
+                        source_id,
+                        [NODE_A, NODE_B],
+                        apply=False,
+                        serve=True,
+                    )
+
+                    self.assertEqual(operation.status, "PREPARED")
+                    self.assertFalse(tasks)
+                    self.assertTrue(changed)
+                    self.assertEqual(
+                        target.plan["model_cache_kind"],
+                        MODEL_CACHE_KIND_STAGE,
+                    )
+                    self.assertNotEqual(
+                        target.plan["model"], source.plan["model"]
+                    )
+                    if source_cache_kind == MODEL_CACHE_KIND_STAGE:
+                        self.assertNotEqual(
+                            target.plan["stage_artifact"],
+                            source.plan["stage_artifact"],
+                        )
+
+    def test_strict_rollback_rejects_changed_runtime_topology(self) -> None:
+        with self.factory() as session:
+            self._add_nodes(session)
+            target_id = str(uuid.uuid4())
+            source_id = str(uuid.uuid4())
+            target_plan = _strict_plan(target_id, generation=1).to_dict()
+            source_plan = _strict_plan(source_id, generation=2).to_dict()
+            source_plan["assignments"][1]["runtime_address"] = "10.10.10.3"
+            # The source remains a valid strict plan, but it is a different
+            # runtime topology from the direct rollback target.
+            DeploymentPlan.from_dict(source_plan)
+            target = Deployment(
+                id=target_id,
+                lineage_id=target_id,
+                generation=1,
+                plan=target_plan,
+                accept_model_download=False,
+                pull_image=False,
+                status="VERIFIED",
+                verified_at=utcnow() - timedelta(hours=1),
+            )
+            source = Deployment(
+                id=source_id,
+                lineage_id=target_id,
+                previous_generation_id=target_id,
+                generation=2,
+                plan=source_plan,
+                accept_model_download=False,
+                pull_image=False,
+                status="APPLIED",
+            )
+            session.add_all([target, source])
+            session.commit()
+
+            with self.assertRaises(DeploymentRolloutError) as rejected:
+                prepare_or_apply_rollback(
+                    session,
+                    source_id,
+                    [NODE_A, NODE_B],
+                    apply=False,
+                    serve=True,
+                )
+
+            self.assertEqual(
+                rejected.exception.code, "ROLLBACK_TOPOLOGY_UNSUPPORTED"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

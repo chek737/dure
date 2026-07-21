@@ -54,6 +54,7 @@ DEPLOYMENT_MUTATION_TASK_TYPES = {
     TaskType.RESTART_DEPLOYMENT.value,
     TaskType.PREPARE_MODEL.value,
     TaskType.PREPARE_IMAGE.value,
+    TaskType.QUARANTINE_ARTIFACT_CACHE.value,
 }
 PHASE_ORDER = {
     phase: index
@@ -227,18 +228,30 @@ def _plan_assignments(
         )
     signature: list[tuple[Any, ...]] = []
     node_ids: list[str] = []
-    required = (
+    assignment_topology_fields = (
         "node_id",
         "gpu_index",
         "rank",
         "pipeline_rank",
-        "layer_start",
-        "layer_end",
         "role",
     )
+    if strict_ray:
+        assignment_topology_fields += (
+            "expected_runtime_rank",
+            "runtime_address",
+        )
+    else:
+        # Legacy plans use the declared layer range as part of their runtime
+        # partition.  The strict vLLM backend validates each generation's
+        # model-specific range independently; across generations only the
+        # node/rank/runtime placement is topology.
+        assignment_topology_fields += (
+            "layer_start",
+            "layer_end",
+        )
     for assignment in assignments:
         if type(assignment) is not dict or any(
-            field not in assignment for field in required
+            field not in assignment for field in assignment_topology_fields
         ):
             raise DeploymentRolloutError(
                 "deployment assignment topology is invalid",
@@ -251,11 +264,18 @@ def _plan_assignments(
                 code="ROLLBACK_PLAN_INVALID",
             )
         node_ids.append(node_id)
+        # Compare only the host/runtime topology across generations.  Model
+        # and STAGE identities (for example rank manifest and tensor-key
+        # digests) belong to the independently validated target artifact and
+        # must be allowed to differ during rollback.
         signature.append(
             (
                 node_id,
                 json.dumps(
-                    assignment,
+                    {
+                        field: assignment[field]
+                        for field in assignment_topology_fields
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
@@ -275,10 +295,12 @@ def _plan_assignments(
         "network_interface",
     )
     if strict_ray:
+        # Cache delivery kind is an artifact contract, not a runtime topology
+        # coordinate.  Each plan validates it independently and rollback gates
+        # the target's exact READY cache before any target start.
         topology_fields += (
             "execution_backend",
             "runtime_vllm_version",
-            "model_cache_kind",
         )
     if any(field not in plan for field in topology_fields):
         raise DeploymentRolloutError(
@@ -845,7 +867,10 @@ def prepare_or_apply_rollback(
         session, source, require_prepared=False
     )
     effective_target = effective_deployment_plan(
-        session, target, require_prepared=True
+        session,
+        target,
+        require_prepared=True,
+        lock_ready_caches=apply,
     )
     if any(
         plan.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE
@@ -1516,6 +1541,45 @@ def _advance_rollback(
     if operation.phase == "STOP_SOURCE":
         source.status = "ROLLING_BACK"
         target.status = "ROLLBACK_TARGET_PENDING"
+        # The target may have become missing/corrupt/quarantined while the
+        # source was stopping. Recheck the exact persisted cache immediately
+        # before START_TARGET and never repair or download on the rollback path.
+        from .preparation import (
+            ArtifactPreparationError,
+            effective_deployment_plan,
+        )
+
+        try:
+            effective_deployment_plan(
+                session,
+                target,
+                require_prepared=True,
+                lock_ready_caches=True,
+            )
+        except ArtifactPreparationError as exc:
+            now = utcnow()
+            operation.phase = "START_TARGET"
+            operation.status = "FAILED"
+            operation.updated_at = now
+            source.status = "ROLLBACK_FAILED"
+            target.status = "ROLLBACK_FAILED"
+            for record in _phase_nodes(
+                session, operation, "START_TARGET", lock=True
+            ):
+                record.status = "FAILED"
+                record.failure_code = "ROLLBACK_TARGET_CACHE_NOT_READY"
+                record.updated_at = now
+                record.completed_at = now
+            _operation_audit(
+                session,
+                "deployment_operation.rollback.cache_gate",
+                operation,
+                "failed",
+                failure_code="ROLLBACK_TARGET_CACHE_NOT_READY",
+                cache_failure_code=getattr(exc, "code", None),
+                target_deployment_id=target.id,
+            )
+            return []
         return _queue_phase(session, operation, "START_TARGET")
     if operation.phase == "START_TARGET":
         return _queue_phase(session, operation, "VERIFY_TARGET")
@@ -1656,6 +1720,28 @@ def finish_operation_task(
     if node is not None:
         node.desired_state = None
     if terminal_error is not None:
+        if operation.phase in {"VERIFY", "VERIFY_TARGET"}:
+            verification_deployment_id = (
+                operation.rollback_target_id
+                if operation.phase == "VERIFY_TARGET"
+                else operation.deployment_id
+            )
+            verification_deployment = (
+                session.get(Deployment, verification_deployment_id)
+                if verification_deployment_id is not None
+                else None
+            )
+            if verification_deployment is not None:
+                from .preparation import (
+                    record_deployment_cache_verification_failure,
+                )
+
+                record_deployment_cache_verification_failure(
+                    session,
+                    verification_deployment,
+                    node_id=node_id,
+                    task_id=locked_task.id,
+                )
         _update_failed_operation(session, operation)
         return True
 

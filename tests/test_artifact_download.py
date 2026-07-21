@@ -195,6 +195,7 @@ class ArtifactDownloadTests(unittest.TestCase):
         chunk_digest: str | None = None,
         attempts: int = 1,
         manifest_digest: str | None = None,
+        progress_callback=None,
     ) -> str:
         return ArtifactChunkDownloader(
             store,
@@ -207,6 +208,7 @@ class ArtifactDownloadTests(unittest.TestCase):
             manifest_digest=manifest_digest or self.manifest_digest,
             chunk_digest=chunk_digest or _digest(payload),
             expected_size=len(payload),
+            progress_callback=progress_callback,
         )
 
     def assert_failure_journal(
@@ -254,12 +256,23 @@ class ArtifactDownloadTests(unittest.TestCase):
         payload = b"abcdef"
         full_store = self._store("exact-200")
         full_transport = ScriptedTransport([self._response(payload)])
+        full_progress = []
 
-        full_path = Path(self._download(full_store, full_transport, payload))
+        full_path = Path(
+            self._download(
+                full_store,
+                full_transport,
+                payload,
+                progress_callback=lambda *values: full_progress.append(
+                    values
+                ),
+            )
+        )
 
         self.assertEqual(full_path.read_bytes(), payload)
         self.assertEqual(len(full_transport.calls), 1)
         self.assertNotIn("Range", full_transport.calls[0]["headers"])
+        self.assertEqual(full_progress[-1], (_digest(payload), 6, 6))
 
         resumed_store = self._store("exact-206")
         chunk_digest = _digest(payload)
@@ -278,9 +291,17 @@ class ArtifactDownloadTests(unittest.TestCase):
                 )
             ]
         )
+        resumed_progress = []
 
         resumed_path = Path(
-            self._download(resumed_store, resumed_transport, payload)
+            self._download(
+                resumed_store,
+                resumed_transport,
+                payload,
+                progress_callback=lambda *values: resumed_progress.append(
+                    values
+                ),
+            )
         )
 
         self.assertEqual(resumed_path.read_bytes(), payload)
@@ -288,6 +309,8 @@ class ArtifactDownloadTests(unittest.TestCase):
         self.assertEqual(
             resumed_transport.calls[0]["headers"]["Range"], "bytes=3-"
         )
+        self.assertEqual(resumed_progress[0], (chunk_digest, 3, 6))
+        self.assertEqual(resumed_progress[-1], (chunk_digest, 6, 6))
 
     def test_missing_and_duplicate_content_length_are_rejected(self):
         payload = b"content-length"

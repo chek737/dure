@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -422,6 +423,51 @@ class ArtifactPreparationExecutor:
         if manifest_loader is not None and not callable(manifest_loader):
             raise ValueError("artifact manifest loader is invalid")
         self.manifest_loader = manifest_loader
+        self._progress_lock = threading.Lock()
+        self._progress_by_task: dict[str, dict[str, int]] = {}
+
+    def progress_snapshot(self, task_id: str) -> dict[str, int] | None:
+        """Return the closed, non-sensitive heartbeat projection for a task."""
+
+        if type(task_id) is not str:
+            return None
+        with self._progress_lock:
+            progress = self._progress_by_task.get(task_id)
+            if progress is None:
+                return None
+            return {"downloaded_bytes": progress["downloaded_bytes"]}
+
+    def clear_progress(self, task_id: str) -> None:
+        if type(task_id) is not str:
+            return
+        with self._progress_lock:
+            self._progress_by_task.pop(task_id, None)
+
+    def _record_progress(
+        self,
+        task_id: str,
+        downloaded_bytes: int,
+        expected_bytes: int,
+    ) -> None:
+        if (
+            type(downloaded_bytes) is not int
+            or type(expected_bytes) is not int
+            or expected_bytes <= 0
+        ):
+            return
+        bounded = min(max(downloaded_bytes, 0), expected_bytes)
+        with self._progress_lock:
+            previous = self._progress_by_task.get(task_id)
+            previous_bytes = (
+                previous["downloaded_bytes"]
+                if previous is not None
+                and previous.get("expected_bytes") == expected_bytes
+                else 0
+            )
+            self._progress_by_task[task_id] = {
+                "downloaded_bytes": max(previous_bytes, bounded),
+                "expected_bytes": expected_bytes,
+            }
 
     def _prepare_model(self, task: dict) -> dict:
         binding, payload = PreparationBinding.from_task(
@@ -489,22 +535,34 @@ class ArtifactPreparationExecutor:
                 "PREPARATION_MANIFEST_UNAVAILABLE"
             )
         try:
+            prepare_kwargs = {
+                "identity": identity,
+                "manifest": manifest,
+                "origin": self.origin,
+            }
+            if (
+                getattr(
+                    self.model_preparer,
+                    "supports_progress_reporting",
+                    False,
+                )
+                is True
+            ):
+                prepare_kwargs["progress_callback"] = (
+                    lambda downloaded, expected: self._record_progress(
+                        task["id"], downloaded, expected
+                    )
+                )
             if type(identity) is StageCacheIdentity:
                 prepare_stage = getattr(self.model_preparer, "prepare_stage", None)
                 if not callable(prepare_stage):
                     raise ArtifactPreparationError(
                         "PREPARATION_EXECUTION_FAILED"
                     )
-                prepared = prepare_stage(
-                    identity=identity,
-                    manifest=manifest,
-                    origin=self.origin,
-                )
+                prepared = prepare_stage(**prepare_kwargs)
             else:
                 prepared = self.model_preparer.prepare_full_snapshot(
-                    identity=identity,
-                    manifest=manifest,
-                    origin=self.origin,
+                    **prepare_kwargs
                 )
         except ModelStoreError:
             raise
@@ -591,6 +649,9 @@ class ArtifactPreparationExecutor:
     def execute(self, task: dict) -> dict:
         task_type = task.get("type") if type(task) is dict else None
         if task_type == PREPARE_MODEL_TASK:
+            task_id = task.get("id")
+            if type(task_id) is str:
+                self.clear_progress(task_id)
             return self._prepare_model(task)
         if task_type == PREPARE_IMAGE_TASK:
             return self._prepare_image(task)

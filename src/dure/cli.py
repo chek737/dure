@@ -106,6 +106,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     artifact_manifest_show = artifact_manifest_sub.add_parser("show")
     artifact_manifest_show.add_argument("artifact_id")
+    artifact_cache = admin_sub.add_parser(
+        "artifact-cache",
+        help="Inspect, verify, or explicitly quarantine one central cache record",
+    )
+    artifact_cache_sub = artifact_cache.add_subparsers(
+        dest="artifact_cache_command",
+        required=True,
+    )
+    artifact_cache_sub.add_parser("list")
+    artifact_cache_show = artifact_cache_sub.add_parser("show")
+    artifact_cache_show.add_argument("cache_id")
+    artifact_cache_verify = artifact_cache_sub.add_parser("verify")
+    artifact_cache_verify.add_argument("cache_id")
+    artifact_cache_quarantine = artifact_cache_sub.add_parser("quarantine")
+    artifact_cache_quarantine.add_argument("cache_id")
+    artifact_cache_quarantine.add_argument(
+        "--apply",
+        action="store_true",
+        help="Queue exactly one quarantine task after all references are clear",
+    )
     deployment = admin_sub.add_parser("deployment")
     deployment_sub = deployment.add_subparsers(dest="deployment_command", required=True)
     deployment_create = deployment_sub.add_parser("create")
@@ -447,6 +467,23 @@ def _admin(args: argparse.Namespace) -> int:
             value = client.request("POST", path, manifest)
         else:
             value = client.request("GET", path)
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 0
+    if args.admin_command == "artifact-cache":
+        if args.artifact_cache_command == "list":
+            value = client.request("GET", "/v1/admin/artifact-caches")
+        else:
+            path = f"/v1/admin/artifact-caches/{args.cache_id}"
+            if args.artifact_cache_command == "show":
+                value = client.request("GET", path)
+            elif args.artifact_cache_command == "verify":
+                value = client.request("GET", f"{path}/verify")
+            else:
+                value = client.request(
+                    "POST",
+                    f"{path}/quarantine",
+                    {"apply": args.apply},
+                )
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0
     if args.admin_command == "recommendation":

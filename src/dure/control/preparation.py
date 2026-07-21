@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,12 +23,27 @@ from dure.artifact_prepare import (
 from dure.model_cache import (
     MODEL_CACHE_KIND_FULL_SNAPSHOT,
     MODEL_CACHE_KIND_STAGE,
+    MODEL_CACHE_VERIFICATION_VERSION,
 )
 from dure.models import DeploymentPlan, NodeProfile
+from dure.stage_cache import (
+    STAGE_CACHE_VERIFICATION_VERSION,
+    StageCacheError,
+    StageCacheIdentity,
+)
 from dure.task import TaskStatus, TaskType
 
+from .cache_lifecycle import (
+    ArtifactCacheIdentity,
+    ArtifactCacheLifecycleError,
+    record_preparation_success,
+    record_verification_failure,
+    require_ready_cache,
+)
 from .models import (
+    ArtifactFileChunk,
     ArtifactManifest,
+    ArtifactManifestFile,
     ArtifactPreparation,
     ArtifactPreparationAttempt,
     ArtifactPreparationNode,
@@ -68,6 +83,21 @@ PREPARATION_TERMINAL_FAILURE_CODES = frozenset(
         "PREPARATION_NODE_REVOKED",
         "PREPARATION_RESULT_REJECTED",
     }
+)
+
+# Terminal verified bytes and best-effort download high-water have different
+# trust semantics.  Keep both sources explicit so API consumers never mistake
+# progress telemetry for completed immutable-manifest verification.
+PREPARATION_PROGRESS_BYTES_SOURCE = "COMPLETED_MODEL_VERIFICATION"
+PREPARATION_DOWNLOAD_BYTES_SOURCE = "MODEL_PREPARATION_HIGH_WATER"
+PREPARATION_DOWNLOAD_BYTES_DERIVED_SOURCE = (
+    "DERIVED_FROM_COMPLETED_MODEL_VERIFICATION"
+)
+PREPARATION_DOWNLOAD_BYTES_NOT_STARTED_SOURCE = "NOT_STARTED"
+PREPARATION_DOWNLOAD_BYTES_UNAVAILABLE_SOURCE = "UNAVAILABLE"
+PREPARATION_DOWNLOAD_BYTES_MIXED_SOURCE = "MIXED"
+PREPARATION_PROGRESS_STAGES = frozenset(
+    {"MODEL", "IMAGE", "COMPLETE", "FAILED"}
 )
 
 _SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$")
@@ -217,16 +247,39 @@ def _stage_preparation_projection(
     *,
     artifact_set_digest: str | None,
 ) -> dict[str, Any] | None:
-    """Bind one explicitly requested validated stage variant to node ranks.
+    """Revalidate the delivery mode already fixed by the accepted generation.
 
-    PR7 deliberately does not choose a preferred variant during recommendation.
-    Omitting ``artifact_set_digest`` therefore preserves the existing FULL
-    snapshot path.  Once a digest is supplied, every mismatch is terminal for
-    that immutable preparation request; callers must never fall back to FULL.
+    The optional request digest is only an equality assertion for compatibility
+    with the PR7 CLI.  It can no longer change a FULL generation into STAGE or
+    select a different STAGE variant after recommendation acceptance.
     """
 
-    if artifact_set_digest is None:
+    plan = deployment.plan
+    plan_cache_kind = plan.get("model_cache_kind")
+    plan_stage = plan.get("stage_artifact")
+    if plan_cache_kind != MODEL_CACHE_KIND_STAGE:
+        if artifact_set_digest is not None:
+            raise ArtifactPreparationError(
+                "the accepted generation does not select a stage artifact",
+                code="PREPARATION_STAGE_VARIANT_MISMATCH",
+                details={"deployment_id": deployment.id},
+            )
         return None
+    selected_digest = (
+        plan_stage.get("artifact_set_digest")
+        if type(plan_stage) is dict
+        else None
+    )
+    if artifact_set_digest is not None and artifact_set_digest != selected_digest:
+        raise ArtifactPreparationError(
+            "the requested stage artifact differs from the accepted generation",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            details={
+                "deployment_id": deployment.id,
+                "artifact_set_digest": artifact_set_digest,
+            },
+        )
+    artifact_set_digest = selected_digest
     if (
         type(artifact_set_digest) is not str
         or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_set_digest) is None
@@ -253,7 +306,6 @@ def _stage_preparation_projection(
             details={"artifact_set_digest": artifact_set_digest},
         ) from exc
 
-    plan = deployment.plan
     assignments = plan.get("assignments")
     expected_contract = {
         "artifact_set_digest": artifact_set_digest,
@@ -268,6 +320,25 @@ def _stage_preparation_projection(
     if (
         type(projection) is not dict
         or any(projection.get(key) != value for key, value in expected_contract.items())
+        or type(plan_stage) is not dict
+        or any(
+            plan_stage.get(key) != projection.get(key)
+            for key in (
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "loader_format",
+            )
+        )
+        or selected.get("model_cache_kind") != MODEL_CACHE_KIND_STAGE
+        or selected.get("stage_artifact") != plan_stage
         or projection.get("architecture") != "Qwen2ForCausalLM"
         or plan.get("execution_backend") != "VLLM_RAY_PP_V1"
         or type(assignments) is not list
@@ -320,6 +391,9 @@ def _stage_preparation_projection(
             or tensor_rank != 0
             or assignment is None
             or assignment.get("expected_runtime_rank") != expected_rank
+            or assignment.get("stage_manifest_digest") != manifest_digest
+            or assignment.get("stage_tensor_keys_digest")
+            != stage.get("tensor_keys_digest")
             or type(node_id) is not str
             or node_id in seen_nodes
             or type(manifest_digest) is not str
@@ -747,17 +821,36 @@ def _request_identity(
     *,
     stage_artifact_set_digest: str | None,
 ) -> dict[str, Any]:
+    plan_cache_kind = deployment.plan.get("model_cache_kind")
+    plan_stage = deployment.plan.get("stage_artifact")
+    selected_stage_digest = (
+        plan_stage.get("artifact_set_digest")
+        if plan_cache_kind == MODEL_CACHE_KIND_STAGE and type(plan_stage) is dict
+        else None
+    )
+    if stage_artifact_set_digest is not None and (
+        selected_stage_digest is None
+        or stage_artifact_set_digest != selected_stage_digest
+    ):
+        raise ArtifactPreparationError(
+            "the requested stage artifact differs from the accepted generation",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            details={"deployment_id": deployment.id},
+        )
     value = {
         "schema_version": 1,
         "deployment_id": deployment.id,
         "generation": deployment.generation,
         "source_recommendation_id": deployment.source_recommendation_id,
         "plan": deployment.plan,
-        "cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+        "cache_kind": (
+            MODEL_CACHE_KIND_STAGE
+            if selected_stage_digest is not None
+            else MODEL_CACHE_KIND_FULL_SNAPSHOT
+        ),
     }
-    if stage_artifact_set_digest is not None:
-        value["cache_kind"] = MODEL_CACHE_KIND_STAGE
-        value["stage_artifact_set_digest"] = stage_artifact_set_digest
+    if selected_stage_digest is not None:
+        value["stage_artifact_set_digest"] = selected_stage_digest
     return value
 
 
@@ -836,6 +929,127 @@ def _plan_snapshot(
     if stage_projection is not None:
         value["stage_artifact"] = copy.deepcopy(stage_projection)
     return value
+
+
+def _artifact_cache_identity(
+    snapshot: dict[str, Any], node_id: str
+) -> ArtifactCacheIdentity:
+    """Derive the exact central cache identity from an immutable preparation."""
+
+    artifact = snapshot.get("artifact")
+    stage_artifact = snapshot.get("stage_artifact")
+    if type(artifact) is not dict:
+        raise ArtifactPreparationError(
+            "preparation artifact identity is invalid",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+        )
+    if stage_artifact is None:
+        manifest_digest = artifact.get("manifest_digest")
+        return ArtifactCacheIdentity(
+            cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            cache_identity_digest=manifest_digest,
+            manifest_digest=manifest_digest,
+            source_manifest_digest=manifest_digest,
+            verification_version=MODEL_CACHE_VERIFICATION_VERSION,
+        )
+    if type(stage_artifact) is not dict:
+        raise ArtifactPreparationError(
+            "preparation STAGE identity is invalid",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+        )
+    bindings = stage_artifact.get("node_bindings")
+    binding = next(
+        (
+            item
+            for item in bindings
+            if type(item) is dict and item.get("node_id") == node_id
+        ),
+        None,
+    ) if type(bindings) is list else None
+    if binding is None:
+        raise ArtifactPreparationError(
+            "preparation STAGE rank binding is missing",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+            details={"node_id": node_id},
+        )
+    try:
+        physical_identity = StageCacheIdentity(
+            repository=artifact["repository"],
+            revision=artifact["revision"],
+            manifest_digest=binding["manifest_digest"],
+            quantization=artifact["quantization"],
+            artifact_set_digest=stage_artifact["artifact_set_digest"],
+            contract_identity_digest=stage_artifact[
+                "contract_identity_digest"
+            ],
+            source_manifest_digest=stage_artifact["source_manifest_digest"],
+            runtime_image=stage_artifact["runtime_image"],
+            vllm_version=stage_artifact["vllm_version"],
+            exporter_build_digest=stage_artifact["exporter_build_digest"],
+            architecture=stage_artifact["architecture"],
+            loader_format=stage_artifact["loader_format"],
+            tensor_parallel_size=stage_artifact["tensor_parallel_size"],
+            pipeline_parallel_size=stage_artifact["pipeline_parallel_size"],
+            pipeline_rank=binding["pipeline_rank"],
+            tensor_rank=binding["tensor_rank"],
+            tensor_keys_digest=binding["tensor_keys_digest"],
+        )
+    except (KeyError, TypeError, ValueError, StageCacheError) as exc:
+        raise ArtifactPreparationError(
+            "preparation STAGE cache identity is invalid",
+            code="DEPLOYMENT_PREPARATION_INVALID",
+            details={"node_id": node_id},
+        ) from exc
+    return ArtifactCacheIdentity(
+        cache_kind=MODEL_CACHE_KIND_STAGE,
+        cache_identity_digest=physical_identity.cache_identity_digest,
+        manifest_digest=physical_identity.manifest_digest,
+        source_manifest_digest=physical_identity.source_manifest_digest,
+        verification_version=STAGE_CACHE_VERIFICATION_VERSION,
+        artifact_set_digest=physical_identity.artifact_set_digest,
+        pipeline_rank=physical_identity.pipeline_rank,
+        tensor_rank=physical_identity.tensor_rank,
+        tensor_parallel_size=physical_identity.tensor_parallel_size,
+        pipeline_parallel_size=physical_identity.pipeline_parallel_size,
+        tensor_keys_digest=physical_identity.tensor_keys_digest,
+    )
+
+
+def record_deployment_cache_verification_failure(
+    session: Session,
+    deployment: Deployment,
+    *,
+    node_id: str,
+    task_id: str,
+) -> bool:
+    """Fail closed for a node-local deployment verification failure.
+
+    Legacy deployments have no controller-owned preparation/cache contract and
+    are intentionally left unchanged. A missing cache record must not hide the
+    original rollout failure, so callers receive ``False`` instead.
+    """
+
+    if deployment.source_recommendation_id is None:
+        return False
+    preparation = session.scalar(
+        select(ArtifactPreparation).where(
+            ArtifactPreparation.deployment_id == deployment.id
+        )
+    )
+    if preparation is None or type(preparation.plan_snapshot) is not dict:
+        return False
+    try:
+        identity = _artifact_cache_identity(preparation.plan_snapshot, node_id)
+        record_verification_failure(
+            session,
+            node_id=node_id,
+            identity=identity,
+            source_id=task_id,
+            source_task_id=task_id,
+        )
+    except (ArtifactCacheLifecycleError, ArtifactPreparationError):
+        return False
+    return True
 
 
 def _active_attempts(session: Session, preparation_id: str) -> bool:
@@ -983,6 +1197,7 @@ def _queue_attempt(
     record: ArtifactPreparationNode,
     *,
     stage: str,
+    download_expected_bytes: int | None = None,
 ) -> Task:
     if stage == "MODEL":
         record.model_current_attempt += 1
@@ -1011,7 +1226,23 @@ def _queue_attempt(
         attempt_no=attempt_no,
         task_id=task.id,
         status="QUEUED",
+        download_progress=(
+            {
+                "downloaded_bytes": 0,
+                "expected_bytes": download_expected_bytes,
+            }
+            if stage == "MODEL"
+            and type(download_expected_bytes) is int
+            and download_expected_bytes > 0
+            else None
+        ),
     )
+    if stage == "MODEL" and attempt.download_progress is None:
+        raise ArtifactPreparationError(
+            "preparation manifest has no downloadable chunks",
+            code="PREPARATION_MANIFEST_UNAVAILABLE",
+            details={"manifest_digest": record.model_manifest_digest},
+        )
     task.payload = _task_payload(
         preparation, record, attempt, stage=stage
     )
@@ -1101,8 +1332,31 @@ def _queue_for_apply(
         if record.model_status in {"PREPARED", "FAILED"}
     ]
     if model_records:
+        expected_by_manifest: dict[str, int] = {}
+        for record in model_records:
+            if record.model_manifest_digest not in expected_by_manifest:
+                expected = _manifest_download_bytes(
+                    session, record.model_manifest_digest
+                )
+                if expected is None:
+                    raise ArtifactPreparationError(
+                        "preparation manifest has no downloadable chunks",
+                        code="PREPARATION_MANIFEST_UNAVAILABLE",
+                        details={
+                            "manifest_digest": record.model_manifest_digest
+                        },
+                    )
+                expected_by_manifest[record.model_manifest_digest] = expected
         tasks.extend(
-            _queue_attempt(session, preparation, record, stage="MODEL")
+            _queue_attempt(
+                session,
+                preparation,
+                record,
+                stage="MODEL",
+                download_expected_bytes=expected_by_manifest[
+                    record.model_manifest_digest
+                ],
+            )
             for record in model_records
         )
     else:
@@ -1417,6 +1671,79 @@ def get_artifact_preparation(
     return preparation
 
 
+def _preparation_node_stage(record: ArtifactPreparationNode) -> str:
+    """Project one node onto the closed operator-facing preparation stages."""
+
+    if "FAILED" in {record.model_status, record.image_status}:
+        return "FAILED"
+    if record.model_status != "SUCCEEDED":
+        return "MODEL"
+    if record.image_status != "SUCCEEDED":
+        return "IMAGE"
+    return "COMPLETE"
+
+
+def _preparation_stage(
+    preparation: ArtifactPreparation,
+    node_progress: list[dict[str, Any]],
+) -> str:
+    """Return the earliest unfinished gate, or a terminal closed stage."""
+
+    if preparation.status in {"FAILED", "PARTIAL_FAILED"}:
+        return "FAILED"
+    stages = [item["stage"] for item in node_progress]
+    if "FAILED" in stages:
+        return "FAILED"
+    if stages and all(stage == "COMPLETE" for stage in stages):
+        return "COMPLETE"
+    # MODEL takes precedence while nodes are progressing concurrently because
+    # every deployment still depends on the earliest unfinished gate.
+    if "MODEL" in stages:
+        return "MODEL"
+    if "IMAGE" in stages:
+        return "IMAGE"
+    return "FAILED"
+
+
+def _attempt_progress(
+    *,
+    status: str,
+    current_attempt: int,
+    failure_code: str | None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "current_attempt": current_attempt,
+        "retry_count": max(current_attempt - 1, 0),
+        "failure_code": failure_code,
+    }
+
+
+def _manifest_download_bytes(
+    session: Session, manifest_digest: str
+) -> int | None:
+    """Return distinct immutable chunk bytes, excluding duplicate references."""
+
+    distinct_chunks = (
+        select(
+            ArtifactFileChunk.chunk_digest,
+            ArtifactFileChunk.length_bytes,
+        )
+        .join(
+            ArtifactManifestFile,
+            ArtifactManifestFile.id == ArtifactFileChunk.file_id,
+        )
+        .where(ArtifactManifestFile.manifest_digest == manifest_digest)
+        .distinct()
+        .subquery()
+    )
+    expected = session.scalar(
+        select(func.sum(distinct_chunks.c.length_bytes))
+    )
+    expected = int(expected) if expected is not None else 0
+    return expected if expected > 0 else None
+
+
 def artifact_preparation_detail(
     session: Session, preparation: ArtifactPreparation
 ) -> dict[str, Any]:
@@ -1440,7 +1767,17 @@ def artifact_preparation_detail(
     attempts_by_node: dict[str, list[dict[str, Any]]] = {
         record.id: [] for record in records
     }
+    attempts_by_identity: dict[
+        tuple[str, str, int], ArtifactPreparationAttempt
+    ] = {}
     for attempt in attempts:
+        attempts_by_identity[
+            (
+                attempt.preparation_node_id,
+                attempt.stage,
+                attempt.attempt_no,
+            )
+        ] = attempt
         attempts_by_node[attempt.preparation_node_id].append(
             {
                 "id": attempt.id,
@@ -1450,11 +1787,186 @@ def artifact_preparation_detail(
                 "status": attempt.status,
                 "failure_code": attempt.failure_code,
                 "result": attempt.result,
+                "download_progress": attempt.download_progress,
                 "created_at": _iso(attempt.created_at),
                 "updated_at": _iso(attempt.updated_at),
                 "completed_at": _iso(attempt.completed_at),
             }
         )
+    manifest_digests = {
+        record.model_manifest_digest for record in records
+    }
+    manifests = {
+        manifest.digest: manifest
+        for manifest in session.scalars(
+            select(ArtifactManifest).where(
+                ArtifactManifest.digest.in_(manifest_digests)
+            )
+        )
+    }
+    download_bytes_by_manifest = {
+        digest: _manifest_download_bytes(session, digest)
+        for digest in manifest_digests
+    }
+    node_progress: list[dict[str, Any]] = []
+    for record in records:
+        manifest = manifests.get(record.model_manifest_digest)
+        expected_bytes = (
+            manifest.total_size_bytes if manifest is not None else None
+        )
+        download_expected_bytes = download_bytes_by_manifest[
+            record.model_manifest_digest
+        ]
+        current_model_attempt = attempts_by_identity.get(
+            (record.id, "MODEL", record.model_current_attempt)
+        )
+        model_result = (
+            current_model_attempt.result
+            if current_model_attempt is not None
+            and current_model_attempt.status == "SUCCEEDED"
+            and record.model_status == "SUCCEEDED"
+            and type(current_model_attempt.result) is dict
+            else None
+        )
+        result_bytes = (
+            model_result.get("bytes_verified")
+            if model_result is not None
+            else None
+        )
+        verified_bytes = result_bytes if type(result_bytes) is int else 0
+        raw_download_progress = (
+            current_model_attempt.download_progress
+            if current_model_attempt is not None
+            else None
+        )
+        valid_download_progress = (
+            raw_download_progress
+            if type(raw_download_progress) is dict
+            and set(raw_download_progress)
+            == {"downloaded_bytes", "expected_bytes"}
+            and type(raw_download_progress.get("downloaded_bytes")) is int
+            and type(raw_download_progress.get("expected_bytes")) is int
+            and raw_download_progress["expected_bytes"]
+            == download_expected_bytes
+            and 0
+            <= raw_download_progress["downloaded_bytes"]
+            <= raw_download_progress["expected_bytes"]
+            else None
+        )
+        if current_model_attempt is None:
+            downloaded_bytes = 0
+            download_bytes_source = (
+                PREPARATION_DOWNLOAD_BYTES_NOT_STARTED_SOURCE
+            )
+        elif valid_download_progress is not None:
+            downloaded_bytes = valid_download_progress["downloaded_bytes"]
+            download_bytes_source = PREPARATION_DOWNLOAD_BYTES_SOURCE
+        elif model_result is not None and download_expected_bytes is not None:
+            # Pre-0010 successful attempts have no progress JSON, but their
+            # already validated immutable result proves all manifest chunks
+            # were locally available at terminal verification.
+            downloaded_bytes = download_expected_bytes
+            download_bytes_source = (
+                PREPARATION_DOWNLOAD_BYTES_DERIVED_SOURCE
+            )
+        else:
+            downloaded_bytes = None
+            download_bytes_source = (
+                PREPARATION_DOWNLOAD_BYTES_UNAVAILABLE_SOURCE
+            )
+        model_progress = _attempt_progress(
+            status=record.model_status,
+            current_attempt=record.model_current_attempt,
+            failure_code=record.model_failure_code,
+        )
+        image_progress = _attempt_progress(
+            status=record.image_status,
+            current_attempt=record.image_current_attempt,
+            failure_code=record.image_failure_code,
+        )
+        stage = _preparation_node_stage(record)
+        if stage not in PREPARATION_PROGRESS_STAGES:  # pragma: no cover
+            raise AssertionError("invalid preparation progress stage")
+        node_progress.append(
+            {
+                "node_id": record.node_id,
+                "expected_bytes": expected_bytes,
+                "verified_bytes": verified_bytes,
+                "bytes_source": PREPARATION_PROGRESS_BYTES_SOURCE,
+                "downloaded_bytes": downloaded_bytes,
+                "download_expected_bytes": download_expected_bytes,
+                "download_bytes_source": download_bytes_source,
+                "stage": stage,
+                "retrying": any(
+                    item["retry_count"] > 0
+                    and item["status"] in {"QUEUED", "RUNNING"}
+                    for item in (model_progress, image_progress)
+                ),
+                "model": model_progress,
+                "image": image_progress,
+            }
+        )
+    expected_values = [item["expected_bytes"] for item in node_progress]
+    expected_bytes = (
+        sum(expected_values)
+        if all(type(value) is int for value in expected_values)
+        else None
+    )
+    overall_stage = _preparation_stage(preparation, node_progress)
+    if overall_stage not in PREPARATION_PROGRESS_STAGES:  # pragma: no cover
+        raise AssertionError("invalid preparation progress stage")
+    progress = {
+        "expected_bytes": expected_bytes,
+        "verified_bytes": sum(
+            item["verified_bytes"] for item in node_progress
+        ),
+        "bytes_source": PREPARATION_PROGRESS_BYTES_SOURCE,
+        "downloaded_bytes": (
+            sum(item["downloaded_bytes"] for item in node_progress)
+            if all(
+                type(item["downloaded_bytes"]) is int
+                for item in node_progress
+            )
+            else None
+        ),
+        "download_expected_bytes": (
+            sum(item["download_expected_bytes"] for item in node_progress)
+            if all(
+                type(item["download_expected_bytes"]) is int
+                for item in node_progress
+            )
+            else None
+        ),
+        "download_bytes_source": (
+            next(
+                iter(
+                    {
+                        item["download_bytes_source"]
+                        for item in node_progress
+                    }
+                )
+            )
+            if len(
+                {
+                    item["download_bytes_source"]
+                    for item in node_progress
+                }
+            )
+            == 1
+            else PREPARATION_DOWNLOAD_BYTES_MIXED_SOURCE
+        ),
+        "stage": overall_stage,
+        "retrying": any(item["retrying"] for item in node_progress),
+        "model_retry_count": sum(
+            item["model"]["retry_count"] for item in node_progress
+        ),
+        "image_retry_count": sum(
+            item["image"]["retry_count"] for item in node_progress
+        ),
+    }
+    progress_by_node = {
+        item["node_id"]: item for item in node_progress
+    }
     return {
         "id": preparation.id,
         "request_id": preparation.request_id,
@@ -1465,6 +1977,7 @@ def artifact_preparation_detail(
         "created_at": _iso(preparation.created_at),
         "updated_at": _iso(preparation.updated_at),
         "completed_at": _iso(preparation.completed_at),
+        "progress": progress,
         "nodes": [
             {
                 "id": record.id,
@@ -1479,6 +1992,7 @@ def artifact_preparation_detail(
                 "image_failure_code": record.image_failure_code,
                 "created_at": _iso(record.created_at),
                 "updated_at": _iso(record.updated_at),
+                "progress": progress_by_node[record.node_id],
                 "attempts": attempts_by_node[record.id],
             }
             for record in records
@@ -1575,12 +2089,16 @@ def claim_preparation_task(
 
 
 def extend_preparation_task(
-    session: Session, task: Task, node_id: str
+    session: Session,
+    task: Task,
+    node_id: str,
+    *,
+    progress: dict[str, Any] | None = None,
 ) -> bool:
     if task.type not in PREPARATION_TASK_TYPES:
         return True
     attempt, record, preparation = _bound_attempt(session, task, lock=True)
-    return bool(
+    current = bool(
         attempt
         and record
         and preparation
@@ -1589,6 +2107,63 @@ def extend_preparation_task(
         and attempt.status == "RUNNING"
         and _attempt_is_current(task, attempt, record, preparation)
     )
+    if not current:
+        return False
+    if progress is None:
+        return True
+    if (
+        task.type != PREPARE_MODEL_TASK
+        or attempt.stage != "MODEL"
+        or type(progress) is not dict
+        or set(progress) != {"downloaded_bytes"}
+        or type(progress.get("downloaded_bytes")) is not int
+        or progress["downloaded_bytes"] < 0
+    ):
+        return False
+    previous = attempt.download_progress
+    stored_expected = (
+        previous.get("expected_bytes")
+        if type(previous) is dict
+        and set(previous) == {"downloaded_bytes", "expected_bytes"}
+        and type(previous.get("downloaded_bytes")) is int
+        and type(previous.get("expected_bytes")) is int
+        and previous["expected_bytes"] > 0
+        and 0 <= previous["downloaded_bytes"] <= previous["expected_bytes"]
+        else None
+    )
+    expected_bytes = (
+        stored_expected
+        if stored_expected is not None
+        else _manifest_download_bytes(session, record.model_manifest_digest)
+    )
+    if (
+        expected_bytes is None
+        or progress["downloaded_bytes"] > expected_bytes
+    ):
+        return False
+    if previous is None:
+        previous_bytes = 0
+    elif (
+        type(previous) is dict
+        and set(previous) == {"downloaded_bytes", "expected_bytes"}
+        and type(previous.get("downloaded_bytes")) is int
+        and previous.get("expected_bytes") == expected_bytes
+        and 0 <= previous["downloaded_bytes"] <= expected_bytes
+    ):
+        previous_bytes = previous["downloaded_bytes"]
+    else:
+        return False
+    high_water = max(previous_bytes, progress["downloaded_bytes"])
+    if previous is None or high_water != previous_bytes:
+        now = utcnow()
+        attempt.download_progress = {
+            "downloaded_bytes": high_water,
+            "expected_bytes": expected_bytes,
+        }
+        attempt.updated_at = now
+        record.updated_at = now
+        preparation.updated_at = now
+    return True
 
 
 def _task_wire(task: Task) -> dict[str, Any]:
@@ -1721,6 +2296,24 @@ def finish_preparation_task(
                 details={"task_id": locked_task.id},
             )
 
+    if failure_code is None and attempt.stage == "MODEL":
+        expected_download_bytes = _manifest_download_bytes(
+            session, record.model_manifest_digest
+        )
+        if expected_download_bytes is None:  # pragma: no cover - manifest gate
+            failure_code = "PREPARATION_RESULT_REJECTED"
+            validated_result = None
+            result_rejection = ArtifactPreparationError(
+                "preparation manifest has no downloadable chunks",
+                code=failure_code,
+                details={"task_id": locked_task.id},
+            )
+        else:
+            attempt.download_progress = {
+                "downloaded_bytes": expected_download_bytes,
+                "expected_bytes": expected_download_bytes,
+            }
+
     locked_task.status = (
         TaskStatus.FAILED.value
         if failure_code is not None
@@ -1738,7 +2331,43 @@ def finish_preparation_task(
         record.model_status = "FAILED" if failure_code else "SUCCEEDED"
         record.model_failure_code = failure_code
         if failure_code is None:
-            _queue_attempt(session, preparation, record, stage="IMAGE")
+            try:
+                # Persist the terminal MODEL projection before the lifecycle
+                # helper re-reads and fences the exact current attempt.  Its
+                # cache/event writes live in a savepoint so any registry race
+                # can be converted into a committed closed failure without a
+                # half-written READY record.
+                session.flush()
+                with session.begin_nested():
+                    identity = _artifact_cache_identity(
+                        preparation.plan_snapshot, record.node_id
+                    )
+                    record_preparation_success(
+                        session,
+                        attempt_id=attempt.id,
+                        identity=identity,
+                    )
+            except (ArtifactCacheLifecycleError, ArtifactPreparationError) as exc:
+                failure_code = "PREPARATION_RESULT_REJECTED"
+                validated_result = None
+                locked_task.status = TaskStatus.FAILED.value
+                locked_task.result = None
+                locked_task.error = failure_code
+                attempt.status = "FAILED"
+                attempt.failure_code = failure_code
+                attempt.result = None
+                record.model_status = "FAILED"
+                record.model_failure_code = failure_code
+                result_rejection = ArtifactPreparationError(
+                    "preparation success could not be bound to an exact READY cache",
+                    code=failure_code,
+                    details={
+                        "task_id": locked_task.id,
+                        "cache_failure_code": getattr(exc, "code", None),
+                    },
+                )
+            else:
+                _queue_attempt(session, preparation, record, stage="IMAGE")
     else:
         record.image_status = "FAILED" if failure_code else "SUCCEEDED"
         record.image_failure_code = failure_code
@@ -2028,6 +2657,7 @@ def effective_deployment_plan(
     deployment: Deployment,
     *,
     require_prepared: bool = True,
+    lock_ready_caches: bool = True,
 ) -> dict[str, Any]:
     if deployment.source_recommendation_id is None:
         return deployment.plan
@@ -2340,6 +2970,24 @@ def effective_deployment_plan(
                     "node_id": record.node_id,
                 },
             )
+        try:
+            cache_identity = _artifact_cache_identity(snapshot, record.node_id)
+            require_ready_cache(
+                session,
+                node_id=record.node_id,
+                identity=cache_identity,
+                lock=lock_ready_caches,
+            )
+        except (ArtifactCacheLifecycleError, ArtifactPreparationError) as exc:
+            raise ArtifactPreparationError(
+                "the exact node artifact cache is not READY",
+                code="DEPLOYMENT_ARTIFACT_CACHE_NOT_READY",
+                details={
+                    "deployment_id": deployment.id,
+                    "node_id": record.node_id,
+                    "cache_failure_code": getattr(exc, "code", None),
+                },
+            ) from exc
         for stage, attempt_no in (
             ("MODEL", record.model_current_attempt),
             ("IMAGE", record.image_current_attempt),
