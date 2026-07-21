@@ -1,1 +1,0 @@
-"""Dure schema revisions."""
