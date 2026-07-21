@@ -1,6 +1,6 @@
 # 모델 아티팩트 매니페스트와 배포 계약
 
-> 상태: **`FULL_SNAPSHOT` 경로 구현**. 중앙 제어면의 불변 정규화 매니페스트 레지스트리, 노드 콘텐츠 주소 캐시와 명시적 deployment 준비 API·CLI, `PREPARE_MODEL → PREPARE_IMAGE` Agent 작업과 배포 소비 게이트가 구현되었습니다. rank별 파일을 만드는 `STAGE` 분산은 아직 지원하지 않습니다.
+> 상태: **`FULL_SNAPSHOT` 배포 경로 구현, `STAGE` 생성·등록 구현**. 중앙 제어면의 불변 정규화 매니페스트 레지스트리, 노드 콘텐츠 주소 캐시와 명시적 deployment 준비 API·CLI, `PREPARE_MODEL → PREPARE_IMAGE` Agent 작업과 배포 소비 게이트가 구현되었습니다. 제한된 vLLM 계약의 rank별 `STAGE` builder와 variant 검증 레지스트리도 제공하지만, Agent 다운로드·캐시 활성화와 추천·준비·실행의 `STAGE` 소비는 아직 지원하지 않습니다.
 
 ## 목적
 
@@ -40,6 +40,25 @@
 - 매니페스트별 시도 저널과 폐쇄형 상태·실패 코드
 
 모델 준비기는 GPU, Docker나 vLLM을 요구하지 않는 파일 계층입니다. 단위 테스트는 가짜 전송 계층을 사용하지만 실제 `ArtifactChunkDownloader`는 HTTPS 네트워크 원본을 사용합니다. Agent는 검증된 `TrustedHTTPSOrigin` 객체를 각 노드의 root 전용 설정에서만 구성하고, 중앙 task payload의 URL·host·header·token은 받지 않습니다. 현재 전송기는 인증 token, cookie와 사용자 지정 header를 지원하지 않으므로 별도 자격 증명 없이 접근 가능한 신뢰 HTTPS origin이 필요합니다.
+
+## 현재 `STAGE` 생성·등록 범위
+
+0.3.17의 신뢰된 오프라인 builder는 정규 매니페스트로 검증된 `FULL_SNAPSHOT`을 vLLM 0.9.0의 네이티브 `sharded_state`로 내보내고, pipeline rank별 디렉터리를 다시 같은 정규 파일·청크 형식의 매니페스트로 고정합니다. 지원 범위는 V0 executor, `Qwen2ForCausalLM` AWQ, `TP=1`입니다. remote code, LoRA·adapter, MoE, 멀티모달과 임의 아키텍처는 거부합니다.
+
+vLLM의 sharded-state 파일명 rank는 pipeline rank가 아니라 tensor-parallel rank입니다. `TP=1`, `PP>1`에서 공용 출력 디렉터리를 사용하면 모든 PP worker가 `model-rank-0-*`를 써 충돌할 수 있으므로 각 worker 출력은 반드시 `stages/<pp-rank>`에 격리합니다. 기존 배치 계획의 `layer_start`·`layer_end`로 가중치 파일을 직접 자르지 않습니다.
+
+하나의 stage variant는 다음 불변 입력과 출력에 결합됩니다.
+
+- source `FULL_SNAPSHOT` 매니페스트 다이제스트
+- digest 고정 runtime 이미지, vLLM 버전과 exporter build 다이제스트
+- 아키텍처·양자화, TP·PP와 loader 형식
+- `0..PP-1` 순서의 완전한 rank별 stage 매니페스트와 tensor 요약
+
+등록은 모든 rank를 하나의 논리 단위로 처리합니다. 누락·중복·범위 밖 rank, source/runtime/topology 불일치와 같은 고정 입력에서 달라진 stage 출력은 거부합니다. 성공한 등록은 `DRAFT`이며 실제 GPU에서 export와 load를 모두 검증한 최신 `GPU_EXPORT_LOAD/PASSED` 증적만 `VALIDATED` 승격을 허용합니다. 전제 조건 부족을 나타내는 `NOT_RUN`, synthetic 검사와 `FAILED`는 승격 근거가 아닙니다. 새 validation run 증적은 `DRAFT`에서만 추가합니다. 이미 등록한 동일 run의 정확한 재전송은 상태 전환 뒤에도 기존 결과를 반환하지만, `VALIDATED`와 `REVOKED`에 새 run을 추가하는 요청은 거부합니다. 검증된 variant의 신뢰가 깨졌다면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 닫고, 수정된 계약은 새 `DRAFT` variant에서 검증합니다. 번들 acceptance harness는 `PP=1`만 native load하므로 PP>1은 모든 rank의 실제 load·attestation을 수행한 별도 신뢰 검증이 없으면 승격하지 않습니다.
+
+variant 등록·증적 기록·상태 전이는 중앙 DB만 바꾸며 Agent task, 모델 다운로드, 이미지 pull, 추천·배포 세대 생성과 기존 컨테이너 변경을 만들지 않습니다. 현재 중앙 준비기는 `FULL_SNAPSHOT`만 허용합니다. 자세한 빌더·검증·실패 경계는 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
+
+vLLM·PyTorch·safetensors·CUDA 계열 heavy dependency는 기본 Debian 패키지에 포함하지 않습니다. 별도의 digest 고정 OCI builder 환경에서만 설치하고 운영 Agent나 중앙 서버를 변환 작업자로 사용하지 않습니다.
 
 ## 정규 형식과 다이제스트
 
@@ -166,7 +185,7 @@ Agent 준비기는 노드 로컬 설정으로 생성한 검증된 `TrustedHTTPSO
 8. 모든 파일과 디렉터리를 `fsync`하고 v2 `.dure-model.json`을 마지막에 쓴 뒤, 기존 대상을 교체하지 않는 원자적 rename으로 최종 캐시를 활성화합니다.
 9. 활성화 뒤 같은 전체 검사를 다시 수행하고 성공 저널을 기록합니다.
 
-최종 디렉터리는 매니페스트 다이제스트로 결정됩니다. 같은 캐시가 이미 있으면 전체 트리, marker, 파일 해시와 `config.json` 계약을 다시 검사한 뒤에만 멱등 재사용합니다. 기존 최종 경로가 비어 있더라도 기대 캐시와 다르면 덮어쓰거나 삭제하지 않습니다. `STAGE` marker는 인벤토리에서 구분해 읽을 수 있지만 이 준비기는 아직 `STAGE` 캐시를 만들지 않습니다.
+최종 디렉터리는 매니페스트 다이제스트로 결정됩니다. 같은 캐시가 이미 있으면 전체 트리, marker, 파일 해시와 `config.json` 계약을 다시 검사한 뒤에만 멱등 재사용합니다. 기존 최종 경로가 비어 있더라도 기대 캐시와 다르면 덮어쓰거나 삭제하지 않습니다. `STAGE` marker는 인벤토리에서 구분해 읽을 수 있고 오프라인 builder 결과는 중앙에 등록할 수 있지만, 이 Agent 준비기는 아직 `STAGE` 캐시를 만들지 않습니다.
 
 ## 실패, 재시도와 운영자 복구
 
@@ -226,7 +245,7 @@ Agent 준비기는 노드 로컬 설정으로 생성한 검증된 `TrustedHTTPSO
 - attempt journal은 매니페스트별 append-only 감사 이력이 아니라 마지막 상태 한 건을 원자적으로 교체하는 로컬 진단값입니다.
 - 현재 HTTPS 전송기는 인증 token, cookie 또는 사용자 지정 header를 지원하지 않습니다. 별도 인증 정보 없이 네트워크와 TLS 경계에서 접근 가능한 신뢰 origin이 필요합니다.
 - 중앙 준비 상태와 노드별 시도 증적은 제공하지만 자동 경보, 전역 참조 검사와 quarantine는 아직 없습니다.
-- 중앙 준비는 각 노드에 모델 전체 `FULL_SNAPSHOT`을 둡니다. 모델 파일을 rank별로 나누는 `STAGE`, 노드 간 P2P 청크 전송, 별도 신뢰 빌더와 분산 배포는 아직 없습니다.
+- 중앙 준비는 각 노드에 모델 전체 `FULL_SNAPSHOT`을 둡니다. 별도 신뢰 builder와 `STAGE` variant 레지스트리는 있지만 rank별 노드 다운로드·원자적 활성화, P2P 청크 전송과 실제 분산 배포 소비는 아직 없습니다.
 
 ## 무결성과 신뢰 경계
 
@@ -245,4 +264,4 @@ SHA-256 다이제스트는 나중에 받은 바이트가 등록된 기대값과 
 
 정규 매니페스트 등록만으로 모델이 특정 노드에 준비됐거나 실행 가능하다고 판단해서는 안 됩니다. `0.3.16`에서는 전용 준비 적용을 완료해 두 단계의 정확한 노드 증적이 모두 성공해야 추천 세대 apply가 이를 소비할 수 있습니다. 추천·수락과 preview는 계속 다운로드나 호스트 변경을 만들지 않으며, `benchmark-runs/prepare`도 모델 바이트가 아니라 DB 실행 문맥만 준비합니다.
 
-후속 범위는 게시자·이미지 서명과 provenance, 감사 가능한 quarantine·참조 검사·eviction, origin 인증 수단, 중앙 자동 경보입니다. 큰 모델의 rank별 `STAGE` 아티팩트 생성·배포, 노드 간 효율적인 전송과 결정론적 vLLM rank 결합은 신뢰 빌더와 독립 검증 설계 뒤에 추가합니다.
+후속 범위는 게시자·이미지 서명과 provenance, 감사 가능한 quarantine·참조 검사·eviction, origin 인증 수단, 중앙 자동 경보입니다. `VALIDATED` stage variant를 추천·준비 계획에 결합하고, 각 노드가 자신의 rank 매니페스트만 내려받아 원자적으로 활성화한 뒤 정확한 `sharded_state`로 실행하는 경로도 후속 PR에서 추가합니다. 이 경로가 완성되기 전에는 stage 등록을 분산 설치 완료로 해석하지 않습니다.

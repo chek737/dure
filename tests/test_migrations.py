@@ -45,6 +45,10 @@ from dure.control.models import (
     ModelRelease,
     PlacementProfileRecord,
     RuntimeRelease,
+    StageArtifactRank,
+    StageArtifactValidationEvidence,
+    StageArtifactValidationRank,
+    StageArtifactVariant,
     Task,
     utcnow,
 )
@@ -75,14 +79,69 @@ ARTIFACT_PREPARATION_TABLES = {
     "artifact_preparation_nodes",
     "artifact_preparation_attempts",
 }
+STAGE_ARTIFACT_TABLES = {
+    "stage_artifact_variants",
+    "stage_artifact_ranks",
+    "stage_artifact_validation_evidence",
+    "stage_artifact_validation_ranks",
+}
 HEAD_TABLES = REGISTRY_TABLES | {
     *ARTIFACT_MANIFEST_TABLES,
     *ARTIFACT_PREPARATION_TABLES,
+    *STAGE_ARTIFACT_TABLES,
     "benchmark_evidence",
     "benchmark_runs",
     "deployment_operation_nodes",
     "deployment_operations",
     "deployment_recommendations",
+}
+STAGE_VARIANT_CHECKS = {
+    "ck_stage_variant_architecture",
+    "ck_stage_variant_contract_sha256",
+    "ck_stage_variant_exporter_sha256",
+    "ck_stage_variant_identity_json_nonempty",
+    "ck_stage_variant_loader_format",
+    "ck_stage_variant_pp_range",
+    "ck_stage_variant_quantization",
+    "ck_stage_variant_rank_count",
+    "ck_stage_variant_runtime_digest",
+    "ck_stage_variant_set_sha256",
+    "ck_stage_variant_source_sha256",
+    "ck_stage_variant_status",
+    "ck_stage_variant_status_timestamps",
+    "ck_stage_variant_tp_supported",
+    "ck_stage_variant_vllm_version",
+}
+STAGE_RANK_CHECKS = {
+    "ck_stage_rank_id_length",
+    "ck_stage_rank_linear_coordinate",
+    "ck_stage_rank_manifest_sha256",
+    "ck_stage_rank_pipeline_range",
+    "ck_stage_rank_supported_topology",
+    "ck_stage_rank_tensor_count_positive",
+    "ck_stage_rank_tensor_keys_sha256",
+    "ck_stage_rank_tensor_range",
+    "ck_stage_rank_weight_size_positive",
+}
+STAGE_EVIDENCE_CHECKS = {
+    "ck_stage_evidence_failure_code",
+    "ck_stage_evidence_identity_sha256",
+    "ck_stage_evidence_json_nonempty",
+    "ck_stage_evidence_kind",
+    "ck_stage_evidence_result_shape",
+    "ck_stage_evidence_run_id_length",
+    "ck_stage_evidence_schema_version",
+    "ck_stage_evidence_sequence_positive",
+    "ck_stage_evidence_status",
+    "ck_stage_evidence_validator_nonempty",
+    "ck_stage_evidence_validator_sha256",
+}
+STAGE_EVIDENCE_RANK_CHECKS = {
+    "ck_stage_evidence_rank_keys_sha256",
+    "ck_stage_evidence_rank_manifest_sha256",
+    "ck_stage_evidence_rank_nonnegative",
+    "ck_stage_evidence_rank_tensor_count",
+    "ck_stage_evidence_rank_weight_size",
 }
 BENCHMARK_INDEXES = {
     "ix_benchmark_evidence_release_id",
@@ -306,6 +365,88 @@ def true_0007_database(url: str) -> Config:
     return migration_config
 
 
+def true_0008_database(url: str) -> Config:
+    """Materialize released 0008 without executing revision 0009."""
+    migration_config = config(url)
+    command.upgrade(migration_config, "0008")
+    engine = make_engine(url)
+    with engine.begin() as connection:
+        for table in (
+            StageArtifactValidationRank.__table__,
+            StageArtifactValidationEvidence.__table__,
+            StageArtifactRank.__table__,
+            StageArtifactVariant.__table__,
+        ):
+            table.drop(connection, checkfirst=True)
+    engine.dispose()
+    return migration_config
+
+
+def _seed_stage_variant(session, *, suffix: str = "seed") -> tuple:
+    artifact = ModelArtifact(
+        id=str(uuid.uuid4()),
+        model_id=f"stage-migration-{suffix}",
+        repository=f"Example/StageMigration-{suffix}",
+        revision="1" * 40,
+        manifest_digest="sha256:" + "1" * 64,
+        quantization="awq",
+        size_mib=1,
+        default_max_model_len=1024,
+        layer_count=1,
+        license_id="apache-2.0",
+    )
+    runtime = RuntimeRelease(
+        id=str(uuid.uuid4()),
+        version=f"stage-migration-{suffix}",
+        image="registry.example/vllm@sha256:" + "2" * 64,
+        vllm_version="0.9.0",
+        cuda_version="12.4",
+        gpu_architectures=["ampere"],
+    )
+    session.add_all((artifact, runtime))
+    session.flush()
+    source = ArtifactManifest(
+        digest=artifact.manifest_digest,
+        schema_version=1,
+        model_artifact_id=artifact.id,
+        total_size_bytes=1,
+        file_count=1,
+        chunk_count=1,
+        canonical_json="{}",
+    )
+    stage = ArtifactManifest(
+        digest="sha256:" + "3" * 64,
+        schema_version=1,
+        model_artifact_id=None,
+        total_size_bytes=1,
+        file_count=1,
+        chunk_count=1,
+        canonical_json="{}",
+    )
+    session.add_all((source, stage))
+    session.flush()
+    variant = StageArtifactVariant(
+        artifact_set_digest="sha256:" + "4" * 64,
+        contract_identity_digest="sha256:" + "5" * 64,
+        source_manifest_digest=source.digest,
+        runtime_release_id=runtime.id,
+        runtime_image=runtime.image,
+        vllm_version="0.9.0",
+        exporter_build_digest="sha256:" + "6" * 64,
+        architecture="Qwen2ForCausalLM",
+        quantization="awq",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        rank_count=1,
+        loader_format="VLLM_SHARDED_STATE_V1",
+        status="DRAFT",
+        canonical_identity_json="{}",
+    )
+    session.add(variant)
+    session.commit()
+    return artifact, runtime, source, stage, variant
+
+
 class MigrationTests(unittest.TestCase):
     def assert_artifact_manifest_head(self, inspector) -> None:
         expected_columns = {
@@ -349,7 +490,6 @@ class MigrationTests(unittest.TestCase):
                 set(Base.metadata.tables[table_name].columns.keys()),
                 f"Base.metadata {table_name}",
             )
-
         manifest_columns = {
             item["name"]: item
             for item in inspector.get_columns("artifact_manifests")
@@ -672,7 +812,258 @@ class MigrationTests(unittest.TestCase):
                 ["id"],
                 table_name,
             )
+        self._assert_artifact_preparation_constraints(inspector)
 
+    def assert_stage_artifact_head(self, inspector) -> None:
+        expected_columns = {
+            "stage_artifact_variants": {
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_release_id",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "rank_count",
+                "loader_format",
+                "status",
+                "canonical_identity_json",
+                "created_at",
+                "updated_at",
+                "validated_at",
+                "revoked_at",
+            },
+            "stage_artifact_ranks": {
+                "id",
+                "variant_id",
+                "rank",
+                "pipeline_rank",
+                "tensor_rank",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "manifest_digest",
+                "tensor_key_count",
+                "tensor_keys_digest",
+                "weight_size_bytes",
+                "created_at",
+            },
+            "stage_artifact_validation_evidence": {
+                "identity_digest",
+                "variant_id",
+                "validation_run_id",
+                "registration_sequence",
+                "schema_version",
+                "kind",
+                "status",
+                "validator_version",
+                "validator_build_digest",
+                "rank_count",
+                "failure_code",
+                "canonical_evidence_json",
+                "created_at",
+            },
+            "stage_artifact_validation_ranks": {
+                "evidence_id",
+                "rank",
+                "variant_id",
+                "manifest_digest",
+                "tensor_keys_digest",
+                "loaded_tensor_count",
+                "loaded_weight_size_bytes",
+            },
+        }
+        for table_name, columns in expected_columns.items():
+            self.assertEqual(
+                columns,
+                {item["name"] for item in inspector.get_columns(table_name)},
+                table_name,
+            )
+            self.assertEqual(
+                columns,
+                set(Base.metadata.tables[table_name].columns.keys()),
+                f"Base.metadata {table_name}",
+            )
+
+        expected_checks = {
+            "stage_artifact_variants": STAGE_VARIANT_CHECKS,
+            "stage_artifact_ranks": STAGE_RANK_CHECKS,
+            "stage_artifact_validation_evidence": STAGE_EVIDENCE_CHECKS,
+            "stage_artifact_validation_ranks": STAGE_EVIDENCE_RANK_CHECKS,
+        }
+        for table_name, checks in expected_checks.items():
+            self.assertEqual(
+                checks,
+                {
+                    item["name"]
+                    for item in inspector.get_check_constraints(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                checks,
+                {
+                    constraint.name
+                    for constraint in Base.metadata.tables[table_name].constraints
+                    if isinstance(constraint, CheckConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        expected_uniques = {
+            "stage_artifact_variants": {
+                ("artifact_set_digest", "tensor_parallel_size", "pipeline_parallel_size"),
+                ("contract_identity_digest",),
+            },
+            "stage_artifact_ranks": {
+                ("variant_id", "rank"),
+                ("variant_id", "pipeline_rank", "tensor_rank"),
+                ("variant_id", "manifest_digest"),
+                (
+                    "variant_id",
+                    "rank",
+                    "manifest_digest",
+                    "tensor_keys_digest",
+                ),
+            },
+            "stage_artifact_validation_evidence": {
+                ("variant_id", "registration_sequence"),
+                ("variant_id", "validation_run_id"),
+                ("identity_digest", "variant_id"),
+            },
+        }
+        for table_name, uniques in expected_uniques.items():
+            self.assertEqual(
+                uniques,
+                {
+                    tuple(item["column_names"])
+                    for item in inspector.get_unique_constraints(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                uniques,
+                {
+                    tuple(column.name for column in constraint.columns)
+                    for constraint in Base.metadata.tables[table_name].constraints
+                    if isinstance(constraint, UniqueConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+
+        expected_indexes = {
+            "stage_artifact_variants": {
+                "ix_stage_variants_source_manifest",
+                "ix_stage_variants_runtime_release",
+                "ix_stage_variants_status",
+            },
+            "stage_artifact_ranks": {"ix_stage_ranks_manifest_digest"},
+            "stage_artifact_validation_evidence": {
+                "ix_stage_evidence_variant_kind_sequence"
+            },
+            "stage_artifact_validation_ranks": set(),
+        }
+        for table_name, indexes in expected_indexes.items():
+            self.assertEqual(
+                indexes,
+                {item["name"] for item in inspector.get_indexes(table_name)},
+                table_name,
+            )
+            self.assertEqual(
+                indexes,
+                {index.name for index in Base.metadata.tables[table_name].indexes},
+                f"Base.metadata {table_name}",
+            )
+
+        expected_foreign_keys = {
+            "stage_artifact_variants": {
+                "fk_stage_variant_source_manifest": (
+                    ("source_manifest_digest",),
+                    "artifact_manifests",
+                    ("digest",),
+                ),
+                "fk_stage_variant_runtime_release": (
+                    ("runtime_release_id",),
+                    "runtime_releases",
+                    ("id",),
+                ),
+            },
+            "stage_artifact_ranks": {
+                "fk_stage_rank_variant_topology": (
+                    (
+                        "variant_id",
+                        "tensor_parallel_size",
+                        "pipeline_parallel_size",
+                    ),
+                    "stage_artifact_variants",
+                    (
+                        "artifact_set_digest",
+                        "tensor_parallel_size",
+                        "pipeline_parallel_size",
+                    ),
+                ),
+                "fk_stage_rank_manifest": (
+                    ("manifest_digest",),
+                    "artifact_manifests",
+                    ("digest",),
+                ),
+            },
+            "stage_artifact_validation_evidence": {
+                "fk_stage_evidence_variant": (
+                    ("variant_id",),
+                    "stage_artifact_variants",
+                    ("artifact_set_digest",),
+                ),
+            },
+            "stage_artifact_validation_ranks": {
+                "fk_stage_evidence_rank_evidence": (
+                    ("evidence_id", "variant_id"),
+                    "stage_artifact_validation_evidence",
+                    ("identity_digest", "variant_id"),
+                ),
+                "fk_stage_evidence_rank_stage": (
+                    (
+                        "variant_id",
+                        "rank",
+                        "manifest_digest",
+                        "tensor_keys_digest",
+                    ),
+                    "stage_artifact_ranks",
+                    (
+                        "variant_id",
+                        "rank",
+                        "manifest_digest",
+                        "tensor_keys_digest",
+                    ),
+                ),
+            },
+        }
+        for table_name, foreign_keys in expected_foreign_keys.items():
+            self.assertEqual(
+                foreign_keys,
+                {
+                    item["name"]: (
+                        tuple(item["constrained_columns"]),
+                        item["referred_table"],
+                        tuple(item["referred_columns"]),
+                    )
+                    for item in inspector.get_foreign_keys(table_name)
+                },
+                table_name,
+            )
+            self.assertEqual(
+                set(foreign_keys),
+                {
+                    constraint.name
+                    for constraint in Base.metadata.tables[table_name].constraints
+                    if isinstance(constraint, ForeignKeyConstraint)
+                },
+                f"Base.metadata {table_name}",
+            )
+    def _assert_artifact_preparation_constraints(self, inspector) -> None:
         preparation_columns = {
             item["name"]: item
             for item in inspector.get_columns("artifact_preparations")
@@ -860,6 +1251,7 @@ class MigrationTests(unittest.TestCase):
         self.assertTrue(HEAD_TABLES <= set(inspector.get_table_names()))
         self.assert_artifact_manifest_head(inspector)
         self.assert_artifact_preparation_head(inspector)
+        self.assert_stage_artifact_head(inspector)
         self.assertEqual(
             BENCHMARK_INDEXES,
             {item["name"] for item in inspector.get_indexes("benchmark_evidence")},
@@ -1249,12 +1641,12 @@ class MigrationTests(unittest.TestCase):
         )
         engine.dispose()
 
-    def test_migration_history_has_single_0008_head(self):
+    def test_migration_history_has_single_0009_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             url = f"sqlite:///{Path(temporary) / 'heads.db'}"
             heads = ScriptDirectory.from_config(config(url)).get_heads()
 
-            self.assertEqual(heads, ["0008"])
+            self.assertEqual(heads, ["0009"])
 
     def test_empty_database_upgrades_to_benchmark_head(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1263,6 +1655,224 @@ class MigrationTests(unittest.TestCase):
             command.upgrade(config(url), "head")
 
             self.assert_benchmark_head(url)
+
+    def test_true_0008_upgrade_and_empty_round_trip_preserve_registry_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'stage-upgrade.db'}"
+            migration_config = true_0008_database(url)
+            engine = make_engine(url)
+            self.assertFalse(
+                STAGE_ARTIFACT_TABLES & set(inspect(engine).get_table_names())
+            )
+            factory = make_session_factory(engine)
+            with factory() as session:
+                artifact = ModelArtifact(
+                    id=str(uuid.uuid4()),
+                    model_id="stage-upgrade-source",
+                    repository="Example/StageUpgrade",
+                    revision="a" * 40,
+                    manifest_digest="sha256:" + "b" * 64,
+                    quantization="awq",
+                    size_mib=1,
+                    default_max_model_len=1024,
+                    layer_count=1,
+                    license_id="apache-2.0",
+                )
+                runtime = RuntimeRelease(
+                    id=str(uuid.uuid4()),
+                    version="stage-upgrade-runtime",
+                    image="registry.example/vllm@sha256:" + "c" * 64,
+                    vllm_version="0.9.0",
+                    cuda_version="12.4",
+                    gpu_architectures=["ampere"],
+                )
+                session.add_all((artifact, runtime))
+                session.commit()
+                artifact_id = artifact.id
+                runtime_id = runtime.id
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+
+            self.assert_benchmark_head(url)
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                self.assertIsNotNone(session.get(ModelArtifact, artifact_id))
+                self.assertIsNotNone(session.get(RuntimeRelease, runtime_id))
+            engine.dispose()
+
+            command.downgrade(migration_config, "0008")
+
+            engine = make_engine(url)
+            self.assertFalse(
+                STAGE_ARTIFACT_TABLES & set(inspect(engine).get_table_names())
+            )
+            factory = make_session_factory(engine)
+            with factory() as session:
+                self.assertIsNotNone(session.get(ModelArtifact, artifact_id))
+                self.assertIsNotNone(session.get(RuntimeRelease, runtime_id))
+            engine.dispose()
+
+            command.upgrade(migration_config, "head")
+            self.assert_benchmark_head(url)
+
+    def test_0009_database_rejects_invalid_topology_duplicates_and_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'stage-constraints.db'}"
+            command.upgrade(config(url), "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                _artifact, _runtime, _source, stage, variant = _seed_stage_variant(
+                    session,
+                    suffix="constraints",
+                )
+                invalid_rank = StageArtifactRank(
+                    variant_id=variant.artifact_set_digest,
+                    rank=1,
+                    pipeline_rank=0,
+                    tensor_rank=0,
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    manifest_digest=stage.digest,
+                    tensor_key_count=1,
+                    tensor_keys_digest="sha256:" + "7" * 64,
+                    weight_size_bytes=1,
+                )
+                session.add(invalid_rank)
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                session.add(
+                    StageArtifactVariant(
+                        artifact_set_digest="sha256:" + "b" * 64,
+                        contract_identity_digest="sha256:" + "c" * 64,
+                        source_manifest_digest=variant.source_manifest_digest,
+                        runtime_release_id=variant.runtime_release_id,
+                        runtime_image=variant.runtime_image,
+                        vllm_version="0.9.0",
+                        exporter_build_digest="sha256:" + "d" * 64,
+                        architecture="Qwen2ForCausalLM",
+                        quantization="awq",
+                        tensor_parallel_size=1,
+                        pipeline_parallel_size=1,
+                        rank_count=1,
+                        loader_format="VLLM_SHARDED_STATE_V1",
+                        status="ACTIVE",
+                        canonical_identity_json="{}",
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                rank = StageArtifactRank(
+                    variant_id=variant.artifact_set_digest,
+                    rank=0,
+                    pipeline_rank=0,
+                    tensor_rank=0,
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    manifest_digest=stage.digest,
+                    tensor_key_count=1,
+                    tensor_keys_digest="sha256:" + "7" * 64,
+                    weight_size_bytes=1,
+                )
+                session.add(rank)
+                session.commit()
+                session.add(
+                    StageArtifactRank(
+                        variant_id=variant.artifact_set_digest,
+                        rank=0,
+                        pipeline_rank=0,
+                        tensor_rank=0,
+                        tensor_parallel_size=1,
+                        pipeline_parallel_size=1,
+                        manifest_digest=stage.digest,
+                        tensor_key_count=1,
+                        tensor_keys_digest="sha256:" + "7" * 64,
+                        weight_size_bytes=1,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                invalid_evidence = StageArtifactValidationEvidence(
+                    identity_digest="sha256:" + "8" * 64,
+                    variant_id=variant.artifact_set_digest,
+                    validation_run_id=str(uuid.uuid4()),
+                    registration_sequence=1,
+                    schema_version=1,
+                    kind="GPU_EXPORT_LOAD",
+                    status="PASSED",
+                    validator_version="validator-1",
+                    validator_build_digest="sha256:" + "9" * 64,
+                    rank_count=0,
+                    failure_code=None,
+                    canonical_evidence_json="{}",
+                )
+                session.add(invalid_evidence)
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+
+                evidence = StageArtifactValidationEvidence(
+                    identity_digest="sha256:" + "8" * 64,
+                    variant_id=variant.artifact_set_digest,
+                    validation_run_id=str(uuid.uuid4()),
+                    registration_sequence=1,
+                    schema_version=1,
+                    kind="GPU_EXPORT_LOAD",
+                    status="PASSED",
+                    validator_version="validator-1",
+                    validator_build_digest="sha256:" + "9" * 64,
+                    rank_count=1,
+                    failure_code=None,
+                    canonical_evidence_json="{}",
+                )
+                session.add(evidence)
+                session.commit()
+                session.add(
+                    StageArtifactValidationRank(
+                        evidence_id=evidence.identity_digest,
+                        rank=0,
+                        variant_id=variant.artifact_set_digest,
+                        manifest_digest=stage.digest,
+                        tensor_keys_digest="sha256:" + "a" * 64,
+                        loaded_tensor_count=1,
+                        loaded_weight_size_bytes=1,
+                    )
+                )
+                with self.assertRaises(IntegrityError):
+                    session.commit()
+                session.rollback()
+            engine.dispose()
+
+    def test_0009_downgrade_rejects_registered_stage_variant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            url = f"sqlite:///{Path(temporary) / 'stage-downgrade.db'}"
+            migration_config = config(url)
+            command.upgrade(migration_config, "head")
+            engine = make_engine(url)
+            factory = make_session_factory(engine)
+            with factory() as session:
+                _seed_stage_variant(session, suffix="downgrade")
+            engine.dispose()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "refusing to downgrade 0009",
+            ):
+                command.downgrade(migration_config, "0008")
+
+            engine = make_engine(url)
+            self.assertTrue(
+                STAGE_ARTIFACT_TABLES <= set(inspect(engine).get_table_names())
+            )
+            engine.dispose()
 
     def test_true_0007_upgrade_and_empty_round_trip_preserve_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
