@@ -1,21 +1,74 @@
 """
-Async Pipeline Optimizer for 7-stage Pipeline Parallelism (PP=7, TP=1, DP=1).
+Async Pipeline Optimizer for local Pipeline Parallelism (TP=1, DP=1).
 
 Hides P2P activation-transfer latency (stage i -> i+1) behind compute of the
 current microbatch, using a dedicated compute stream, a dedicated comm stream,
 and CUDA events for cross-stream sync (no CPU-side torch.cuda.synchronize()
 inside the hot loop).
 
-Run with: torchrun --nproc_per_node=7 async_pipeline_optimizer.py
+Run with: python3 speed/async_pipeline_optimizer.py
+
+The launcher detects the number of CUDA devices visible to PyTorch and starts
+one torchrun worker per GPU. CUDA_VISIBLE_DEVICES can be used to select a
+subset. Direct torchrun launches remain supported.
 """
 
+from __future__ import annotations
+
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import List, Optional
 
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.distributed as dist
+    import torch.nn.functional as F
+except ImportError:
+    # Keep launcher helpers importable in the dependency-free Dure test suite.
+    # The worker reports a clear error before attempting any GPU work.
+    torch = None
+    dist = None
+    F = None
+
+
+def detected_gpu_count(torch_module=None) -> int:
+    """Return the number of CUDA GPUs visible to the current process."""
+    module = torch_module or torch
+    if module is None:
+        raise RuntimeError("PyTorch is not installed; install a CUDA-enabled PyTorch build")
+    if not module.cuda.is_available():
+        return 0
+    return int(module.cuda.device_count())
+
+
+def launcher_command(gpu_count: int, script_path: Path | None = None) -> list[str]:
+    if gpu_count < 1:
+        raise ValueError("gpu_count must be positive")
+    script = script_path or Path(__file__).resolve()
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        f"--nproc-per-node={gpu_count}",
+        str(script),
+    ]
+
+
+def launch_detected_gpus(*, torch_module=None, process_runner=subprocess.run) -> int:
+    gpu_count = detected_gpu_count(torch_module)
+    if gpu_count == 0:
+        raise RuntimeError(
+            "No CUDA GPU is visible to PyTorch; check nvidia-smi, the PyTorch CUDA build, "
+            "and CUDA_VISIBLE_DEVICES"
+        )
+    print(f"Detected {gpu_count} CUDA GPU(s); launching {gpu_count} pipeline stage(s).")
+    completed = process_runner(launcher_command(gpu_count), check=False)
+    return int(completed.returncode)
 
 
 class AsyncPipelineOptimizer:
@@ -162,7 +215,9 @@ class AsyncPipelineOptimizer:
         return (end_time - start_time) / steps
 
 
-def main() -> None:
+def run_worker() -> int:
+    if torch is None or dist is None or F is None:
+        raise RuntimeError("PyTorch with distributed NCCL support is required")
     try:
         dist.init_process_group(backend="nccl")
     except Exception as exc:  # noqa: BLE001 - surface init failures clearly
@@ -190,7 +245,7 @@ def main() -> None:
         if rank == 0:
             speedup_pct = (sync_latency - async_latency) / sync_latency * 100
             print("\n" + "=" * 50)
-            print("  7-GPU PIPELINE PARALLEL ASYNC OVERLAP BENCHMARK")
+            print(f"  {world_size}-GPU PIPELINE PARALLEL ASYNC OVERLAP BENCHMARK")
             print("=" * 50)
             print(f"[-] Sync pipeline avg latency:   {sync_latency * 1000:.2f} ms")
             print(f"[+] Async pipeline avg latency:  {async_latency * 1000:.2f} ms")
@@ -200,7 +255,16 @@ def main() -> None:
         # Always tear down NCCL group even if benchmark raised.
         if dist.is_initialized():
             dist.destroy_process_group()
+    return 0
+
+
+def main() -> int:
+    # torchrun injects LOCAL_RANK/WORLD_SIZE into every worker. Without those
+    # variables this process is the lightweight auto-detecting launcher.
+    if "LOCAL_RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return launch_detected_gpus()
+    return run_worker()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
