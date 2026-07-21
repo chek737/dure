@@ -29,7 +29,7 @@
 6. 고정 이미지는 `dure-benchmark` 진입점을 제공해야 합니다. 실행 직전 `nvidia-smi`로 선택 GPU의 compute process가 없음을 다시 확인하고, MIG process는 상위 GPU를 안전하게 식별할 수 없으므로 하나라도 있으면 거부합니다. 컨테이너는 가장 큰 정상 GPU 한 장만 UUID로 할당하고, 읽기 전용 루트, 네트워크 없음, capability 제거, 권한 상승 금지, 비 root 사용자, `restart=no`와 고정 Dure 벤치마크 레이블로 실행됩니다. 메모리는 `min(전체 RAM, 가용 RAM) / 2`와 32GiB 중 작은 값으로 제한하고 8GiB 미만이면 실행하지 않으며, `memory-swap`을 같은 값으로 두어 추가 swap을 막습니다. CPU quota는 논리 CPU 수의 절반과 8코어 중 작은 값입니다. stdout·stderr는 실행 중 합계 64KiB로 제한하고 중앙에는 원문을 보내지 않습니다.
 7. Agent와 서버가 동일한 폐쇄형 결과 스키마와 유한 수치 범위를 검사합니다. 성공 결과는 자동으로 증적에 등록되고, SLO 미달도 정상 수집된 `FAILED` 증적으로 남습니다.
 
-`0.3.15`의 콘텐츠 주소 준비 라이브러리는 이 벤치마크 실행기가 자동 호출하지 않습니다. `POST /v1/admin/benchmark-runs/prepare`는 모델 바이트를 준비하는 API가 아니라 DB에 고정 실행 문맥만 저장합니다. 캐시는 실행 전에 이미 존재해야 하며 중앙 `PREPARE_MODEL`, 이미지 pull과 READY 증적은 후속 버전 범위입니다.
+`0.3.16`의 중앙 deployment 준비 기능은 이 벤치마크 실행기가 자동 호출하지 않습니다. `POST /v1/admin/benchmark-runs/prepare`는 모델 바이트를 준비하는 API가 아니라 DB에 고정 실행 문맥만 저장합니다. 벤치마크 캐시와 다이제스트 이미지는 실행 전에 별도의 명시적 deployment 준비 또는 검증된 운영 절차로 이미 존재해야 합니다. probe와 조정되는 독립 `READY` 캐시 수명주기는 후속 버전 범위입니다.
 
 작업 페이로드는 임의 명령, Docker 인자, 환경 변수, 마운트, 호스트 경로, Python 코드, 프롬프트, 토큰, 비밀값 또는 로그 필드를 허용하지 않습니다. 실패 시 중앙 DB와 감사 이벤트에는 고정 실패 코드만 저장하고 원문 stdout·stderr·예외문은 저장하지 않습니다.
 
