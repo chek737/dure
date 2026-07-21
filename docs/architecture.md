@@ -47,7 +47,7 @@ CPU 전용 노드는 중앙 제어면, 게이트웨이, 아티팩트 캐시, 관
 
 ## 현재 로컬 모델 캐시와 중앙 준비 계층
 
-`0.3.16`에는 정규 아티팩트 매니페스트를 로컬 `FULL_SNAPSHOT` 캐시로 materialize하는 노드 라이브러리와 이를 호출하는 중앙 준비 operation·관리자 CLI·Agent 작업이 있습니다. 추천과 수락은 여전히 호스트를 바꾸지 않으며, 운영자가 같은 준비 요청에 명시적으로 `--apply`를 지정한 뒤에만 `PREPARE_MODEL → PREPARE_IMAGE` 작업이 실행됩니다. GPU 노드 추가만으로 준비를 자동 시작하지 않습니다.
+`0.3.16`의 `FULL_SNAPSHOT` 계층과 0.3.19의 rank별 `STAGE` 계층은 같은 중앙 준비 operation·관리자 CLI·Agent 작업을 사용합니다. 추천과 수락은 여전히 호스트를 바꾸지 않으며, 운영자가 준비 preview와 같은 요청에 명시적으로 `--apply`를 지정한 뒤에만 `PREPARE_MODEL → PREPARE_IMAGE` 작업이 실행됩니다. GPU 노드 추가만으로 준비를 자동 시작하지 않습니다.
 
 ```text
 정규 매니페스트 + 검증된 TrustedHTTPSOrigin 객체
@@ -67,7 +67,7 @@ production 기본값에서 CAS와 시도 저널은 `/var/lib/dure/model-store`, 
 
 패키지는 root Agent의 캐시 경계를 중앙 서버 계정과 분리합니다. `/var/lib/dure`는 `root:dure`의 비쓰기 부모이고 중앙 서버의 로컬 쓰기 상태는 `/var/lib/dure/server`에 둡니다. 준비기는 설정 루트의 가장 가까운 기존 조상부터 생성한 루트까지 소유권·쓰기 권한·symlink를 검사합니다. 인벤토리와 벤치마크는 `/var/lib/dure/models` 루트와 캐시 후보·`config.json`·marker를 현재 Agent 사용자 소유의 비쓰기 일반 항목으로 각각 검사하며, 상위 `/var/lib/dure`까지 같은 검사를 반복하지는 않습니다. Hugging Face inventory의 표준 snapshot→repository `blobs` 링크는 읽기 호환성을 유지하지만 자동 벤치마크의 검증 캐시가 되지는 않습니다.
 
-## 현재 stage artifact 생성·등록 계층
+## 현재 stage artifact 생성·등록·소비 계층
 
 0.3.17에는 검증된 `FULL_SNAPSHOT`을 pipeline rank별 vLLM `sharded_state`로 내보내는 신뢰된 오프라인 빌더와 중앙 variant 레지스트리가 있습니다. 이 빌더는 Agent task가 아니며 커뮤니티 GPU 노드에서 중앙 지시로 실행되지 않습니다.
 
@@ -87,15 +87,15 @@ vLLM 0.9.0의 sharded-state 파일명 rank는 PP rank가 아니라 TP rank입니
 
 variant identity는 원본 매니페스트, 런타임 OCI 다이제스트, vLLM 버전, exporter 빌드 다이제스트, 아키텍처·양자화, TP·PP, loader 형식과 rank 순서의 stage 매니페스트를 결합합니다. 누락·중복·범위 밖 rank, topology 불일치와 같은 고정 입력에서 달라진 stage 출력은 거부합니다. remote code, LoRA·adapter, MoE, 멀티모달과 임의 아키텍처도 지원하지 않습니다.
 
-등록은 실제 실행 가능성 증명이 아닙니다. synthetic 검사는 구조·tensor coverage·결정성을 검사하지만 승격할 수 없고, 정확한 variant를 실제 GPU에서 export하고 다시 load한 최신 `GPU_EXPORT_LOAD/PASSED` 증적만 `DRAFT → VALIDATED`를 허용합니다. 전제 조건 부족을 뜻하는 `NOT_RUN`과 실패는 DRAFT 승격을 차단합니다. canonical UUIDv4 validation run의 새 증적은 `DRAFT`에서만 추가합니다. 등록된 동일 run의 정확한 재전송은 상태 전환 뒤에도 멱등 반환하지만, `VALIDATED`와 `REVOKED`에는 새 run을 추가하지 못합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 닫고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. 번들 acceptance harness의 native load 범위는 `PP=1`뿐이므로 PP>1은 모든 rank를 검증하는 별도 신뢰 증적이 없으면 `DRAFT`로 유지합니다.
+등록은 실제 실행 가능성 증명이 아닙니다. synthetic 검사는 구조·tensor coverage·결정성을 검사하지만 승격할 수 없고, 정확한 variant를 실제 GPU에서 export하고 다시 load한 최신 `GPU_EXPORT_LOAD/PASSED` 증적만 `DRAFT → VALIDATED`를 허용합니다. 전제 조건 부족을 뜻하는 `NOT_RUN`과 실패는 DRAFT 승격을 차단합니다. canonical UUIDv4 validation run의 새 증적은 `DRAFT`에서만 추가합니다. 등록된 동일 run의 정확한 재전송은 상태 전환 뒤에도 멱등 반환하지만, `VALIDATED`와 `REVOKED`에는 새 run을 추가하지 못합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 닫고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. builder harness는 `PP=1`, 별도 분산 runtime harness는 준비된 `PP=2/3`의 실제 load·최소 추론을 검사합니다.
 
-현재 추천기, 중앙 준비 operation, Agent와 런타임은 stage variant를 아직 소비하지 않습니다. 노드에는 계속 전체 `FULL_SNAPSHOT`을 준비합니다. 빌드·등록·검증 실패는 deployment나 task를 만들지 않고 기존 컨테이너를 변경하지 않습니다. rank별 다운로드, `STAGE` 캐시의 원자적 활성화와 `sharded_state` 로더 결합은 다음 PR 범위이며, probe 기반 캐시 상태 투영과 격리 수명주기는 그 다음 PR 범위입니다. 상세 계약은 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
+0.3.19 중앙 준비 operation은 운영자가 정확한 `VALIDATED` digest를 지정한 경우 node UUID와 PP rank를 해당 stage 매니페스트에 고정합니다. Agent는 계약 전체의 복합 identity로 자신의 rank 캐시만 원자적으로 활성화하고, 런타임은 시작 직전에 전체 파일·marker를 재해시한 뒤 서로 다른 host 경로를 동일한 `/models/model`에 읽기 전용 mount합니다. vLLM 명령에는 고정 `--load-format sharded_state`가 추가됩니다. 추천기의 자동 variant 선택과 probe 기반 중앙 캐시 상태·격리 수명주기는 후속 범위입니다. 상세 계약은 [stage artifact 문서](stage-artifacts.md)를 따릅니다.
 
 빌더의 vLLM·PyTorch·safetensors·CUDA 계열 의존성은 기본 Debian 패키지에 포함하지 않습니다. 운영 Agent·중앙 서버와 분리한 digest 고정 OCI 환경에서만 heavy dependency를 설치합니다.
 
 ## 현재 폐쇄형 다중 노드 Ray pipeline 실행
 
-0.3.18은 중앙 추천을 수락해 만드는 다중 노드 세대에 `VLLM_RAY_PP_V1` 실행 계약을 결합합니다. 이 backend는 기존 로컬 계획과 legacy Ray 실행을 대체하지 않습니다. `execution_backend`가 없는 기존 계획 JSON은 기존 필드와 동작을 유지하며, 엄격한 backend 전용 필드가 섞인 legacy 계획이나 알 수 없는 backend는 실행 전에 거부합니다.
+0.3.18은 중앙 추천을 수락해 만드는 다중 노드 세대에 `VLLM_RAY_PP_V1` 실행 계약을 결합했고, 0.3.19는 같은 backend에 명시적 `STAGE` 소비를 추가합니다. 이 backend는 기존 로컬 계획과 legacy Ray 실행을 대체하지 않습니다. `execution_backend`가 없는 기존 계획 JSON은 기존 필드와 동작을 유지하며, 엄격한 backend 전용 필드가 섞인 legacy 계획이나 알 수 없는 backend는 실행 전에 거부합니다.
 
 ```text
 서버 UUID와 최신 NodeProfile
@@ -103,13 +103,13 @@ variant identity는 원본 매니페스트, 런타임 OCI 다이제스트, vLLM 
 head를 rank 0으로 고정, worker를 IPv4 문자열로 정렬
         ↓ TP=1, PP=노드 수(2 또는 3)
 VLLM_RAY_PP_V1 / vLLM 0.9.0 / V0 / Ray 계획
-        ↓ 모든 노드의 검증된 FULL_SNAPSHOT과 digest 고정 이미지 확인
+        ↓ 모든 노드의 검증된 FULL_SNAPSHOT 또는 rank별 STAGE와 digest 고정 이미지 확인
 고정 Ray 포트·고정 컨테이너 identity로 실행
         ↓
 source-pinned pipeline-rank-contract + API readiness
 ```
 
-계획의 각 assignment에는 서버가 발급한 정규 노드 UUID, `runtime_address`, pipeline rank와 기대 runtime rank가 들어갑니다. head assignment는 항상 rank 0이고, 나머지 worker는 계획에 선택된 고유한 canonical RFC1918 IPv4 문자열의 오름차순입니다. 각 노드는 정상 GPU가 정확히 한 장이어야 합니다. probe는 전체 주소와 별도로 기본 interface에 실제 결합된 `default_interface_addresses`를 보고하며, 선택 주소가 이 목록에 정확히 하나 존재하고 모든 노드의 기본 interface 이름이 같아야 합니다. 주소가 없거나 여러 개라 모호하면 새 probe와 네트워크 설정 정리가 필요합니다. 모델 캐시는 `/var/lib/dure/models/sha256-<manifesthex>` 경로와 marker의 manifest digest가 정확히 같은 검증된 `FULL_SNAPSHOT` 하나여야 합니다. 현재 지원 범위는 `TP=1`, `PP=2` 또는 `PP=3`이고 `STAGE` 캐시는 실행 입력으로 허용하지 않습니다.
+계획의 각 assignment에는 서버가 발급한 정규 노드 UUID, `runtime_address`, pipeline rank와 기대 runtime rank가 들어갑니다. head assignment는 항상 rank 0이고, 나머지 worker는 계획에 선택된 고유한 canonical RFC1918 IPv4 문자열의 오름차순입니다. 각 노드는 정상 GPU가 정확히 한 장이어야 합니다. probe는 전체 주소와 별도로 기본 interface에 실제 결합된 `default_interface_addresses`를 보고하며, 선택 주소가 이 목록에 정확히 하나 존재하고 모든 노드의 기본 interface 이름이 같아야 합니다. 주소가 없거나 여러 개라 모호하면 새 probe와 네트워크 설정 정리가 필요합니다. `FULL_SNAPSHOT`은 `/var/lib/dure/models/sha256-<manifesthex>`, `STAGE`는 assignment마다 `/var/lib/dure/models/stages/sha256-<cache-identity>`의 marker와 전체 파일이 정확히 일치해야 합니다. 현재 지원 범위는 `TP=1`, `PP=2` 또는 `PP=3`입니다.
 
 엄격한 Ray 컨테이너는 `--node-ip-address`와 `VLLM_HOST_IP`를 같은 계획 주소로 고정하고, 서버 UUID에서 계산한 `dure_node_<uuidhex>` Ray custom resource를 정확히 하나 게시합니다. GCS는 `6379`, worker 범위는 `20000-21000`이며 vLLM API는 head의 `127.0.0.1:8000`에만 바인딩합니다. 모든 컨테이너는 기존 `dure.deployment`·`dure.generation`·`dure.node` 외에 `dure.backend`, `dure.pipeline-rank`, `dure.runtime-rank`, `dure.component`, `dure.runtime-contract` 레이블을 가집니다. 마지막 값은 이미지·모델 mount·GPU·network·entrypoint·고정 환경·명령을 포함한 정규 계약의 SHA-256입니다. 시작·재사용·readiness는 이 digest까지 정확히 비교합니다. incident containment용 `STOP`은 준비 경로가 손상되거나 원본 계획과 effective path가 달라도 동작해야 하므로 기존 배포·세대·노드·backend·rank·component만 정확히 확인하고 runtime-contract 값은 재계산하지 않습니다.
 
@@ -170,9 +170,9 @@ verified_at 롤백 증거 기록
 
 `APPLY_DEPLOYMENT`와 `VERIFY` 묶음은 배포 세대에 연결된 operation으로 기록됩니다. operation 상태는 `PREPARED`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `PARTIAL_FAILED`, `FAILED`의 폐쇄 목록을 사용하고, 노드별 단계는 `PENDING`, `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELED`로 추적합니다. 각 노드 단계에는 시도 번호가 있으며 생성된 task는 해당 단계와 시도 번호에 결합됩니다. 현재 시도 번호·단계·작업 유형과 일치하지 않는 늦은 claim이나 완료 보고는 상태를 전진시키지 않습니다.
 
-전체 배정 노드를 정확히 대상으로 한 `VERIFY`가 모두 성공하고 backend별 최소 Agent 버전을 충족할 때만 `verified_at`을 기록합니다. legacy 배포는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이 필요합니다. 엄격한 backend에서는 각 노드의 정확한 `pipeline-rank-contract`와 head의 API 검증도 성공해야 합니다. 일부 노드 검증, API 검증을 생략한 엄격한 결과, 전체 배정 집합이 아닌 Ray head 전용 검증과 구 Agent 결과는 운영 상태 조회에는 남지만 롤백 증거가 되지 않습니다. `dure admin deployment show`는 한 세대와 연결된 작업을, `dure admin deployment generations`는 같은 계보의 모든 세대를 조회합니다.
+전체 배정 노드를 정확히 대상으로 한 `VERIFY`가 모두 성공하고 backend별 최소 Agent 버전을 충족할 때만 `verified_at`을 기록합니다. legacy 배포는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이며 `STAGE` 준비·실행은 0.3.19 이상이 필요합니다. 엄격한 backend에서는 각 노드의 정확한 `pipeline-rank-contract`와 head의 API 검증도 성공해야 합니다. 일부 노드 검증, API 검증을 생략한 엄격한 결과, 전체 배정 집합이 아닌 Ray head 전용 검증과 구 Agent 결과는 운영 상태 조회에는 남지만 롤백 증거가 되지 않습니다. `dure admin deployment show`는 한 세대와 연결된 작업을, `dure admin deployment generations`는 같은 계보의 모든 세대를 조회합니다.
 
-롤백 요청에서 서버가 대상 계획을 선택하므로 클라이언트는 대상 세대, 계획, 다운로드 또는 이미지 내려받기 값을 지정할 수 없습니다. 소스는 계보의 최신 세대여야 하고 대상은 그 소스가 직접 가리키는 직전 세대여야 하며, 대상 상태가 `VERIFIED`이고 `verified_at`이 있어야 합니다. 두 세대는 전체 노드 배정과 토폴로지가 정확히 같아야 합니다. 요청한 정규 UUID 노드 집합도 전체 배정 집합과 정확히 같아야 하고, 모든 노드는 승인됨·온라인이며 legacy는 Agent 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이어야 합니다. 두 계획의 이미지가 OCI 다이제스트로 고정되지 않았으면 거부합니다.
+롤백 요청에서 서버가 대상 계획을 선택하므로 클라이언트는 대상 세대, 계획, 다운로드 또는 이미지 내려받기 값을 지정할 수 없습니다. 소스는 계보의 최신 세대여야 하고 대상은 그 소스가 직접 가리키는 직전 세대여야 하며, 대상 상태가 `VERIFIED`이고 `verified_at`이 있어야 합니다. 두 세대는 전체 노드 배정과 토폴로지가 정확히 같아야 합니다. 요청한 정규 UUID 노드 집합도 전체 배정 집합과 정확히 같아야 하고, 모든 노드는 승인됨·온라인이며 legacy는 Agent 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상이어야 합니다. `STAGE` 대상 시작에는 0.3.19 이상과 현재 검증된 exact variant·로컬 캐시가 필요합니다. 두 계획의 이미지가 OCI 다이제스트로 고정되지 않았으면 거부합니다.
 
 기본 롤백 요청은 `PREPARED` operation만 저장하고 task를 만들지 않습니다. `apply=true`를 명시해야 계보의 활성 변경이 되며 다음 단계를 순서대로 실행합니다.
 
@@ -226,7 +226,7 @@ Codex 진단은 이 결정론적 선택의 입력이 아닙니다. 사람이 해
 
 stage builder는 이 중앙 작업 열거형에 속하지 않습니다. 신뢰된 오프라인 환경에서만 실행하며, variant 등록·증적 기록·상태 전이는 중앙 DB 작업일 뿐 Agent 작업이나 호스트 변경 권한이 아닙니다.
 
-계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. `VLLM_RAY_PP_V1`은 이 호환 정규화를 허용하지 않고 계획의 UUID 전체 집합을 서버 노드와 직접 대조하며, 비중지 작업은 전체 배정 노드와 0.3.18 이상 Agent를 요구합니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
+계획은 서버가 발급한 노드 UUID를 사용합니다. 레거시 호스트명 배정은 승인된 노드 하나로만 해석될 때 정규화할 수 있습니다. `VLLM_RAY_PP_V1`은 이 호환 정규화를 허용하지 않고 계획의 UUID 전체 집합을 서버 노드와 직접 대조하며, 비중지 작업은 전체 배정 노드와 0.3.18 이상 Agent를 요구합니다. `STAGE` 비중지 작업은 0.3.19 이상을 요구합니다. 중앙 배포 이미지는 OCI 다이제스트로 고정돼야 합니다.
 
 ## 신뢰 경계
 

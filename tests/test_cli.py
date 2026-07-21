@@ -509,6 +509,23 @@ class DeploymentGenerationCLITests(unittest.TestCase):
             {"request_id": request_id, "apply": True},
         )
 
+        stage_digest = "sha256:" + "a" * 64
+        FakeJSONClient.calls = []
+        result, output = self.run_cli(
+            [*common, "--stage-variant", stage_digest]
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output), FakeJSONClient.response)
+        self.assertEqual(
+            FakeJSONClient.calls[-1][4],
+            {
+                "request_id": request_id,
+                "apply": False,
+                "artifact_set_digest": stage_digest,
+            },
+        )
+
     def test_preparation_reads_the_operation_detail_endpoint(self):
         FakeJSONClient.response = {
             "preparation": {"id": "preparation-1", "status": "RUNNING"}

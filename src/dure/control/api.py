@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from datetime import timedelta
 from functools import partial
@@ -367,6 +368,7 @@ class DeploymentRollback(StrictBody):
 
 class DeploymentPreparationRequest(StrictBody):
     request_id: str
+    artifact_set_digest: str | None = None
     apply: StrictBool = False
 
     @model_validator(mode="after")
@@ -376,6 +378,16 @@ class DeploymentPreparationRequest(StrictBody):
                 raise ValueError
         except (AttributeError, ValueError) as exc:
             raise ValueError("request_id must be a canonical UUID") from exc
+        if (
+            self.artifact_set_digest is not None
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}", self.artifact_set_digest
+            )
+            is None
+        ):
+            raise ValueError(
+                "artifact_set_digest must be an immutable sha256 digest"
+            )
         return self
 
 
@@ -1460,6 +1472,7 @@ def create_app(*, database_url: str | None = None, admin_token: str | None = Non
                 session,
                 deployment_id,
                 request_id=body.request_id,
+                artifact_set_digest=body.artifact_set_digest,
                 apply=body.apply,
             )
         except ArtifactPreparationNotFoundError as exc:

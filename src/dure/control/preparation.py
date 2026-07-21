@@ -20,8 +20,11 @@ from dure.artifact_prepare import (
     validate_digest_pinned_runtime_image,
     validate_preparation_result,
 )
-from dure.model_cache import MODEL_CACHE_KIND_FULL_SNAPSHOT
-from dure.models import NodeProfile
+from dure.model_cache import (
+    MODEL_CACHE_KIND_FULL_SNAPSHOT,
+    MODEL_CACHE_KIND_STAGE,
+)
+from dure.models import DeploymentPlan, NodeProfile
 from dure.task import TaskStatus, TaskType
 
 from .models import (
@@ -42,11 +45,17 @@ from .models import (
     utcnow,
 )
 from .recommendation import RecommendationError, evaluate_deployment_recommendation
+from .stage_artifacts import (
+    StageArtifactConflictError,
+    StageArtifactNotFoundError,
+    validated_stage_artifact_projection,
+)
 
 
 PROFILE_FRESH_FOR = timedelta(seconds=90)
 NODE_ONLINE_FOR = timedelta(seconds=30)
 MINIMUM_PREPARATION_AGENT = (0, 3, 16)
+MINIMUM_STAGE_PREPARATION_AGENT = (0, 3, 19)
 
 PREPARATION_TASK_TYPES = frozenset(
     {TaskType.PREPARE_MODEL.value, TaskType.PREPARE_IMAGE.value}
@@ -128,9 +137,13 @@ def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _agent_version_supported(value: str) -> bool:
+def _agent_version_supported(
+    value: str,
+    *,
+    minimum: tuple[int, int, int] = MINIMUM_PREPARATION_AGENT,
+) -> bool:
     match = _SEMVER.fullmatch(value)
-    return bool(match and tuple(int(item) for item in match.groups()) >= MINIMUM_PREPARATION_AGENT)
+    return bool(match and tuple(int(item) for item in match.groups()) >= minimum)
 
 
 def _node_online(node: Node, now: datetime) -> bool:
@@ -196,11 +209,185 @@ def _lock_model_release_transitions(session: Session) -> None:
         session.execute(text("LOCK TABLE model_releases IN SHARE MODE"))
 
 
+def _stage_preparation_projection(
+    session: Session,
+    deployment: Deployment,
+    selected: dict[str, Any],
+    artifact: ModelArtifact,
+    *,
+    artifact_set_digest: str | None,
+) -> dict[str, Any] | None:
+    """Bind one explicitly requested validated stage variant to node ranks.
+
+    PR7 deliberately does not choose a preferred variant during recommendation.
+    Omitting ``artifact_set_digest`` therefore preserves the existing FULL
+    snapshot path.  Once a digest is supplied, every mismatch is terminal for
+    that immutable preparation request; callers must never fall back to FULL.
+    """
+
+    if artifact_set_digest is None:
+        return None
+    if (
+        type(artifact_set_digest) is not str
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_set_digest) is None
+    ):
+        raise ArtifactPreparationError(
+            "stage artifact set digest is invalid",
+            code="PREPARATION_STAGE_VARIANT_INVALID",
+            details={"deployment_id": deployment.id},
+        )
+    try:
+        projection = validated_stage_artifact_projection(
+            session, artifact_set_digest
+        )
+    except StageArtifactNotFoundError as exc:
+        raise ArtifactPreparationError(
+            "requested validated stage artifact variant is unavailable",
+            code="PREPARATION_STAGE_VARIANT_UNAVAILABLE",
+            details={"artifact_set_digest": artifact_set_digest},
+        ) from exc
+    except (StageArtifactConflictError, ValueError) as exc:
+        raise ArtifactPreparationError(
+            "requested stage artifact variant failed immutable validation",
+            code="PREPARATION_STAGE_VARIANT_INVALID",
+            details={"artifact_set_digest": artifact_set_digest},
+        ) from exc
+
+    plan = deployment.plan
+    assignments = plan.get("assignments")
+    expected_contract = {
+        "artifact_set_digest": artifact_set_digest,
+        "source_manifest_digest": artifact.manifest_digest,
+        "runtime_image": selected.get("runtime_image"),
+        "vllm_version": plan.get("runtime_vllm_version"),
+        "quantization": artifact.quantization,
+        "tensor_parallel_size": plan.get("tensor_parallel_size"),
+        "pipeline_parallel_size": plan.get("pipeline_parallel_size"),
+        "loader_format": "VLLM_SHARDED_STATE_V1",
+    }
+    if (
+        type(projection) is not dict
+        or any(projection.get(key) != value for key, value in expected_contract.items())
+        or projection.get("architecture") != "Qwen2ForCausalLM"
+        or plan.get("execution_backend") != "VLLM_RAY_PP_V1"
+        or type(assignments) is not list
+        or len(assignments) != plan.get("pipeline_parallel_size")
+    ):
+        raise ArtifactPreparationError(
+            "stage artifact variant does not match the accepted generation",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            details={"artifact_set_digest": artifact_set_digest},
+        )
+
+    assignment_by_pipeline_rank: dict[int, dict[str, Any]] = {}
+    for assignment in assignments:
+        if type(assignment) is not dict:
+            raise ArtifactPreparationError(
+                "accepted generation has an invalid stage assignment",
+                code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            )
+        pipeline_rank = assignment.get("pipeline_rank")
+        if type(pipeline_rank) is not int or pipeline_rank in assignment_by_pipeline_rank:
+            raise ArtifactPreparationError(
+                "accepted generation has duplicate or invalid pipeline ranks",
+                code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            )
+        assignment_by_pipeline_rank[pipeline_rank] = assignment
+
+    stages = projection.get("ranks")
+    if type(stages) is not list or len(stages) != len(assignments):
+        raise ArtifactPreparationError(
+            "stage artifact rank set is incomplete",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            details={"artifact_set_digest": artifact_set_digest},
+        )
+    bindings: list[dict[str, Any]] = []
+    seen_nodes: set[str] = set()
+    seen_manifests: set[str] = set()
+    for expected_rank, stage in enumerate(stages):
+        if type(stage) is not dict:
+            raise ArtifactPreparationError(
+                "stage artifact rank binding is invalid",
+                code="PREPARATION_STAGE_VARIANT_MISMATCH",
+            )
+        pipeline_rank = stage.get("pipeline_rank")
+        tensor_rank = stage.get("tensor_rank")
+        assignment = assignment_by_pipeline_rank.get(pipeline_rank)
+        node_id = assignment.get("node_id") if assignment is not None else None
+        manifest_digest = stage.get("manifest_digest")
+        if (
+            stage.get("rank") != expected_rank
+            or tensor_rank != 0
+            or assignment is None
+            or assignment.get("expected_runtime_rank") != expected_rank
+            or type(node_id) is not str
+            or node_id in seen_nodes
+            or type(manifest_digest) is not str
+            or manifest_digest in seen_manifests
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest) is None
+            or type(stage.get("tensor_keys_digest")) is not str
+            or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", stage["tensor_keys_digest"]
+            )
+            is None
+            or type(stage.get("total_size_bytes")) is not int
+            or stage["total_size_bytes"] <= 0
+            or type(stage.get("file_count")) is not int
+            or stage["file_count"] <= 0
+        ):
+            raise ArtifactPreparationError(
+                "stage artifact rank does not match the accepted node assignment",
+                code="PREPARATION_STAGE_VARIANT_MISMATCH",
+                details={"artifact_set_digest": artifact_set_digest},
+            )
+        seen_nodes.add(node_id)
+        seen_manifests.add(manifest_digest)
+        bindings.append(
+            {
+                "node_id": node_id,
+                "rank": expected_rank,
+                "pipeline_rank": pipeline_rank,
+                "tensor_rank": tensor_rank,
+                "manifest_digest": manifest_digest,
+                "tensor_key_count": stage.get("tensor_key_count"),
+                "tensor_keys_digest": stage["tensor_keys_digest"],
+                "weight_size_bytes": stage.get("weight_size_bytes"),
+                "total_size_bytes": stage["total_size_bytes"],
+                "file_count": stage["file_count"],
+            }
+        )
+    if set(assignment_by_pipeline_rank) != set(range(len(bindings))):
+        raise ArtifactPreparationError(
+            "stage artifact ranks do not cover the accepted topology",
+            code="PREPARATION_STAGE_VARIANT_MISMATCH",
+        )
+    return {
+        **{
+            key: projection[key]
+            for key in (
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "loader_format",
+            )
+        },
+        "node_bindings": bindings,
+    }
+
+
 def _selected_context(
     session: Session,
     deployment: Deployment,
     *,
     now: datetime,
+    stage_artifact_set_digest: str | None = None,
     preparation_id: str | None = None,
     revalidate_inventory: bool = True,
     disk_node_ids: set[str] | None = None,
@@ -210,6 +397,7 @@ def _selected_context(
     ModelArtifact,
     ArtifactManifest,
     list[Node],
+    dict[str, Any] | None,
 ]:
     if deployment.source_recommendation_id is None:
         raise ArtifactPreparationError(
@@ -491,17 +679,55 @@ def _selected_context(
             code="PREPARATION_IMAGE_INVALID",
             details={"deployment_id": deployment.id},
         )
+    stage_projection = _stage_preparation_projection(
+        session,
+        deployment,
+        selected,
+        artifact,
+        artifact_set_digest=stage_artifact_set_digest,
+    )
+    if stage_projection is not None:
+        unsupported = [
+            node.id
+            for node in nodes
+            if not _agent_version_supported(
+                node.agent_version,
+                minimum=MINIMUM_STAGE_PREPARATION_AGENT,
+            )
+        ]
+        if unsupported:
+            raise ArtifactPreparationError(
+                "an assigned node Agent cannot prepare stage artifacts",
+                code="PREPARATION_AGENT_UNSUPPORTED",
+                details={
+                    "node_ids": unsupported,
+                    "minimum_version": "0.3.19",
+                },
+            )
     # The controller cannot know which CAS chunks already exist or whether the
     # chunk store and assembled model share a filesystem. Reserve the safe
     # same-filesystem worst case: all chunks + one assembled snapshot + PR3's
     # fixed disk reserve. The Agent performs the authoritative per-filesystem
     # check again immediately before writing.
-    required_bytes = manifest.total_size_bytes * 2 + 64 * 1024 * 1024
-    required_mib = math.ceil(required_bytes / (1024 * 1024))
+    stage_by_node = (
+        {
+            item["node_id"]: item
+            for item in stage_projection["node_bindings"]
+        }
+        if stage_projection is not None
+        else {}
+    )
     checked_disk_nodes = set(node_ids) if disk_node_ids is None else disk_node_ids
     for node in nodes:
         if node.id not in checked_disk_nodes:
             continue
+        selected_size = (
+            stage_by_node[node.id]["total_size_bytes"]
+            if stage_projection is not None
+            else manifest.total_size_bytes
+        )
+        required_bytes = selected_size * 2 + 64 * 1024 * 1024
+        required_mib = math.ceil(required_bytes / (1024 * 1024))
         profile = NodeProfile.from_dict(profile_records[node.id].profile)
         if profile.disk_free_mib < required_mib:
             raise ArtifactPreparationError(
@@ -513,11 +739,15 @@ def _selected_context(
                     "available_mib": profile.disk_free_mib,
                 },
             )
-    return recommendation, selected, artifact, manifest, nodes
+    return recommendation, selected, artifact, manifest, nodes, stage_projection
 
 
-def _request_identity(deployment: Deployment) -> dict[str, Any]:
-    return {
+def _request_identity(
+    deployment: Deployment,
+    *,
+    stage_artifact_set_digest: str | None,
+) -> dict[str, Any]:
+    value = {
         "schema_version": 1,
         "deployment_id": deployment.id,
         "generation": deployment.generation,
@@ -525,6 +755,10 @@ def _request_identity(deployment: Deployment) -> dict[str, Any]:
         "plan": deployment.plan,
         "cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
     }
+    if stage_artifact_set_digest is not None:
+        value["cache_kind"] = MODEL_CACHE_KIND_STAGE
+        value["stage_artifact_set_digest"] = stage_artifact_set_digest
+    return value
 
 
 def _plan_snapshot(
@@ -533,13 +767,51 @@ def _plan_snapshot(
     selected: dict[str, Any],
     artifact: ModelArtifact,
     manifest: ArtifactManifest,
+    stage_projection: dict[str, Any] | None,
 ) -> dict[str, Any]:
     effective_plan = copy.deepcopy(deployment.plan)
-    effective_plan["model_path"] = (
-        "/var/lib/dure/models/sha256-"
-        + manifest.digest.removeprefix("sha256:")
-    )
-    return {
+    if stage_projection is None:
+        effective_plan["model_path"] = (
+            "/var/lib/dure/models/sha256-"
+            + manifest.digest.removeprefix("sha256:")
+        )
+        cache_kind = MODEL_CACHE_KIND_FULL_SNAPSHOT
+    else:
+        effective_plan["model_path"] = "/var/lib/dure/models/stages"
+        effective_plan["model_cache_kind"] = MODEL_CACHE_KIND_STAGE
+        effective_plan["stage_artifact"] = {
+            key: stage_projection[key]
+            for key in (
+                "artifact_set_digest",
+                "contract_identity_digest",
+                "source_manifest_digest",
+                "runtime_image",
+                "vllm_version",
+                "exporter_build_digest",
+                "architecture",
+                "quantization",
+                "tensor_parallel_size",
+                "pipeline_parallel_size",
+                "loader_format",
+            )
+        }
+        binding_by_node = {
+            item["node_id"]: item
+            for item in stage_projection["node_bindings"]
+        }
+        for assignment in effective_plan.get("assignments", []):
+            binding = binding_by_node.get(assignment.get("node_id"))
+            if binding is None:
+                raise ArtifactPreparationError(
+                    "stage plan is missing a node rank binding",
+                    code="PREPARATION_STAGE_VARIANT_MISMATCH",
+                )
+            assignment["stage_manifest_digest"] = binding["manifest_digest"]
+            assignment["stage_tensor_keys_digest"] = binding[
+                "tensor_keys_digest"
+            ]
+        cache_kind = MODEL_CACHE_KIND_STAGE
+    value = {
         "schema_version": 1,
         "deployment_id": deployment.id,
         "generation": deployment.generation,
@@ -555,12 +827,15 @@ def _plan_snapshot(
             "quantization": artifact.quantization,
             "total_size_bytes": manifest.total_size_bytes,
             "file_count": manifest.file_count,
-            "cache_kind": MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            "cache_kind": cache_kind,
         },
         "runtime_image": selected["runtime_image"],
         "node_ids": list(selected["node_ids"]),
         "effective_plan": effective_plan,
     }
+    if stage_projection is not None:
+        value["stage_artifact"] = copy.deepcopy(stage_projection)
+    return value
 
 
 def _active_attempts(session: Session, preparation_id: str) -> bool:
@@ -639,14 +914,64 @@ def _task_payload(
         "apply": True,
     }
     if stage == "MODEL":
-        payload.update(
-            model_id=artifact["model_id"],
-            repository=artifact["repository"],
-            revision=artifact["revision"],
-            manifest_digest=artifact["manifest_digest"],
-            quantization=artifact["quantization"],
-            cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
-        )
+        stage_artifact = snapshot.get("stage_artifact")
+        if stage_artifact is None:
+            payload.update(
+                model_id=artifact["model_id"],
+                repository=artifact["repository"],
+                revision=artifact["revision"],
+                manifest_digest=artifact["manifest_digest"],
+                quantization=artifact["quantization"],
+                cache_kind=MODEL_CACHE_KIND_FULL_SNAPSHOT,
+            )
+        else:
+            bindings = stage_artifact.get("node_bindings")
+            binding = next(
+                (
+                    item
+                    for item in bindings
+                    if type(item) is dict
+                    and item.get("node_id") == record.node_id
+                ),
+                None,
+            ) if type(bindings) is list else None
+            if binding is None:
+                raise ArtifactPreparationError(
+                    "stage preparation has no exact node rank binding",
+                    code="PREPARATION_PLAN_CONFLICT",
+                    details={"node_id": record.node_id},
+                )
+            payload.update(
+                model_id=artifact["model_id"],
+                repository=artifact["repository"],
+                revision=artifact["revision"],
+                manifest_digest=binding["manifest_digest"],
+                quantization=artifact["quantization"],
+                cache_kind=MODEL_CACHE_KIND_STAGE,
+                artifact_set_digest=stage_artifact["artifact_set_digest"],
+                contract_identity_digest=stage_artifact[
+                    "contract_identity_digest"
+                ],
+                source_manifest_digest=stage_artifact[
+                    "source_manifest_digest"
+                ],
+                runtime_image=stage_artifact["runtime_image"],
+                vllm_version=stage_artifact["vllm_version"],
+                exporter_build_digest=stage_artifact[
+                    "exporter_build_digest"
+                ],
+                architecture=stage_artifact["architecture"],
+                tensor_parallel_size=stage_artifact[
+                    "tensor_parallel_size"
+                ],
+                pipeline_parallel_size=stage_artifact[
+                    "pipeline_parallel_size"
+                ],
+                pipeline_rank=binding["pipeline_rank"],
+                tensor_rank=binding["tensor_rank"],
+                loader_format=stage_artifact["loader_format"],
+                tensor_keys_digest=binding["tensor_keys_digest"],
+            )
     else:
         payload["runtime_image"] = snapshot["runtime_image"]
     return payload
@@ -797,6 +1122,7 @@ def prepare_deployment_artifacts(
     deployment_id: str,
     *,
     request_id: str,
+    artifact_set_digest: str | None = None,
     apply: bool = False,
     now: datetime | None = None,
 ) -> tuple[ArtifactPreparation, list[Task], bool]:
@@ -845,7 +1171,12 @@ def prepare_deployment_artifacts(
             code="PREPARATION_PLAN_CONFLICT",
             details={"deployment_id": deployment_id},
         )
-    request_digest = _digest(_request_identity(deployment))
+    request_digest = _digest(
+        _request_identity(
+            deployment,
+            stage_artifact_set_digest=artifact_set_digest,
+        )
+    )
     request_binding = session.scalar(
         select(ArtifactPreparation)
         .where(ArtifactPreparation.request_id == request_id)
@@ -924,10 +1255,18 @@ def prepare_deployment_artifacts(
         ):
             return existing, [], False
         initial_apply = existing.status == "PREPARED"
-        recommendation, selected, artifact, manifest, _nodes = _selected_context(
+        (
+            recommendation,
+            selected,
+            artifact,
+            manifest,
+            _nodes,
+            stage_projection,
+        ) = _selected_context(
             session,
             deployment,
             now=evaluated_at,
+            stage_artifact_set_digest=artifact_set_digest,
             preparation_id=existing.id,
             revalidate_inventory=initial_apply,
             disk_node_ids=(
@@ -935,7 +1274,12 @@ def prepare_deployment_artifacts(
             ),
         )
         expected_snapshot = _plan_snapshot(
-            deployment, recommendation, selected, artifact, manifest
+            deployment,
+            recommendation,
+            selected,
+            artifact,
+            manifest,
+            stage_projection,
         )
         if existing.plan_snapshot != expected_snapshot:
             raise ArtifactPreparationError(
@@ -956,8 +1300,18 @@ def prepare_deployment_artifacts(
         session.commit()
         return existing, tasks, bool(tasks)
 
-    recommendation, selected, artifact, manifest, nodes = _selected_context(
-        session, deployment, now=evaluated_at
+    (
+        recommendation,
+        selected,
+        artifact,
+        manifest,
+        nodes,
+        stage_projection,
+    ) = _selected_context(
+        session,
+        deployment,
+        now=evaluated_at,
+        stage_artifact_set_digest=artifact_set_digest,
     )
     preparation = ArtifactPreparation(
         id=str(uuid.uuid4()),
@@ -966,19 +1320,36 @@ def prepare_deployment_artifacts(
         deployment_id=deployment.id,
         status="PREPARED",
         plan_snapshot=_plan_snapshot(
-            deployment, recommendation, selected, artifact, manifest
+            deployment,
+            recommendation,
+            selected,
+            artifact,
+            manifest,
+            stage_projection,
         ),
     )
     try:
         session.add(preparation)
         session.flush()
+        stage_by_node = (
+            {
+                item["node_id"]: item
+                for item in stage_projection["node_bindings"]
+            }
+            if stage_projection is not None
+            else {}
+        )
         for node in nodes:
             session.add(
                 ArtifactPreparationNode(
                     id=str(uuid.uuid4()),
                     preparation_id=preparation.id,
                     node_id=node.id,
-                    model_manifest_digest=manifest.digest,
+                    model_manifest_digest=(
+                        stage_by_node[node.id]["manifest_digest"]
+                        if stage_projection is not None
+                        else manifest.digest
+                    ),
                     runtime_image=selected["runtime_image"],
                 )
             )
@@ -1023,6 +1394,7 @@ def prepare_deployment_artifacts(
                 session,
                 deployment_id,
                 request_id=request_id,
+                artifact_set_digest=artifact_set_digest,
                 apply=apply,
                 now=now,
             )
@@ -1659,16 +2031,58 @@ def effective_deployment_plan(
 ) -> dict[str, Any]:
     if deployment.source_recommendation_id is None:
         return deployment.plan
-    if not require_prepared:
-        # STOP and rollback STOP_SOURCE are incident-containment paths. They
-        # need only the immutable deployment/generation labels and must remain
-        # usable even when preparation evidence is missing or corrupted.
-        return copy.deepcopy(deployment.plan)
     preparation = session.scalar(
         select(ArtifactPreparation).where(
             ArtifactPreparation.deployment_id == deployment.id
         )
     )
+    if not require_prepared:
+        # STOP and rollback STOP_SOURCE never revalidate current release or
+        # stage-registry eligibility.  They still need the immutable effective
+        # cache-kind projection so a STAGE container can be matched by its
+        # exact rank labels after the variant is revoked.  Accept only the two
+        # narrow plan changes preparation is allowed to persist; corruption
+        # falls back to the original plan and therefore cannot broaden a stop.
+        snapshot = (
+            preparation.plan_snapshot
+            if preparation is not None
+            and isinstance(preparation.plan_snapshot, dict)
+            else None
+        )
+        projected = (
+            snapshot.get("effective_plan")
+            if isinstance(snapshot, dict)
+            else None
+        )
+        if isinstance(projected, dict):
+            normalized = copy.deepcopy(projected)
+            original = copy.deepcopy(deployment.plan)
+            normalized["model_path"] = original.get("model_path")
+            if normalized.get("model_cache_kind") == MODEL_CACHE_KIND_STAGE:
+                normalized.pop("stage_artifact", None)
+                normalized["model_cache_kind"] = original.get(
+                    "model_cache_kind"
+                )
+                assignments = normalized.get("assignments")
+                if isinstance(assignments, list):
+                    for assignment in assignments:
+                        if isinstance(assignment, dict):
+                            assignment.pop("stage_manifest_digest", None)
+                            assignment.pop("stage_tensor_keys_digest", None)
+            try:
+                parsed = DeploymentPlan.from_dict(projected)
+            except (KeyError, TypeError, ValueError):
+                parsed = None
+            if (
+                parsed is not None
+                and normalized == original
+                and snapshot.get("deployment_id") == deployment.id
+                and snapshot.get("generation") == deployment.generation
+                and snapshot.get("source_recommendation_id")
+                == deployment.source_recommendation_id
+            ):
+                return copy.deepcopy(projected)
+        return copy.deepcopy(deployment.plan)
     if preparation is None or preparation.status != "SUCCEEDED":
         raise ArtifactPreparationError(
             "recommended deployment artifacts are not fully prepared",
@@ -1717,6 +2131,10 @@ def effective_deployment_plan(
     snapshot = preparation.plan_snapshot
     plan = snapshot.get("effective_plan")
     artifact = snapshot.get("artifact")
+    stage_artifact = snapshot.get("stage_artifact")
+    cache_kind = (
+        artifact.get("cache_kind") if isinstance(artifact, dict) else None
+    )
     expected_node_ids = sorted(
         item.get("node_id")
         for item in deployment.plan.get("assignments", [])
@@ -1734,7 +2152,8 @@ def effective_deployment_plan(
         or plan.get("deployment_id") != deployment.id
         or plan.get("generation") != deployment.generation
         or snapshot.get("runtime_image") != deployment.plan.get("image")
-        or artifact.get("cache_kind") != MODEL_CACHE_KIND_FULL_SNAPSHOT
+        or cache_kind
+        not in {MODEL_CACHE_KIND_FULL_SNAPSHOT, MODEL_CACHE_KIND_STAGE}
         or not isinstance(artifact.get("manifest_digest"), str)
         or re.fullmatch(
             r"sha256:[0-9a-f]{64}", artifact["manifest_digest"]
@@ -1747,10 +2166,149 @@ def effective_deployment_plan(
             details={"deployment_id": deployment.id},
         )
     expected_plan = copy.deepcopy(deployment.plan)
-    expected_plan["model_path"] = (
-        "/var/lib/dure/models/sha256-"
-        + artifact["manifest_digest"].removeprefix("sha256:")
-    )
+    expected_manifest_by_node: dict[str, str] = {}
+    expected_model_summary_by_node: dict[str, tuple[int, int]] = {}
+    if cache_kind == MODEL_CACHE_KIND_FULL_SNAPSHOT:
+        if stage_artifact is not None:
+            raise ArtifactPreparationError(
+                "FULL preparation unexpectedly contains stage identity",
+                code="DEPLOYMENT_PREPARATION_INVALID",
+                details={"deployment_id": deployment.id},
+            )
+        expected_plan["model_path"] = (
+            "/var/lib/dure/models/sha256-"
+            + artifact["manifest_digest"].removeprefix("sha256:")
+        )
+        expected_manifest_by_node = {
+            node_id: artifact["manifest_digest"]
+            for node_id in expected_node_ids
+        }
+        expected_model_summary_by_node = {
+            node_id: (
+                artifact.get("total_size_bytes"),
+                artifact.get("file_count"),
+            )
+            for node_id in expected_node_ids
+        }
+    else:
+        if not isinstance(stage_artifact, dict):
+            raise ArtifactPreparationError(
+                "STAGE preparation has no immutable variant identity",
+                code="DEPLOYMENT_PREPARATION_INVALID",
+                details={"deployment_id": deployment.id},
+            )
+        common_fields = (
+            "artifact_set_digest",
+            "contract_identity_digest",
+            "source_manifest_digest",
+            "runtime_image",
+            "vllm_version",
+            "exporter_build_digest",
+            "architecture",
+            "quantization",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "loader_format",
+        )
+        bindings = stage_artifact.get("node_bindings")
+        if (
+            type(bindings) is not list
+            or len(bindings) != len(expected_node_ids)
+            or stage_artifact.get("source_manifest_digest")
+            != artifact["manifest_digest"]
+            or stage_artifact.get("runtime_image") != snapshot["runtime_image"]
+        ):
+            raise ArtifactPreparationError(
+                "STAGE preparation variant binding is inconsistent",
+                code="DEPLOYMENT_PREPARATION_INVALID",
+                details={"deployment_id": deployment.id},
+            )
+        try:
+            current_projection = validated_stage_artifact_projection(
+                session, stage_artifact["artifact_set_digest"]
+            )
+        except (StageArtifactNotFoundError, StageArtifactConflictError, ValueError) as exc:
+            raise ArtifactPreparationError(
+                "prepared STAGE variant is no longer validated",
+                code="DEPLOYMENT_STAGE_VARIANT_UNAVAILABLE",
+                details={
+                    "deployment_id": deployment.id,
+                    "artifact_set_digest": stage_artifact.get(
+                        "artifact_set_digest"
+                    ),
+                },
+            ) from exc
+        projected_ranks = [
+            {
+                key: binding[key]
+                for key in (
+                    "rank",
+                    "pipeline_rank",
+                    "tensor_rank",
+                    "manifest_digest",
+                    "tensor_key_count",
+                    "tensor_keys_digest",
+                    "weight_size_bytes",
+                    "total_size_bytes",
+                    "file_count",
+                )
+            }
+            for binding in bindings
+            if type(binding) is dict
+        ]
+        expected_projection = {
+            **{key: stage_artifact.get(key) for key in common_fields},
+            "ranks": projected_ranks,
+        }
+        if current_projection != expected_projection:
+            raise ArtifactPreparationError(
+                "prepared STAGE variant registry projection changed",
+                code="DEPLOYMENT_STAGE_VARIANT_UNAVAILABLE",
+                details={"deployment_id": deployment.id},
+            )
+        expected_plan["model_path"] = "/var/lib/dure/models/stages"
+        expected_plan["model_cache_kind"] = MODEL_CACHE_KIND_STAGE
+        expected_plan["stage_artifact"] = {
+            key: stage_artifact[key] for key in common_fields
+        }
+        binding_by_node = {
+            item.get("node_id"): item
+            for item in bindings
+            if type(item) is dict
+        }
+        if (
+            len(binding_by_node) != len(expected_node_ids)
+            or set(binding_by_node) != set(expected_node_ids)
+        ):
+            raise ArtifactPreparationError(
+                "prepared STAGE node rank set is incomplete",
+                code="DEPLOYMENT_PREPARATION_INVALID",
+                details={"deployment_id": deployment.id},
+            )
+        for assignment in expected_plan.get("assignments", []):
+            binding = binding_by_node.get(assignment.get("node_id"))
+            if binding is None:
+                raise ArtifactPreparationError(
+                    "prepared STAGE assignment is incomplete",
+                    code="DEPLOYMENT_PREPARATION_INVALID",
+                )
+            assignment["stage_manifest_digest"] = binding[
+                "manifest_digest"
+            ]
+            assignment["stage_tensor_keys_digest"] = binding[
+                "tensor_keys_digest"
+            ]
+        expected_manifest_by_node = {
+            node_id: binding_by_node[node_id]["manifest_digest"]
+            for node_id in expected_node_ids
+        }
+        expected_model_summary_by_node = {
+            node_id: (
+                binding_by_node[node_id]["total_size_bytes"],
+                binding_by_node[node_id]["file_count"],
+            )
+            for node_id in expected_node_ids
+        }
     if plan != expected_plan:
         raise ArtifactPreparationError(
             "prepared deployment plan evidence is inconsistent",
@@ -1770,7 +2328,8 @@ def effective_deployment_plan(
             or record.image_status != "SUCCEEDED"
             or record.model_failure_code is not None
             or record.image_failure_code is not None
-            or record.model_manifest_digest != artifact["manifest_digest"]
+            or record.model_manifest_digest
+            != expected_manifest_by_node.get(record.node_id)
             or record.runtime_image != snapshot["runtime_image"]
         ):
             raise ArtifactPreparationError(
@@ -1826,10 +2385,11 @@ def effective_deployment_plan(
                 )
             if stage == "MODEL" and (
                 result.get("manifest_digest")
-                != artifact["manifest_digest"]
+                != expected_manifest_by_node[record.node_id]
                 or result.get("bytes_verified")
-                != artifact.get("total_size_bytes")
-                or result.get("file_count") != artifact.get("file_count")
+                != expected_model_summary_by_node[record.node_id][0]
+                or result.get("file_count")
+                != expected_model_summary_by_node[record.node_id][1]
             ):
                 raise ArtifactPreparationError(
                     "prepared model evidence is inconsistent",

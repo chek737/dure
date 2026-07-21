@@ -139,10 +139,8 @@ dure admin verify <deployment-id> --nodes <ray-head-node-id> --api
 - 각 노드는 서로 다른 canonical RFC1918 IPv4를 가지며 head가 rank 0, worker는 IPv4 문자열 오름차순입니다.
 - 각 노드의 계획 주소가 최신 probe의 `default_interface_addresses`에 정확히 하나
   존재하고 모든 노드의 기본 network interface 이름이 같습니다.
-- 모든 노드에 `/var/lib/dure/models/sha256-<manifesthex>` 경로와 marker digest가
-  정확히 일치하는 검증된 `FULL_SNAPSHOT`과 digest 고정 이미지가 준비돼 있습니다.
-  `STAGE`는 아직 허용하지 않습니다.
-- 대상 노드가 모두 승인·온라인이고 Agent가 0.3.18 이상입니다. 비중지 작업은 일부 노드만 골라 실행할 수 없습니다.
+- `FULL_SNAPSHOT`이면 모든 노드에 `/var/lib/dure/models/sha256-<manifesthex>`와 같은 전체 캐시가, `STAGE`이면 각 노드에 `/var/lib/dure/models/stages/sha256-<cache-identity>`의 서로 다른 rank 캐시가 검증돼 있습니다.
+- 대상 노드가 모두 승인·온라인이고 `FULL_SNAPSHOT` 실행은 Agent 0.3.18 이상, `STAGE` 준비·실행은 0.3.19 이상입니다. 비중지 작업은 일부 노드만 골라 실행할 수 없습니다.
 
 일반 추천·준비·적용 명령을 그대로 사용합니다.
 
@@ -157,6 +155,12 @@ dure admin deployment prepare <deployment-id> --request-id <request-uuid>
 dure admin deployment prepare <deployment-id> \
   --request-id <request-uuid> --apply
 dure admin deployment preparation <preparation-id>
+
+# STAGE를 사용할 때만 exact VALIDATED digest를 preview와 apply에 같이 지정합니다.
+dure admin deployment prepare <deployment-id> \
+  --request-id <stage-request-uuid> --stage-variant sha256:<64-hex>
+dure admin deployment prepare <deployment-id> \
+  --request-id <stage-request-uuid> --stage-variant sha256:<64-hex> --apply
 
 dure admin apply <deployment-id> --nodes <node-a> <node-b> [<node-c>] --serve
 dure admin verify <deployment-id> \
@@ -266,7 +270,7 @@ DURE_RUN_VLLM_RAY_PP_ACCEPTANCE=1 \
 
 ## stage artifact 생성·검증 운영
 
-0.3.17은 신뢰된 오프라인 환경에서 pipeline rank별 `STAGE`를 만들고 중앙에 variant·rank 매니페스트·검증 증적을 기록하는 계층을 제공합니다. 이것은 중앙 Agent 작업이나 자동 설치 기능이 아닙니다. 현재 배포 준비와 Agent는 계속 `FULL_SNAPSHOT`만 소비합니다.
+0.3.17은 신뢰된 오프라인 환경에서 pipeline rank별 `STAGE`를 만들고 중앙에 variant·rank 매니페스트·검증 증적을 기록합니다. 0.3.19는 별도의 명시적 준비 요청이 exact `VALIDATED` digest를 선택한 경우에만 각 Agent가 자신의 rank를 내려받아 활성화하고 실행합니다. builder 자체는 여전히 중앙 Agent 작업이 아니며 GPU 노드에서 임의 변환하지 않습니다.
 
 운영자는 빌드 전에 다음 고정 계약을 모두 확인합니다.
 
@@ -299,7 +303,7 @@ variant 등록 시 source manifest, runtime digest, vLLM, exporter build digest,
 
 synthetic fixture 검사는 빠진 rank, 잘못된 파일, tensor 누락과 digest 변조를 찾는 개발 게이트일 뿐 승격 증적이 아닙니다. 실제 GPU 검증의 전제 조건이 없으면 결과를 `NOT_RUN`으로 기록하며 성공으로 바꾸거나 생략하지 않습니다. 정확한 variant에 결합된 최신 `GPU_EXPORT_LOAD/PASSED`만 `DRAFT → VALIDATED`를 허용합니다. 새 validation run 증적은 `DRAFT`에서만 추가할 수 있습니다. 이미 등록한 동일 run의 정확한 네트워크 재전송은 `VALIDATED`나 `REVOKED` 뒤에도 기존 결과를 반환하지만, 두 상태에서 새 run을 추가하는 요청은 거부합니다. 검증 뒤 신뢰 문제가 발견되면 운영자가 영향 범위를 검토해 명시적으로 `REVOKED`로 전환하고 수정된 계약은 새 `DRAFT` variant에서 검증합니다. `REVOKED`는 되돌리지 않습니다.
 
-번들 `scripts/acceptance-vllm-stage-builder.py`는 현재 `PP=1`에서만 export·native load·최소 추론을 검증합니다. opt-in이나 GPU·고정 runtime 같은 전제 조건이 없고 `PP>1`이면 `NOT_RUN`과 종료 코드 77이어야 합니다. 이 결과를 성공으로 취급하지 않습니다. PP>1 variant는 구조적 빌드·등록이 가능해도 모든 stage rank를 실제 load하고 attest한 별도 신뢰 검증이 없으면 `DRAFT`로 유지합니다. 0.3.18의 `FULL_SNAPSHOT` rank 수용 검사는 이 stage 증적을 대신하지 않으며 stage-local loader는 다음 PR 범위입니다.
+번들 `scripts/acceptance-vllm-stage-builder.py`는 `PP=1` export·native load·최소 추론을 검증합니다. `scripts/acceptance-vllm-stage-ray-pp.py`는 신뢰된 `PP=2/3` 노드에서 이미 준비한 rank별 캐시를 실제 Ray/vLLM `sharded_state`로 load하고 최소 추론을 확인합니다. 두 harness 모두 opt-in·GPU·고정 runtime 등 전제 조건이 없으면 `NOT_RUN`과 종료 코드 77이며 성공으로 취급하지 않습니다. 기존 `FULL_SNAPSHOT` 수용 결과를 stage 증적으로 바꾸어 기록해서도 안 됩니다.
 
 현재 중앙 운영은 다음 관리자 인증 API를 사용합니다. 전용 `dure admin` 하위 명령은 아직 없습니다.
 
@@ -327,18 +331,31 @@ POST /v1/admin/stage-artifact-variants/{artifact_set_digest}/transition
 
 stage build, 등록, 증적 기록과 상태 전이는 deployment, 준비 operation, Agent task, 다운로드, image pull이나 Docker 실행을 만들지 않습니다. 실패해도 실행 중인 이전 배포를 자동 중지·교체·롤백하지 않습니다. 새 stage variant를 사용할 수 없다는 사실과 기존 배포가 정상이라는 사실은 별개이므로 기존 세대의 health와 `VERIFY` 결과를 계속 관찰합니다. `REVOKED` variant가 향후 선택되지 않게 하는 것과 이미 실행 중인 컨테이너를 중지하는 것도 별개의 명시적 운영 절차입니다.
 
+`VALIDATED` variant의 실제 준비는 다음처럼 별도 수행합니다. digest를 생략하면 기존 `FULL_SNAPSHOT`이며 지정 실패 시 자동 fallback하지 않습니다.
+
+```bash
+dure admin deployment prepare <deployment-id> \
+  --request-id <request-uuid> --stage-variant sha256:<64-hex>
+dure admin deployment prepare <deployment-id> \
+  --request-id <request-uuid> --stage-variant sha256:<64-hex> --apply
+```
+
+중앙은 source·runtime·vLLM·양자화·TP·PP와 모든 rank 증적을 다시 확인한 뒤 node UUID와 PP rank별 매니페스트를 task에 결합합니다. Agent는 task가 준 경로가 아니라 계약 전체에서 계산한 `/var/lib/dure/models/stages/sha256-<cache-identity>`만 사용합니다. 준비 성공 뒤에도 시작 직전에 전체 stage 파일과 marker를 다시 해시하며 불일치하면 Docker 호출 전에 실패합니다.
+
+일반 `probe`의 `installed_models`에 보이는 STAGE identity는 `complete=false`인 advisory 관측입니다. heartbeat마다 수 GiB를 재해시하지 않기 위한 경계이므로 이 값을 수동으로 `READY`로 해석하거나 캐시 검증을 생략하지 않습니다. 배포 시작 전 권위 검사는 runtime의 전체 재해시 결과입니다.
+
 vLLM·PyTorch·safetensors·CUDA 계열 의존성은 기본 Debian 패키지에 설치하지 않습니다. 운영 Agent나 중앙 서버에서 임시로 설치하지 말고 digest 고정 별도 OCI builder를 사용합니다. 자세한 계약과 후속 배포 연결 범위는 [stage artifact 문서](stage-artifacts.md)를 참고합니다.
 
 ## 중앙 아티팩트 준비와 실패 복구
 
-`0.3.16`은 추천을 수락해 만든 배포 세대에 대해 정규 매니페스트의 `FULL_SNAPSHOT` 캐시와 다이제스트 고정 OCI 이미지를 명시적으로 준비합니다. `recommend`, `accept`와 준비 preview는 다운로드나 task를 만들지 않습니다. 운영자가 같은 준비 요청에 `--apply`를 명시한 뒤에만 각 노드에서 `PREPARE_MODEL → PREPARE_IMAGE`를 순서대로 실행합니다. `benchmark-runs/prepare`는 이름이 비슷하지만 모델 바이트가 아니라 DB 실행 문맥만 준비하는 별도 기능입니다.
+중앙은 추천을 수락해 만든 배포 세대에 대해 정규 매니페스트의 기본 `FULL_SNAPSHOT` 또는 명시적으로 선택한 rank별 `STAGE` 캐시와 다이제스트 고정 OCI 이미지를 준비합니다. `recommend`, `accept`와 준비 preview는 다운로드나 task를 만들지 않습니다. 운영자가 같은 준비 요청에 `--apply`를 명시한 뒤에만 각 노드에서 `PREPARE_MODEL → PREPARE_IMAGE`를 순서대로 실행합니다. `benchmark-runs/prepare`는 이름이 비슷하지만 모델 바이트가 아니라 DB 실행 문맥만 준비하는 별도 기능입니다.
 
 production 고정 경계는 다음과 같습니다.
 
 - 청크 CAS·잠금·시도 저널: `/var/lib/dure/model-store`
 - 활성 모델과 숨은 조립 영역: `/var/lib/dure/models`
 - 원본: 각 노드의 root 전용 Agent 설정으로 만드는 검증된 `TrustedHTTPSOrigin`. 중앙 task나 DB가 raw URL·header·token을 전달하지 않음
-- 지원 cache kind: `FULL_SNAPSHOT`만 해당. `STAGE`는 명시적으로 거부
+- 지원 cache kind: 기본 `FULL_SNAPSHOT`, exact `VALIDATED` digest를 명시한 경우 `STAGE`. 둘 사이 자동 fallback 없음
 
 Agent 설정의 기존 secret과 node ID를 유지한 채 root 권한으로 `artifact_origin`을 추가합니다. 이 파일 전체를 로그나 지원 요청에 첨부하면 안 됩니다.
 
@@ -570,6 +587,8 @@ legacy에서 선택적, 엄격 backend에서 필수 VERIFY_API (Ray head)
 롤백 task는 항상 `accept_model_download=false`, `pull_image=false`를 사용합니다. 추천으로 만든 대상은 과거에 성공한 exact-path 모델·이미지 준비 증적을 다시 사용하며 새 준비 task를 만들지 않습니다. 대상 모델 캐시와 다이제스트 이미지가 모든 노드에 이미 있어야 하며 롤백이 다운로드나 이미지 내려받기를 대신하지 않습니다. 동일 GPU에서 소스 컨테이너를 중지하고 대상 컨테이너를 다시 생성하므로 중단 시간이 생길 수 있고 블루·그린 전환이 아닙니다. 이 흐름은 다중 노드 네트워크·NCCL 시험이나 24시간 복구 검증을 수행하지 않으므로 실제 GPU 환경의 별도 수용 검사를 계속 진행해야 합니다.
 
 ## 업그레이드와 복구
+
+0.3.19에는 데이터베이스 migration이 없습니다. 기존 0009 stage 레지스트리와 0008 준비 증적을 사용합니다. controller를 먼저 올린 뒤 대상 Agent를 작은 batch로 0.3.19 이상에 올리고, 새 heartbeat·probe에서 버전과 rank별 `STAGE` marker projection을 확인합니다. Agent가 0.3.18이면 기존 `FULL_SNAPSHOT` 엄격 실행은 유지할 수 있지만 `--stage-variant` 준비·시작·재시작·롤백 대상 시작은 거부됩니다. 첫 STAGE 적용 전에 preview가 task 0개인지, 각 rank 매니페스트가 기대 UUID에 결합됐는지, 실제 GPU harness 기본값이 `NOT_RUN(77)`인지 확인합니다.
 
 0.3.18에는 데이터베이스 migration이 없습니다. controller를 먼저 업그레이드한 뒤 Agent를 작은 batch로 0.3.18 이상에 올리고 새 heartbeat의 `agent_version`, UUID와 사설 주소를 확인합니다. 기존 local/legacy 계획은 계속 사용할 수 있지만 `VLLM_RAY_PP_V1` 비중지 작업은 전체 배정 노드가 0.3.18 이상일 때만 만듭니다. 전체 노드 업그레이드와 `FULL_SNAPSHOT` 준비가 끝나기 전에 엄격한 다중 노드 apply를 시작하지 않습니다.
 
