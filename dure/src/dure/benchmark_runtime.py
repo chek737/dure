@@ -42,7 +42,7 @@ MAX_MODEL_CONFIG_BYTES = 1024 * 1024
 MIN_BENCHMARK_MEMORY_LIMIT_MIB = 8 * 1024
 MAX_BENCHMARK_MEMORY_LIMIT_MIB = 32 * 1024
 MAX_BENCHMARK_CPUS = 8.0
-BENCHMARK_CONTAINER_GRACE_SECONDS = 300
+BENCHMARK_CONTAINER_GRACE_SECONDS = 900
 NVIDIA_COMPUTE_QUERY_COMMAND = (
     "nvidia-smi",
     "--query-compute-apps=gpu_uuid",
@@ -711,7 +711,7 @@ class SafeBenchmarkRuntime:
             )
         result = limited_run(
             command,
-            timeout=payload.duration_seconds + 300,
+            timeout=payload.duration_seconds + BENCHMARK_CONTAINER_GRACE_SECONDS,
             max_output_bytes=MAX_BENCHMARK_OUTPUT_BYTES,
         )
         if not result.ok:

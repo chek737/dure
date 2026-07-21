@@ -1,3 +1,9 @@
+dure (0.3.30) UNRELEASED; urgency=medium
+
+  * 실제 quality-eval 처리 시간을 수용하도록 벤치마크 실행·정리 여유를 늘립니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 23:35:00 +0900
+
 dure (0.3.29) UNRELEASED; urgency=medium
 
   * Triton JIT 공유 라이브러리를 로드할 수 있도록 벤치마크 tmpfs 실행을 허용합니다.
