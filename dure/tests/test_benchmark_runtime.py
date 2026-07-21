@@ -107,7 +107,7 @@ def metrics(**overrides):
 
 
 def container_identity(
-    *, state: str, deployment: str = "", started_at: str | None = None
+    *, state: str, deployment: str = "-", started_at: str | None = None
 ) -> str:
     started_at = started_at or datetime.now(timezone.utc).isoformat().replace(
         "+00:00", "Z"
@@ -310,6 +310,19 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             + BENCHMARK_CONTAINER_GRACE_SECONDS,
             300.0,
         )
+
+    def test_missing_deployment_label_survives_runner_output_stripping(self):
+        def respond(command):
+            if command[:3] == ("docker", "container", "inspect"):
+                return 0, container_identity(state="created").strip(), ""
+            if command == ("docker", "rm", "a" * 64):
+                return 0, "a" * 64, ""
+            raise AssertionError(f"unexpected command: {command}")
+
+        runner = FakeRunner(response_factory=respond)
+        SafeBenchmarkRuntime(runner).reconcile(payload())
+
+        self.assertIn(("docker", "rm", "a" * 64), runner.calls)
 
     def test_unsafe_packaged_entrypoint_is_rejected_before_docker(self):
         path = Path(self.temporary.name) / "unsafe-benchmark"
