@@ -1,3 +1,11 @@
+dure (0.4.11) UNRELEASED; urgency=medium
+
+  * 고정 vLLM V1 비동기 엔진에서 첫 stream 요청이 진행되도록 비동기 스케줄링을 복구합니다.
+  * 비-max-context workload에 1-token 실행 여유를 두어 exact limit 첫 요청 정지를 방지합니다.
+  * Transformers chat template 반환을 strict token list로 고정해 BatchEncoding 오인을 차단합니다.
+
+ -- Dure contributors <maintainers@example.invalid>  Tue, 21 Jul 2026 17:42:00 +0000
+
 dure (0.4.10) UNRELEASED; urgency=medium
 
   * label이 없는 벤치마크 컨테이너도 출력 trim 뒤 exact identity를 유지합니다.
