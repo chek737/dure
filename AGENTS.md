@@ -8,7 +8,7 @@ applies those plans through Docker, and reports readiness to a FastAPI/PostgreSQ
 
 ## Before changing code
 
-- Read `README.md` and the relevant document under `docs/`.
+- Read `README.md` and the relevant document under `dure/docs/`.
 - Preserve unrelated user changes in a dirty worktree.
 - Use `rg`/`rg --files` for discovery and `apply_patch` for edits.
 - Never add `.env`, agent credentials, admin tokens, signing keys, model tokens, or generated packages.
@@ -46,12 +46,12 @@ applies those plans through Docker, and reports readiness to a FastAPI/PostgreSQ
 
 ## Code organization
 
-- `src/dure/cli.py`: local and administrative CLI surface.
-- `src/dure/agent.py`: join flow, polling loop, lease renewal, and safe task execution.
-- `src/dure/control/`: API, persistence models, services, and bundled Alembic migrations.
-- `src/dure/probe.py`, `planner.py`, `orchestrator.py`, `runtime.py`, `readiness.py`: local node
+- `dure/src/dure/cli.py`: local and administrative CLI surface.
+- `dure/src/dure/agent.py`: join flow, polling loop, lease renewal, and safe task execution.
+- `dure/src/dure/control/`: API, persistence models, services, and bundled Alembic migrations.
+- `dure/src/dure/probe.py`, `planner.py`, `orchestrator.py`, `runtime.py`, `readiness.py`: local node
   discovery and deployment lifecycle.
-- `packaging/`, `debian/`, `.github/workflows/`: systemd, Debian, APT, and release integration.
+- `dure/packaging/`, `dure/debian/`, `.github/workflows/`: systemd, Debian, APT, and release integration.
 
 Keep HTTP handlers thin. Put transactional rules in `control/service.py`, host actions in the
 runtime/orchestrator layer, and wire-format validation in Pydantic models.
@@ -61,8 +61,8 @@ runtime/orchestrator layer, and wire-format validation in Pydantic models.
 Run before handing off a change:
 
 ```bash
-python3 -m compileall -q src tests
-python3 -m unittest discover -v
+python3 -m compileall -q dure/src dure/tests
+python3 -m unittest discover -s dure/tests -t dure -v
 git diff --check
 ```
 
@@ -80,8 +80,8 @@ PostgreSQL server, or Internet access in the unit suite.
 ## Schema, versions, and releases
 
 - Schema changes require a new Alembic revision; never edit a released revision.
-- Keep versions synchronized in `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, and
-  `debian/changelog`.
+- Keep versions synchronized in `pyproject.toml`, `setup.py`, `dure/src/dure/__init__.py`, and
+  `dure/debian/changelog`.
 - Do not tag or publish a release unless explicitly requested.
 - The APT workflow publishes tags matching the Debian version exactly (`v<version>`).
 - Preserve existing CLI flags and plan JSON compatibility unless a breaking release is explicit.

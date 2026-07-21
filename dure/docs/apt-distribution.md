@@ -76,22 +76,22 @@ sudo apt install apt-utils debhelper dh-python dpkg-dev gnupg python3-all python
 패키지와 저장소를 build합니다.
 
 ```bash
-package=$(scripts/build-deb.sh)
-scripts/build-apt-repo.sh "$package" public stable main <GPG_KEY_ID>
-scripts/render-installer.sh https://packages.example.com/dure public/install.sh
+package=$(dure/scripts/build-deb.sh)
+dure/scripts/build-apt-repo.sh "$package" public stable main <GPG_KEY_ID>
+dure/scripts/render-installer.sh https://packages.example.com/dure public/install.sh
 ```
 
 임시 서명 키를 사용한 APT end-to-end integration test:
 
 ```bash
-scripts/test-apt-repo.sh "$package"
+dure/scripts/test-apt-repo.sh "$package"
 ```
 
 생성된 `public/`의 내용을 구성한 HTTPS URL의 root에 업로드합니다.
 
 ## 릴리스 절차
 
-1. `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, `debian/changelog`의 version을 일치시킵니다.
+1. `pyproject.toml`, `setup.py`, `dure/src/dure/__init__.py`, `dure/debian/changelog`의 version을 일치시킵니다.
 2. unit test와 package build를 로컬에서 실행합니다.
 3. 의도한 범위만 commit하고 version branch를 push합니다.
 4. 사용자 승인 후 `v<debian-version>` tag를 만듭니다.

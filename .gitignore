@@ -6,8 +6,8 @@ __pycache__/
 build/
 dist/
 public/
-debian/.debhelper/
-debian/debhelper-build-stamp
-debian/dure/
-debian/files
-debian/*.substvars
+dure/debian/.debhelper/
+dure/debian/debhelper-build-stamp
+dure/debian/dure/
+dure/debian/files
+dure/debian/*.substvars

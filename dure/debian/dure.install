@@ -1,0 +1,2 @@
+dure/packaging/dure-agent.service lib/systemd/system/
+dure/packaging/dure-client.env etc/dure/

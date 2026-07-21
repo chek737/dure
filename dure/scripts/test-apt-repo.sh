@@ -6,7 +6,7 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-project_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 deb_path=$(realpath "$1")
 temporary_dir=$(mktemp -d /tmp/dure-apt-test.XXXXXX)
 
@@ -25,7 +25,7 @@ key_id=$(gpg --batch --with-colons --list-secret-keys | \
   awk -F: '$1 == "sec" && !found { print $5; found=1 }')
 test -n "$key_id"
 
-"$project_dir/scripts/build-apt-repo.sh" \
+"$repository_root/dure/scripts/build-apt-repo.sh" \
   "$deb_path" "$temporary_dir/repo" stable main "$key_id"
 gpgv --keyring "$temporary_dir/repo/dure-archive-keyring.gpg" \
   "$temporary_dir/repo/dists/stable/InRelease"

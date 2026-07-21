@@ -8,8 +8,8 @@ setup(
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     python_requires=">=3.10",
-    package_dir={"": "src"},
-    packages=find_packages("src"),
+    package_dir={"": "dure/src"},
+    packages=find_packages("dure/src"),
     install_requires=[],
     extras_require={
         "server": [

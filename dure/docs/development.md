@@ -4,7 +4,7 @@
 
 ```bash
 python3 -m pip install -e '.[test]'
-python3 -m unittest discover -v
+python3 -m unittest discover -s dure/tests -t dure -v
 ```
 
 단위 테스트는 SQLite, 가짜 호스트 명령, FastAPI 테스트 클라이언트를 사용합니다. GPU, Docker 데몬, PostgreSQL, 인터넷 없이 실행 가능해야 합니다.
@@ -50,9 +50,9 @@ PR 내부 ref는 이 Git 미러의 범위에 포함되지 않습니다.
 
 ## 스키마와 릴리스 변경
 
-schema 변경마다 `src/dure/control/migrations/versions/` 아래에 새 Alembic revision을 만듭니다. 출시된 revision은 수정하지 않으며 새 database와 기존 database 모두에서 `dure-server --migrate`를 검증합니다.
+schema 변경마다 `dure/src/dure/control/migrations/versions/` 아래에 새 Alembic revision을 만듭니다. 출시된 revision은 수정하지 않으며 새 database와 기존 database 모두에서 `dure-server --migrate`를 검증합니다.
 
-릴리스 전에는 `pyproject.toml`, `setup.py`, `src/dure/__init__.py`, `debian/changelog`의 버전을 일치시킵니다. `scripts/build-deb.sh`로 로컬 build를 확인하고 Debian version과 정확히 같은 `v<version>` tag를 push해야 서명된 APT workflow가 실행됩니다.
+릴리스 전에는 `pyproject.toml`, `setup.py`, `dure/src/dure/__init__.py`, `dure/debian/changelog`의 버전을 일치시킵니다. `dure/scripts/build-deb.sh`로 로컬 build를 확인하고 Debian version과 정확히 같은 `v<version>` tag를 push해야 서명된 APT workflow가 실행됩니다.
 
 ## 모델 선택 기능 개발 규칙
 

@@ -35,7 +35,7 @@ dure-agent = "dure.agent:main"
 dure-server = "dure.server:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "dure/src"}
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["dure/src"]

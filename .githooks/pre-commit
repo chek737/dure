@@ -14,4 +14,4 @@ if git diff --cached | grep -Eq '^\+(<<<<<<<|=======|>>>>>>>)'; then
     exit 1
 fi
 
-python3 -m compileall -q src tests
+python3 -m compileall -q dure/src dure/tests

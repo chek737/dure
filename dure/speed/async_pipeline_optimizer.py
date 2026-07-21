@@ -6,7 +6,7 @@ current microbatch, using a dedicated compute stream, a dedicated comm stream,
 and CUDA events for cross-stream sync (no CPU-side torch.cuda.synchronize()
 inside the hot loop).
 
-Run with: python3 speed/async_pipeline_optimizer.py
+Run with: python3 dure/speed/async_pipeline_optimizer.py
 
 The launcher detects the number of CUDA devices visible to PyTorch and starts
 one torchrun worker per GPU. CUDA_VISIBLE_DEVICES can be used to select a
