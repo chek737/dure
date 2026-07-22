@@ -1,36 +1,68 @@
-name: Publish signed APT repository
+name: Publish signed Dure APT mirror
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Official Dure source tag to build, exactly v<Debian-version>
+        required: true
+        type: string
 
+# This repository is the current package distribution authority. The archive
+# key signs the mirror's package and manifest; it does not grant authority to
+# the upstream source repository.
 permissions:
   contents: write
   pages: write
   id-token: write
 
 concurrency:
-  group: "dure-apt-pages"
+  group: "dure-apt-mirror-${{ inputs.source_tag || github.ref_name }}"
   cancel-in-progress: false
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-22.04
-    defaults:
-      run:
-        working-directory: dure
+    timeout-minutes: 35
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      SOURCE_REPOSITORY: madcamp-official/legendary-super-ultra-black-dragon
+      SOURCE_TAG: ${{ inputs.source_tag || github.ref_name }}
 
     steps:
-      - name: Check out source
+      - name: Check out mirror workflow
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+      - name: Check out immutable official source tag
+        uses: actions/checkout@v6
+        with:
+          repository: madcamp-official/legendary-super-ultra-black-dragon
+          ref: ${{ env.SOURCE_TAG }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve exact official source commit
+        id: source
+        run: |
+          case "$SOURCE_TAG" in
+            v[0-9]*) ;;
+            *) echo "source_tag must be a version tag" >&2; exit 1 ;;
+          esac
+          source_commit=$(git -C source rev-parse "${SOURCE_TAG}^{commit}")
+          test "$source_commit" = "$(git -C source rev-parse HEAD)"
+          source_version=$(cd source/dure && dpkg-parsechangelog -S Version)
+          test "$SOURCE_TAG" = "v$source_version"
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "version=$source_version" >> "$GITHUB_OUTPUT"
 
       - name: Install packaging tools
         run: |
@@ -38,82 +70,115 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             apt-utils debhelper dh-python dpkg-dev gnupg python3-all python3-pip python3-setuptools
 
-      - name: Run full Python test suite
+      - name: Run official source tests
         run: |
+          cd source/dure
           python3 -m pip install --upgrade pip
           python3 -m pip install -e '.[test]'
+          python3 -m compileall -q src tests
           python3 -m unittest discover -v
+          python3 scripts/check_version_sync.py
 
-      - name: Verify release version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          package_version=$(dpkg-parsechangelog -S Version)
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
-
-      - name: Build and test Debian package
+      - name: Build and test exact source Debian package
         id: package
         env:
-          DURE_BUILD_COMMIT: ${{ github.sha }}
+          DURE_BUILD_COMMIT: ${{ steps.source.outputs.commit }}
         run: |
+          cd source/dure
           package_path=$(scripts/build-deb.sh)
+          test "$(dpkg-deb -f "$package_path" Version)" = "${{ steps.source.outputs.version }}"
           echo "path=$package_path" >> "$GITHUB_OUTPUT"
-
-      - name: Install Debian node package
-        run: |
           python3 -m pip uninstall -y dure
-          sudo apt-get install -y "${{ steps.package.outputs.path }}"
-          test "$(cat /usr/share/dure/build-commit)" = "$GITHUB_SHA"
+          sudo apt-get install -y "$package_path"
+          test "$(cat /usr/share/dure/build-commit)" = "$DURE_BUILD_COMMIT"
           /usr/bin/python3 -c 'import dure; assert dure.__file__.startswith("/usr/lib/python3/dist-packages/dure/"); import dure.bootstrap, dure.host_setup'
           /usr/bin/dure --version
           /usr/bin/dure bootstrap --help >/dev/null
           /usr/bin/dure doctor --json >/dev/null
           grep -Fx 'ConditionPathExists=/etc/dure/agent.json' \
             /lib/systemd/system/dure-agent.service
+          scripts/test-apt-repo.sh "$package_path"
 
-      - name: Test signed APT repository
-        run: scripts/test-apt-repo.sh "${{ steps.package.outputs.path }}"
-
-      - name: Import APT signing key
+      - name: Import mirror APT signing key
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
           test -n "$APT_GPG_PRIVATE_KEY"
           printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
-          key_id=$(gpg --batch --with-colons --list-secret-keys | \
-            awk -F: '$1 == "sec" && !found { print $5; found=1 }')
-          test -n "$key_id"
+          mapfile -t key_ids < <(gpg --batch --with-colons --list-secret-keys \
+            | awk -F: '$1 == "sec" { print $5 }')
+          test "${#key_ids[@]}" -eq 1
+          key_id=${key_ids[0]}
+          fingerprint=$(gpg --batch --with-colons --fingerprint "$key_id" \
+            | awk -F: '$1 == "fpr" && !found { print $10; found=1 }')
+          test -n "$fingerprint"
           echo "DURE_APT_GPG_KEY_ID=$key_id" >> "$GITHUB_ENV"
+          echo "DURE_APT_GPG_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
 
-      - name: Build signed APT repository
+      - name: Build signed mirror and provenance record
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          SOURCE_VERSION: ${{ steps.source.outputs.version }}
         run: |
           mkdir public
-          scripts/build-apt-repo.sh \
+          source/dure/scripts/build-apt-repo.sh \
             "${{ steps.package.outputs.path }}" public stable main "$DURE_APT_GPG_KEY_ID"
-          repository_name=${GITHUB_REPOSITORY#*/}
-          repository_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${repository_name}"
-          scripts/render-installer.sh "$repository_url" public/install.sh
+          mirror_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          source/dure/scripts/render-installer.sh "$mirror_url" public/install.sh
+          provenance=public/release-provenance.json
+          python3 tools/release_provenance.py create \
+            --package "${{ steps.package.outputs.path }}" \
+            --version "$SOURCE_VERSION" \
+            --source-repository "https://github.com/$SOURCE_REPOSITORY" \
+            --source-tag "$SOURCE_TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --builder-repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --mirror-url "$mirror_url" \
+            --signing-key-fingerprint "$DURE_APT_GPG_FINGERPRINT" \
+            --output "$provenance"
+          python3 tools/release_provenance.py verify \
+            --manifest "$provenance" \
+            --package "${{ steps.package.outputs.path }}" \
+            --version "$SOURCE_VERSION" \
+            --source-repository "https://github.com/$SOURCE_REPOSITORY" \
+            --source-tag "$SOURCE_TAG" \
+            --source-commit "$SOURCE_COMMIT" \
+            --builder-repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --workflow-run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --mirror-url "$mirror_url" \
+            --signing-key-fingerprint "$DURE_APT_GPG_FINGERPRINT"
+          gpg --batch --yes --armor --local-user "$DURE_APT_GPG_KEY_ID" \
+            --output "$provenance.asc" --detach-sign "$provenance"
+          gpgv --keyring public/dure-archive-keyring.gpg "$provenance.asc" "$provenance"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: dure/public
+          path: public
 
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Publish GitHub release asset
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish mirror release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" \
-              "${{ steps.package.outputs.path }}" \
-              --clobber
+          assets=(
+            "${{ steps.package.outputs.path }}"
+            public/release-provenance.json
+            public/release-provenance.json.asc
+            public/dure-archive-keyring.gpg
+          )
+          if gh release view "$SOURCE_TAG" >/dev/null 2>&1; then
+            gh release upload "$SOURCE_TAG" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" \
-              "${{ steps.package.outputs.path }}" \
+            gh release create "$SOURCE_TAG" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
               --generate-notes \
-              --title "Dure $GITHUB_REF_NAME"
+              --title "Dure mirror $SOURCE_TAG"
           fi
