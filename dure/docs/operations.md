@@ -81,7 +81,7 @@ CLI는 파일을 shell로 source하지 않고 빈 줄·주석, `KEY=VALUE`와 `e
 
 ## GPU 노드 런타임 준비
 
-GPU 노드에는 Dure 패키지와 정상 동작하는 NVIDIA host driver가 먼저 있어야 합니다. 현재 bootstrap 지원 범위는 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 다만 공식 Dure APT 저장소는 아직 `amd64`만 게시합니다. `arm64`에서는 CLI·Agent 실행 파일과 함께 패키지의 `dure-agent.service`, `/etc/dure/dure-client.env`를 별도로 설치해야 하며 unit이 없으면 bootstrap을 차단합니다. CPU utility 노드는 Docker/NVIDIA runtime 준비를 건너뛸 수 있습니다.
+GPU 노드에는 Dure 패키지와 정상 동작하는 NVIDIA host driver가 먼저 있어야 합니다. 현재 bootstrap 지원 범위는 Ubuntu 22.04·24.04의 `amd64`·`arm64`입니다. 다만 현재 Dure APT **미러**는 아직 `amd64`만 게시합니다. 이 미러의 key는 미러가 게시한 package만 인증하며 공식 조직 승인 package의 증명은 아닙니다. 신뢰 경계와 설치 전 검증은 [APT 배포](apt-distribution.md), [릴리스 권한과 출처 관리](release-governance.md)를 따릅니다. `arm64`에서는 CLI·Agent 실행 파일과 함께 패키지의 `dure-agent.service`, `/etc/dure/dure-client.env`를 별도로 설치해야 하며 unit이 없으면 bootstrap을 차단합니다. CPU utility 노드는 Docker/NVIDIA runtime 준비를 건너뛸 수 있습니다.
 
 먼저 root 권한으로 읽기 전용 계획을 확인합니다. 이 단계는 APT 설정, Docker 설정과 서비스를 바꾸지 않습니다.
 
