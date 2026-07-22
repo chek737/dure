@@ -29,13 +29,25 @@ dure-server --host 127.0.0.1 --port 8081
 저장소는 `.githooks/`에 native hook을 추적합니다.
 
 ```bash
-git config core.hooksPath .githooks
+cd /path/to/legendary-super-ultra-black-dragon
+git config --local core.hooksPath .githooks
+git config --show-origin --get core.hooksPath
+git hook run pre-commit
+git hook run pre-push -- origin "$(git remote get-url origin)"
 ```
 
-- `pre-commit`은 whitespace 오류, conflict marker, `.env`, credential, 생성 package artifact를 거부하고 Python source를 compile합니다.
-- `pre-push`는 전체 unit suite, 깨끗한 wheel build, 독립 migration smoke test를 실행합니다.
+- hook은 저장소 루트에서 실행되지만 Dure source는 `dure/` 아래에 있으므로, tracked hook은 그 경로를 명시적으로 해석합니다. Python은 `DURE_PYTHON`, 활성 virtualenv, 저장소 `.venv`, `python3` 순으로 선택합니다.
+- `pre-commit`은 whitespace 오류, conflict marker, `.env`, credential, 생성 package artifact를 거부하고 `dure/src`와 `dure/tests`를 compile합니다.
+- `pre-push`는 전체 unit suite, 깨끗한 wheel build, 독립 migration smoke test와 `pyproject.toml`·`setup.py`·runtime·Debian changelog의 버전 동기화를 확인합니다.
+- `core.hooksPath`는 Git clone에 포함되지 않으므로 각 clone에서 위 설정을 한 번 실행해야 합니다. WSL checkout에서는 WSL Git과 Linux Python을 사용합니다.
 
 긴급 상황이 아닌 한 hook을 우회하지 않습니다. 우회했다면 누락된 검증을 즉시 실행하고 이유를 남깁니다.
+
+## Pull request와 push CI
+
+`.github/workflows/ci.yml`은 `main` 대상 pull request, `main`과 `version/**` push에서 읽기 전용으로 실행됩니다. Python 3.10·3.12의 compile, unit test, changed-diff whitespace 검사, version 동기화, SQLite migration, wheel build와 Debian package smoke test를 실행합니다. 공개 PR에는 production signing key, Pages environment, GPU runner 또는 model credential을 제공하지 않습니다.
+
+workflow를 merge하고 첫 성공 run이 생긴 뒤 `main` ruleset에서 안정적인 `Required CI` check를 필수로 설정합니다. Pull request, 최신 base 반영 또는 merge queue, review conversation 해결, force-push와 branch 삭제 금지도 함께 요구합니다. required workflow에 `paths-ignore`를 추가하지 않아 check가 skip·pending 상태로 남지 않게 합니다.
 
 ## 스키마와 릴리스 변경
 

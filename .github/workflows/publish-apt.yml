@@ -44,6 +44,9 @@ jobs:
           python3 -m pip install -e '.[test]'
           python3 -m unittest discover -v
 
+      - name: Verify synchronized versions
+        run: python3 scripts/check_version_sync.py
+
       - name: Verify release version
         if: startsWith(github.ref, 'refs/tags/')
         run: |

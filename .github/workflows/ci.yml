@@ -1,0 +1,167 @@
+name: Dure CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - "version/**"
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dure-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-validation:
+    name: Python validation (${{ matrix.python }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: dure
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: dure/pyproject.toml
+
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
+
+      - name: Run unit tests
+        run: python -m unittest discover -v
+
+      - name: Check changed whitespace
+        working-directory: ${{ github.workspace }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request)
+              git diff --check "$PR_BASE_SHA...$PR_HEAD_SHA"
+              ;;
+            push)
+              if [[ -n "$PUSH_BEFORE" && ! "$PUSH_BEFORE" =~ ^0+$ ]]; then
+                git diff --check "$PUSH_BEFORE..$GITHUB_SHA"
+              else
+                git fetch --no-tags origin main:refs/remotes/origin/main
+                base_sha=$(git merge-base "$GITHUB_SHA" origin/main)
+                git diff --check "$base_sha...$GITHUB_SHA"
+              fi
+              ;;
+            merge_group)
+              git diff --check "$GITHUB_SHA^1..$GITHUB_SHA"
+              ;;
+            *)
+              git show --check --format= "$GITHUB_SHA"
+              ;;
+          esac
+
+      - name: Verify synchronized versions
+        run: python scripts/check_version_sync.py
+
+      - name: Run migration smoke test
+        run: |
+          python -m dure.server \
+            --database-url "sqlite:///$RUNNER_TEMP/dure-migration-${{ matrix.python }}.db" \
+            --migrate
+
+      - name: Build wheel
+        run: |
+          python -m pip wheel . \
+            --no-deps \
+            --no-build-isolation \
+            --wheel-dir "$RUNNER_TEMP/wheels-${{ matrix.python }}"
+
+  debian-package:
+    name: Debian package smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: dure
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils debhelper dh-python dpkg-dev gnupg python3-all python3-pip python3-setuptools
+
+      - name: Verify synchronized versions
+        run: python3 scripts/check_version_sync.py
+
+      - name: Build and test Debian package
+        id: package
+        env:
+          DURE_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          package_path=$(scripts/build-deb.sh)
+          echo "path=$package_path" >> "$GITHUB_OUTPUT"
+
+      - name: Install Debian node package
+        run: |
+          python3 -m pip uninstall -y dure
+          sudo apt-get install -y "${{ steps.package.outputs.path }}"
+          test "$(cat /usr/share/dure/build-commit)" = "$GITHUB_SHA"
+          /usr/bin/python3 -c 'import dure; assert dure.__file__.startswith("/usr/lib/python3/dist-packages/dure/"); import dure.bootstrap, dure.host_setup'
+          /usr/bin/dure --version
+          /usr/bin/dure bootstrap --help >/dev/null
+          /usr/bin/dure doctor --json >/dev/null
+          grep -Fx 'ConditionPathExists=/etc/dure/agent.json' \
+            /lib/systemd/system/dure-agent.service
+
+      - name: Test disposable signed APT repository
+        run: scripts/test-apt-repo.sh "${{ steps.package.outputs.path }}"
+
+  required:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - python-validation
+      - debian-package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 2
+    permissions: {}
+
+    steps:
+      - name: Require every validation job to pass
+        env:
+          PYTHON_VALIDATION: ${{ needs.python-validation.result }}
+          DEBIAN_PACKAGE: ${{ needs.debian-package.result }}
+        run: |
+          test "$PYTHON_VALIDATION" = success
+          test "$DEBIAN_PACKAGE" = success

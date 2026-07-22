@@ -1,3 +1,10 @@
+dure (0.4.15) UNRELEASED; urgency=medium
+
+  * Repair tracked Git hooks for the nested Dure project layout.
+  * Add read-only pull request and branch push validation workflows.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 12:00:00 +0000
+
 dure (0.4.14) UNRELEASED; urgency=medium
 
   * activation이 staged APPLY operation 완료를 기다린 뒤 최종 VERIFY를 요청합니다.

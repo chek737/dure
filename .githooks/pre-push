@@ -1,19 +1,40 @@
 #!/bin/sh
 set -eu
 
-python3 -m unittest discover -q
+repo_root=$(git rev-parse --show-toplevel)
+project_dir="$repo_root/dure"
+
+if [ -n "${DURE_PYTHON:-}" ]; then
+    python_bin=$DURE_PYTHON
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    python_bin="$VIRTUAL_ENV/bin/python"
+elif [ -x "$repo_root/.venv/bin/python" ]; then
+    python_bin="$repo_root/.venv/bin/python"
+else
+    python_bin=python3
+fi
+
+if ! command -v "$python_bin" >/dev/null 2>&1; then
+    echo 'Python not found; set DURE_PYTHON or create .venv.' >&2
+    exit 1
+fi
+
+if [ ! -d "$project_dir/src" ] || [ ! -d "$project_dir/tests" ]; then
+    echo "Dure project not found at $project_dir." >&2
+    exit 1
+fi
+
+cd "$project_dir"
+export PYTHONPATH="$project_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+
+"$python_bin" -m compileall -q src tests
+"$python_bin" -m unittest discover -q
 
 temporary_dir=$(mktemp -d)
 trap 'find "$temporary_dir" -depth -delete 2>/dev/null || true' EXIT INT TERM
 
-python3 -m pip wheel . --no-deps --no-build-isolation --wheel-dir "$temporary_dir/wheel"
-DURE_DATABASE_URL="sqlite:///$temporary_dir/migration.db" dure-server --migrate
+mkdir -p "$temporary_dir/wheel"
+"$python_bin" -m pip wheel . --no-deps --no-build-isolation --wheel-dir "$temporary_dir/wheel"
+"$python_bin" -m dure.server --database-url "sqlite:///$temporary_dir/migration.db" --migrate
 
-project_version=$(python3 -c 'from dure import __version__; print(__version__)')
-metadata_version=$(awk -F'"' '/^version = / { print $2; exit }' pyproject.toml)
-debian_version=$(dpkg-parsechangelog -S Version | sed 's/-[^-]*$//')
-
-if [ "$project_version" != "$metadata_version" ] || [ "$project_version" != "$debian_version" ]; then
-    echo "Version mismatch: runtime=$project_version metadata=$metadata_version debian=$debian_version" >&2
-    exit 1
-fi
+"$python_bin" scripts/check_version_sync.py
