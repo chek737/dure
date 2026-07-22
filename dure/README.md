@@ -83,13 +83,14 @@ python3 -m pip install -e '.[server]'
 
 ## APT 설치
 
-공식 저장소의 서명된 릴리스가 게시된 뒤에는 다음 경로에서 APT 저장소를 등록합니다. 이 주소와
-archive key는 `madcamp-official/legendary-super-ultra-black-dragon`의 protected release workflow가
-함께 관리합니다. 개인 fork나 이전 배포 미러는 공식 release authority가 아닙니다.
+소스 코드의 canonical 기준은 `madcamp-official/legendary-super-ultra-black-dragon`입니다. 현재
+Debian package의 build·archive key 서명·APT Pages 배포 authority는 별도 미러인
+[`chek737/dure`](https://github.com/chek737/dure)입니다. 따라서 아래 key는 **미러가 게시한
+package**를 인증하며, 공식 조직이 해당 package release를 승인했다는 암호학적 증명은 아닙니다.
 
 ```bash
 curl -fSLo /tmp/dure-install.sh \
-  https://madcamp-official.github.io/legendary-super-ultra-black-dragon/install.sh
+  https://chek737.github.io/dure/install.sh
 sed -n '1,240p' /tmp/dure-install.sh
 sudo sh /tmp/dure-install.sh
 rm -f /tmp/dure-install.sh
@@ -101,7 +102,7 @@ APT 서명 키 fingerprint는 다음과 같습니다.
 E1F952F8B23E7A1B884CB5A33EC5C8CAE53AFA01
 ```
 
-installer를 실행하기 전 검토할 수 없거나 release provenance까지 확인해야 하면
+installer를 실행하기 전 검토하거나 미러 provenance record가 제공된 release를 검증하려면
 [APT 배포 문서](docs/apt-distribution.md)의 수동 등록·검증 절차를 사용합니다.
 
 이후 Dure만 설치하거나 업그레이드할 때는 다음처럼 범위를 제한합니다.
