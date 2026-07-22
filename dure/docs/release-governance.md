@@ -67,4 +67,5 @@ dure --version
 - 미러를 계속 쓸 경우 공식 산출물을 hash·서명 검증 후 그대로 복제하는 배포 전용 경로로 제한합니다.
 
 전환이 끝나기 전에는 README, installer, APT 문서에서 현재 mirror URL과 key의 authority를 숨기거나
-공식 authority로 표현하지 않습니다. 상세 설치 절차는 [APT 배포](apt-distribution.md)를 따릅니다.
+공식 authority로 표현하지 않습니다. 상세 설치 절차는 [APT 배포](apt-distribution.md), 실제 승인·게시·수용
+순서는 [릴리스 실행 체크리스트](release-runbook.md)를 따릅니다.

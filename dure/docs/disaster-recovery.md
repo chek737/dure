@@ -88,4 +88,4 @@ migration 실패 시 Controller를 계속 재시작해 우연히 통과시키거
 - 관리 token 또는 Controller host가 노출됐을 가능성이 있으면 token을 회전하고, 기존 token으로 생성된 관리 세션을 신뢰하지 않는다.
 - Agent credential 노출 가능성이 있으면 해당 노드를 revoke하고 새 enrollment/join 흐름으로 재등록한다. Agent 설정 파일을 다른 host에 복사해 identity를 복제하지 않는다.
 
-관련 운영 순서는 [운영 절차](operations.md), 보안 경계는 [보안 모델](security.md), release-to-package 출처는 [릴리스 권한과 출처 관리](release-governance.md)를 따른다.
+관련 운영 순서는 [운영 절차](operations.md), 보안 경계는 [보안 모델](security.md), release-to-package 출처는 [릴리스 권한과 출처 관리](release-governance.md)를 따른다. backup·audit·evidence·cache의 보존·삭제 기준은 [데이터 보존·격리·삭제 정책](data-retention.md), package·Agent·migration rollout은 [버전 호환성과 롤링 업그레이드](compatibility-upgrades.md)를 따른다.
