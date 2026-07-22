@@ -7,12 +7,14 @@
 - [루트 README](../README.md): 설치, 로컬 CLI, 중앙 관리의 빠른 시작
 - [아키텍처](architecture.md): 로컬 CLI·에이전트·중앙 제어면의 경계와 작업 프로토콜
 - [운영 절차](operations.md): GPU host bootstrap, 서버 운영, 노드 승인, Fleet 준비·적용, 세대별 검증·롤백과 장애 복구
+- [Agent 설정과 credential 회전 운영 절차](agent-operations.md): `/etc/dure` 설정 경계, HTTPS/TLS 우선순위, 안전한 회전·재등록
 - [단일 GPU 자동 활성화](activation.md): 불변 릴리스 등록, 자동 준비·벤치마크·승격·추천·배포·검증
 - [릴리스 수용 검증](release-validation.md): v0.4.14 activation 순서 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
 - [릴리스 증적 기록](release-evidence/README.md): runbook과 실제 GPU 수용 결과를 분리해 보관하는 형식
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
 - [네트워크·방화벽 운영 절차](networking.md): Controller·Agent·Ray/vLLM·NCCL 통신 경계, 포트와 사설망 검증
 - [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md): backup, restore drill, migration 실패, credential 회전 절차
+- [관측·장애 대응 운영 절차](observability.md): systemd·heartbeat·task·DB 신호, 외부 알림 기준과 redaction
 - [관리자·Agent API 계약](api-contract.md): 인증 주체, 재시도·오류 처리, 목록 한계와 민감 정보 규칙
 - [vLLM 다중 노드 rank 결합 결정 기록](adr-vllm-multinode-rank-binding.md): `VLLM_RAY_PP_V1`의 고정 소스 계약과 검증 한계
 
@@ -41,7 +43,7 @@
 - 계획 중인 기능은 상태와 전제 조건을 표시합니다.
 - 절차(runbook)와 실제 실행 결과(evidence)를 같은 문서에서 혼합하지 않습니다. version별 실제 GPU·네트워크 수용 결과는 `release-evidence/`에 `PASSED`·`FAILED`·`NOT_RUN`으로 기록합니다.
 - source checkout, Git tag, GitHub Release, APT package는 서로 다른 상태입니다. source-to-package provenance가 없는 경우에는 공식 승인 package라고 표현하지 않습니다.
-- 네트워크 포트·방화벽·NCCL interface의 운영 기준은 [네트워크·방화벽 운영 절차](networking.md)를 단일 기준으로 사용합니다. PostgreSQL backup·restore와 credential 복구는 [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md)를 따릅니다.
+- 네트워크 포트·방화벽·NCCL interface의 운영 기준은 [네트워크·방화벽 운영 절차](networking.md)를 단일 기준으로 사용합니다. Agent의 Controller 주소·TLS·credential 회전은 [Agent 설정과 credential 회전 운영 절차](agent-operations.md), PostgreSQL backup·restore와 credential 복구는 [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md), 상태 확인과 외부 alert는 [관측·장애 대응 운영 절차](observability.md)를 따릅니다.
 - 모델·OS·runtime 지원 범위는 [지원 매트릭스](support-matrix.md)를 기준으로 하며, 기능 문서에 같은 수치를 반복할 때는 이 문서와 함께 갱신합니다.
 - 새 문서·이미지·링크는 `python3 scripts/check_docs.py`를 통과해야 합니다. 이미지에는 alt text와 갱신 가능한 원본 형식을 함께 보관합니다.
 - 모델은 이름만이 아니라 리비전, 양자화, 런타임 이미지 다이제스트, 라이선스를 함께 관리합니다.
