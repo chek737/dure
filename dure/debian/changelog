@@ -1,3 +1,11 @@
+dure (0.4.20) UNRELEASED; urgency=medium
+
+  * Version automatic Fleet placement profiles as v2.
+  * Let the validated 72B PP=3 STAGE profile qualify with 20 GiB free while
+    preserving the exact per-rank deployment disk gate.
+
+ -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 04:45:00 +0000
+
 dure (0.4.19) UNRELEASED; urgency=medium
 
   * PP=2/3 STAGE 수용 검사의 최소 추론을 vLLM 0.9.0 AsyncLLMEngine으로 실행합니다.

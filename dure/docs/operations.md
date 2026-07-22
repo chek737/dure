@@ -729,6 +729,13 @@ curl -sS -X POST \
 
 적용은 누락된 전체 프로필을 한 트랜잭션으로 만들며 같은 요청을 반복해도 중복 생성하지 않습니다. 같은 profile ID에 다른 origin 또는 digest가 있으면 전체 요청을 거부하고 기존 행을 덮어쓰지 않습니다. 생성된 프로필은 `DRAFT`라서 추천에 사용되지 않습니다. 이 API는 benchmark, Agent task, 모델 다운로드, 이미지 pull, Docker 실행 또는 기존 배포 변경을 만들지 않습니다.
 
+`fleet-placement-v2`의 72B `PP=3` 프로필은 qualification 실행 공간으로 노드당
+20 GiB를 요구합니다. 실제 `STAGE` 추천과 준비는 이 값으로 저장 공간을 추측하지 않고
+각 rank의 exact manifest 크기에 대해 기존 `2 × rank bytes + 64 MiB` 게이트를 별도로
+적용합니다. 따라서 이미 내려받은 digest-pinned runtime과 검증 rank 때문에 100 GiB
+노드의 free 공간이 50 GiB 아래로 내려가도 qualification을 부당하게 막지 않으며,
+실제 rank를 안전하게 준비할 공간이 부족한 노드는 여전히 추천·준비에서 거부됩니다.
+
 ## 자동 배치 프로필 qualification
 
 자동 프로필은 `DRAFT → QUALIFYING → VALIDATED → 운영자 ACTIVE` 순서로 검증합니다. 먼저 정규 UUID인 요청 ID, 자동 프로필 ID와 프로필의 노드 수에 정확히 맞는 중앙 노드 UUID 목록으로 변경 없는 preview를 실행합니다.
