@@ -55,4 +55,4 @@
 ## 갱신 규칙
 
 모델 allowlist, 최소 VRAM·디스크, OS·architecture, runtime version, TP/PP 실행 범위가 바뀌면
-이 문서와 [모델 선택 정책](model-selection.md), [운영 절차](operations.md), [릴리스 수용 검증](release-validation.md)을 같은 변경에서 함께 갱신합니다. 실제 환경에서 얻은 결과는 [릴리스 증적 기록](release-evidence/README.md)에 남깁니다.
+이 문서와 [모델 선택 정책](model-selection.md), [운영 절차](operations.md), [릴리스 수용 검증](release-validation.md)을 같은 변경에서 함께 갱신합니다. Controller·Agent·migration의 최소 호환 조건과 rollout 순서는 [버전 호환성과 롤링 업그레이드](compatibility-upgrades.md)를 함께 갱신합니다. 실제 환경에서 얻은 결과는 [릴리스 증적 기록](release-evidence/README.md)에 남깁니다.

@@ -122,4 +122,5 @@ dure admin nodes --online
 뒤 로컬 credential을 제거한다. 둘은 목적과 영향이 다르므로 장애 상황에서 서로를 대체하지 않는다.
 
 Controller 복구 또는 credential 노출 뒤의 순서는 [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md)를,
-일상 상태 확인과 알림은 [관측·장애 대응 운영 절차](observability.md)를 따른다.
+일상 상태 확인과 알림은 [관측·장애 대응 운영 절차](observability.md)를 따른다. hardware 교체·영구 폐기와
+cache 보존·package 제거는 [GPU 노드 폐기·교체 운영 절차](node-lifecycle.md)를 따른다.

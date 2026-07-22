@@ -11,10 +11,13 @@
 - [단일 GPU 자동 활성화](activation.md): 불변 릴리스 등록, 자동 준비·벤치마크·승격·추천·배포·검증
 - [릴리스 수용 검증](release-validation.md): v0.4.14 activation 순서 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
 - [릴리스 증적 기록](release-evidence/README.md): runbook과 실제 GPU 수용 결과를 분리해 보관하는 형식
+- [릴리스 실행 체크리스트](release-runbook.md): 승인자·중단 기준·재시도·APT 게시 뒤 확인을 연결하는 release record 절차
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
 - [네트워크·방화벽 운영 절차](networking.md): Controller·Agent·Ray/vLLM·NCCL 통신 경계, 포트와 사설망 검증
 - [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md): backup, restore drill, migration 실패, credential 회전 절차
+- [데이터 보존·격리·삭제 정책](data-retention.md): DB·audit·evidence·journal·model cache의 보존 기준과 수동 삭제 승인
 - [관측·장애 대응 운영 절차](observability.md): systemd·heartbeat·task·DB 신호, 외부 알림 기준과 redaction
+- [GPU 노드 폐기·교체 운영 절차](node-lifecycle.md): revoke·unjoin, cache 보존·격리, package 제거와 새 node 재등록
 - [관리자·Agent API 계약](api-contract.md): 인증 주체, 재시도·오류 처리, 목록 한계와 민감 정보 규칙
 - [vLLM 다중 노드 rank 결합 결정 기록](adr-vllm-multinode-rank-binding.md): `VLLM_RAY_PP_V1`의 고정 소스 계약과 검증 한계
 
@@ -25,8 +28,10 @@
 - [자동 배치 프로필 qualification](profile-qualification.md): `DRAFT → QUALIFYING → VALIDATED → ACTIVE`, 8단계 폐쇄형 증적과 exact rank·노드·GPU 결합을 강제하는 중앙 계약
 - [Fleet 후보 생성과 결정론적 스케줄러](fleet-scheduler.md): 여러 exact 증적을 비중첩 배포로 조합하고 불변 추천·원자적 수락·명시적 준비·적용·검증으로 연결하는 계약과 이기종·대규모 합성 수용 매트릭스
 - [모델 아티팩트 매니페스트와 배포 계약](artifact-distribution.md): 불변 파일·청크 레지스트리, 결정론적 `STAGE`·`FULL_SNAPSHOT` 선택, 중앙 캐시 수명 주기, 명시적 준비·격리와 배포·롤백 소비 게이트
+- [모델 반입·승인 정책](model-onboarding-policy.md): allowlist, 원본 revision·라이선스·runtime 검토, 승격과 철회 책임
 - [vLLM 단계 아티팩트 생성·검증·배포](stage-artifacts.md): 제한된 vLLM 0.9.0 stage builder, variant·rank 매니페스트, 추천에 고정된 rank별 준비와 `sharded_state` 소비
 - [지원 매트릭스](support-matrix.md): OS·APT package·모델·GPU·TP/PP·runtime의 현재 지원 범위
+- [버전 호환성과 롤링 업그레이드](compatibility-upgrades.md): Controller·Agent·migration·backend의 최소 조건과 안전한 rollout·복구 순서
 - [용어집](glossary.md): 모델 배포와 운영에서 쓰는 핵심 용어
 - [제품 제안서](dure-proposal.md): 장기 제품 비전과 MVP 가설
 
@@ -43,10 +48,12 @@
 - 계획 중인 기능은 상태와 전제 조건을 표시합니다.
 - 절차(runbook)와 실제 실행 결과(evidence)를 같은 문서에서 혼합하지 않습니다. version별 실제 GPU·네트워크 수용 결과는 `release-evidence/`에 `PASSED`·`FAILED`·`NOT_RUN`으로 기록합니다.
 - source checkout, Git tag, GitHub Release, APT package는 서로 다른 상태입니다. source-to-package provenance가 없는 경우에는 공식 승인 package라고 표현하지 않습니다.
+- release tag·package 게시·실제 GPU 수용 결과의 실행 순서는 [릴리스 실행 체크리스트](release-runbook.md)를 따르며, `PUBLISHED`와 `ACCEPTED`를 혼동하지 않습니다.
 - 네트워크 포트·방화벽·NCCL interface의 운영 기준은 [네트워크·방화벽 운영 절차](networking.md)를 단일 기준으로 사용합니다. Agent의 Controller 주소·TLS·credential 회전은 [Agent 설정과 credential 회전 운영 절차](agent-operations.md), PostgreSQL backup·restore와 credential 복구는 [PostgreSQL 백업·복구·재해 복구](disaster-recovery.md), 상태 확인과 외부 alert는 [관측·장애 대응 운영 절차](observability.md)를 따릅니다.
 - 모델·OS·runtime 지원 범위는 [지원 매트릭스](support-matrix.md)를 기준으로 하며, 기능 문서에 같은 수치를 반복할 때는 이 문서와 함께 갱신합니다.
 - 새 문서·이미지·링크는 `python3 scripts/check_docs.py`를 통과해야 합니다. 이미지에는 alt text와 갱신 가능한 원본 형식을 함께 보관합니다.
 - 모델은 이름만이 아니라 리비전, 양자화, 런타임 이미지 다이제스트, 라이선스를 함께 관리합니다.
+- 모델 반입의 출처·라이선스·보안·철회 검토는 [모델 반입·승인 정책](model-onboarding-policy.md)을 따르며, 레지스트리 등록이 그 검토를 자동화하지 않습니다.
 - 프롬프트, 자격 증명, 토큰, 실제 비밀값을 예시나 벤치마크 결과에 기록하지 않습니다.
 - 모델 릴리스와 배치 프로필의 실제 상태는 중앙 레지스트리가 진실의 원천이며, 이 문서는 정책과 절차를 설명합니다.
 - 배포 세대의 `verified_at`은 전체 배정 노드가 검증에 성공하고 backend별 최소 Agent 버전을 충족할 때만 롤백 증거로 사용합니다. legacy는 0.3.12 이상, `VLLM_RAY_PP_V1`은 0.3.18 이상, `STAGE`는 0.3.19 이상과 엄격한 rank·API 검증이 필요합니다.
@@ -59,3 +66,4 @@
 - 추천기는 같은 품질에서 검증된 exact `STAGE`를 우선하고 독립 `FULL_SNAPSHOT` 후보도 결정론적으로 평가합니다. 수락 뒤에는 두 형식 사이를 묵시적으로 바꾸지 않습니다.
 - 중앙 캐시는 `READY`·`STALE`·`MISSING`·`CORRUPT`·`QUARANTINED`로 투영합니다. 완전한 probe만 상태를 악화시킬 수 있고, `READY` 복구는 현재 준비 성공만 가능합니다.
 - `artifact-cache` 조회·참조 검사는 읽기 전용입니다. 격리는 preview 뒤 명시적 적용으로 정확한 캐시 하나를 보존 위치로 원자 이동하며 자동 삭제·퇴출·P2P 전송은 하지 않습니다.
+- DB·evidence·journal·model cache의 보존·삭제는 [데이터 보존·격리·삭제 정책](data-retention.md)을 따릅니다. node를 교체하거나 폐기할 때 credential·cache·hardware는 [GPU 노드 폐기·교체 운영 절차](node-lifecycle.md)를 따릅니다.
