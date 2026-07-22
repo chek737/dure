@@ -2,6 +2,7 @@ dure (0.4.21) UNRELEASED; urgency=medium
 
   * 문서 지원 매트릭스, 용어집, 릴리스 권한·증적 기록 체계를 추가합니다.
   * 네트워크·방화벽, PostgreSQL 백업·복구, 관리자·Agent API 운영 계약 문서를 추가합니다.
+  * Agent 설정·credential 회전, 관측·장애 대응, 현재 GPU/NCCL 미실행 증적 문서를 추가합니다.
   * 내부 Markdown 링크와 이미지 링크를 검사하는 문서 검증을 CI에 추가합니다.
 
  -- Dure contributors <maintainers@example.invalid>  Wed, 22 Jul 2026 14:30:00 +0000

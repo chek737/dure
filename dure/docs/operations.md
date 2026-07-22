@@ -121,6 +121,11 @@ sudo dure bootstrap --apply
 
 ## 노드 등록과 승인
 
+Agent의 등록 전 `/etc/dure/dure-client.env`, 등록 후 `/etc/dure/agent.json`, HTTPS/TLS 우선순위와
+credential 회전은 [Agent 설정과 credential 회전 운영 절차](agent-operations.md)를 단일 기준으로
+사용합니다. `dure admin credential rotate`는 기존 credential을 즉시 폐기하므로, 실행 중 workload를
+확인하지 않은 채 단독으로 실행해서는 안 됩니다.
+
 ```bash
 sudo apt install dure
 sudo dure join
