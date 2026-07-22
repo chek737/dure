@@ -8,6 +8,7 @@
 - [아키텍처](architecture.md): 로컬 CLI·에이전트·중앙 제어면의 경계와 작업 프로토콜
 - [운영 절차](operations.md): GPU host bootstrap, 서버 운영, 노드 승인, Fleet 준비·적용, 세대별 검증·롤백과 장애 복구
 - [단일 GPU 자동 활성화](activation.md): 불변 릴리스 등록, 자동 준비·벤치마크·승격·추천·배포·검증
+- [릴리스 수용 검증](release-validation.md): v0.4.14 staged activation 회귀와 실제 3×24GiB `PP=3` GPU 검증 절차
 - [보안 모델](security.md): 현재 통제와 공개 전 보안 강화 과제
 - [vLLM 다중 노드 rank 결합 결정 기록](adr-vllm-multinode-rank-binding.md): `VLLM_RAY_PP_V1`의 고정 소스 계약과 검증 한계
 

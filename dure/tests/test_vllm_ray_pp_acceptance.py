@@ -31,13 +31,15 @@ RUN_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 DEPLOYMENT_ID = "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaab"
 
 
-def contract_document(size: int = 2) -> dict:
+def contract_document(
+    size: int = 2, *, minimum_gpu_memory_mib: int | None = None
+) -> dict:
     identities = (
         (NODE_0, "10.0.0.2"),
         (NODE_1, "10.0.0.3"),
         (NODE_2, "10.0.0.4"),
     )[:size]
-    return {
+    document = {
         "schema_version": 1,
         "backend": "VLLM_RAY_PP_V1",
         "vllm_version": "0.9.0",
@@ -56,6 +58,9 @@ def contract_document(size: int = 2) -> dict:
             for rank, (node_id, address) in enumerate(identities)
         ],
     }
+    if minimum_gpu_memory_mib is not None:
+        document["minimum_gpu_memory_mib"] = minimum_gpu_memory_mib
+    return document
 
 
 class FakeBackend:
@@ -65,10 +70,12 @@ class FakeBackend:
         preflight_error: Exception | None = None,
         run_error: Exception | None = None,
         addresses: tuple[str, ...] = ("10.0.0.2", "10.0.0.3"),
+        gpu_memory_mib: tuple[int, ...] | None = None,
     ) -> None:
         self.preflight_error = preflight_error
         self.run_error = run_error
         self.addresses = addresses
+        self.gpu_memory_mib = gpu_memory_mib
         self.preflight_calls = 0
         self.run_calls = 0
 
@@ -81,7 +88,7 @@ class FakeBackend:
         self.run_calls += 1
         if self.run_error is not None:
             raise self.run_error
-        return acceptance.RuntimeResult(self.addresses, 4)
+        return acceptance.RuntimeResult(self.addresses, 4, self.gpu_memory_mib)
 
 
 class VllmRayPpAcceptanceTests(unittest.TestCase):
@@ -139,6 +146,45 @@ class VllmRayPpAcceptanceTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(stderr, "")
                 self.assertEqual(json.loads(stdout)["status"], "PASSED")
+
+    def test_3x24g_profile_requires_exact_topology_and_measured_memory(self):
+        document = contract_document(3, minimum_gpu_memory_mib=24000)
+        parsed = acceptance.AcceptanceContract.parse(document)
+        self.assertEqual(parsed.minimum_gpu_memory_mib, 24000)
+        addresses = tuple(
+            item["runtime_address"] for item in document["ordered_bindings"]
+        )
+        code, stdout, stderr, _ = self.run_harness(
+            document=document,
+            backend=FakeBackend(
+                addresses=addresses,
+                gpu_memory_mib=(24576, 24576, 24576),
+            ),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        report = json.loads(stdout)
+        self.assertEqual(report["minimum_gpu_memory_mib"], 24000)
+        self.assertEqual(report["gpu_memory_mib"], [24576, 24576, 24576])
+
+        for invalid in (
+            contract_document(2, minimum_gpu_memory_mib=24000),
+            contract_document(3, minimum_gpu_memory_mib=24001),
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(acceptance.PrerequisiteMissing):
+                    acceptance.AcceptanceContract.parse(invalid)
+
+        code, stdout, stderr, _ = self.run_harness(
+            document=document,
+            backend=FakeBackend(
+                addresses=addresses,
+                gpu_memory_mib=(24576, 23999, 24576),
+            ),
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["code"], "GPU_MEMORY_INSUFFICIENT")
 
     def test_contract_rejects_boolean_schema_version(self):
         document = contract_document()

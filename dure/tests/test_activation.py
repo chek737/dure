@@ -123,6 +123,7 @@ class FakeActivationClient:
         self.task_counter = 0
         self.selected_release_id = RELEASE_ID
         self.operation_status = "SUCCEEDED"
+        self.operation_statuses: list[str] = []
 
     def _task(self, task_id):
         return {"id": task_id, "status": "SUCCEEDED", "error": None}
@@ -193,6 +194,11 @@ class FakeActivationClient:
             "GET",
             f"/v1/admin/deployments/{DEPLOYMENT_ID}",
         ):
+            operation_status = (
+                self.operation_statuses.pop(0)
+                if self.operation_statuses
+                else self.operation_status
+            )
             return {
                 "deployment": {
                     "id": DEPLOYMENT_ID,
@@ -200,15 +206,15 @@ class FakeActivationClient:
                         {
                             "id": "99999999-9999-4999-8999-999999999999",
                             "kind": "APPLY",
-                            "status": self.operation_status,
+                            "status": operation_status,
                             "created_at": "2026-07-21T00:00:00+00:00",
                             "nodes": [
                                 {
                                     "phase": "APPLY",
-                                    "status": self.operation_status,
+                                    "status": operation_status,
                                     "failure_code": (
                                         None
-                                        if self.operation_status == "SUCCEEDED"
+                                        if operation_status == "SUCCEEDED"
                                         else "DEPLOYMENT_EXECUTION_FAILED"
                                     ),
                                 }
@@ -313,6 +319,35 @@ class ActivationWorkflowTests(unittest.TestCase):
             benchmark_apply,
             {"apply": True, "prepare_model": True, "pull_image": True},
         )
+
+    def test_apply_waits_for_queued_and_running_operation_before_verify(self):
+        client = FakeActivationClient()
+        client.operation_statuses = ["QUEUED", "RUNNING", "SUCCEEDED"]
+        messages = []
+        workflow = ActivationWorkflow(
+            client,
+            sleeper=lambda _seconds: None,
+            reporter=messages.append,
+        )
+
+        result = workflow.apply(ActivationSpec.from_dict(_spec_document()), node_ids=None)
+
+        self.assertEqual(result["status"], "READY")
+        operation_calls = [
+            index
+            for index, (method, path, _payload) in enumerate(client.calls)
+            if (method, path)
+            == ("GET", f"/v1/admin/deployments/{DEPLOYMENT_ID}")
+        ]
+        self.assertEqual(len(operation_calls), 3)
+        verify_index = next(
+            index
+            for index, (method, path, payload) in enumerate(client.calls)
+            if (method, path) == ("POST", "/v1/admin/tasks")
+            and payload["type"] == "VERIFY"
+        )
+        self.assertLess(operation_calls[-1], verify_index)
+        self.assertIn("Waiting for staged deployment operation", messages)
 
     def test_apply_never_deploys_a_different_recommended_release(self):
         client = FakeActivationClient()
