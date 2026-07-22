@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from .resource_pool import FLEET_MODEL_IDS, FLEET_TENSOR_PARALLEL_SIZE
 
 
-AUTO_PROFILE_GENERATOR_VERSION = "fleet-placement-v1"
+AUTO_PROFILE_GENERATOR_VERSION = "fleet-placement-v2"
 AUTO_PROFILE_ORIGIN = "AUTO"
 PLACEMENT_PROFILE_STATUSES = frozenset(
     {"DRAFT", "QUALIFYING", "VALIDATED", "ACTIVE", "REVOKED"}
@@ -145,7 +145,7 @@ def generate_auto_placement_profile_specs(
         return (
             _base_spec(
                 model_id=model_id,
-                profile_id=f"auto-{model_id}-tp1-pp1-v1",
+                profile_id=f"auto-{model_id}-tp1-pp1-v2",
                 topology="single-gpu",
                 node_count=1,
                 pipeline_parallel_size=1,
@@ -154,16 +154,20 @@ def generate_auto_placement_profile_specs(
         )
 
     profiles = []
-    for pipeline_parallel_size, min_gpu_memory_mib, throughput in (
-        (1, 49152, 4.0),
-        (2, 24576, 6.0),
-        (3, 24576, 7.0),
+    for pipeline_parallel_size, min_gpu_memory_mib, min_disk_free_mib, throughput in (
+        (1, 49152, 51200, 4.0),
+        (2, 24576, 51200, 6.0),
+        # The PP=3 STAGE delivery gate separately requires 2x each exact rank's
+        # bytes plus its fixed margin. Requiring another full 50 GiB here made
+        # an already validated rank and pinned runtime impossible to qualify on
+        # the supported 100 GiB nodes.
+        (3, 24576, 20480, 7.0),
     ):
         profiles.append(
             _base_spec(
                 model_id=model_id,
                 profile_id=(
-                    f"auto-{model_id}-tp1-pp{pipeline_parallel_size}-v1"
+                    f"auto-{model_id}-tp1-pp{pipeline_parallel_size}-v2"
                 ),
                 topology=(
                     "single-gpu"
@@ -172,7 +176,7 @@ def generate_auto_placement_profile_specs(
                 ),
                 node_count=pipeline_parallel_size,
                 min_gpu_memory_mib=min_gpu_memory_mib,
-                min_disk_free_mib=51200,
+                min_disk_free_mib=min_disk_free_mib,
                 pipeline_parallel_size=pipeline_parallel_size,
                 max_model_len=8192,
                 max_concurrency=1,

@@ -21,6 +21,17 @@ class AutoPlacementProfileGeneratorTests(unittest.TestCase):
             [spec.pipeline_parallel_size for spec in generated["qwen2.5-72b-awq"]],
             [1, 2, 3],
         )
+        self.assertEqual(
+            [spec.min_disk_free_mib for spec in generated["qwen2.5-72b-awq"]],
+            [51200, 51200, 20480],
+        )
+        self.assertTrue(
+            all(
+                spec.profile_id.endswith("-v2")
+                for specs in generated.values()
+                for spec in specs
+            )
+        )
         for model_id, specs in generated.items():
             with self.subTest(model_id=model_id):
                 self.assertTrue(specs)
