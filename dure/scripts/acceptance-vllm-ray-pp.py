@@ -32,6 +32,8 @@ MODEL_MARKER = ".dure-model.json"
 CONFIG_MAX_BYTES = 64 * 1024
 BACKEND_TIMEOUT_SECONDS = 1800
 DURE_NODE_RESOURCE_PREFIX = "dure_node_"
+MIB = 1024 * 1024
+THREE_BY_24G_MINIMUM_GPU_MEMORY_MIB = 24000
 OPT_IN_NAME = "DURE_RUN_VLLM_RAY_PP_ACCEPTANCE"
 ACCEPTANCE_ENV_PREFIXES = (
     "DURE_RUN_VLLM_RAY_PP_ACCEPTANCE",
@@ -57,6 +59,9 @@ CONFIG_FIELDS = frozenset(
         "model_manifest_digest",
         "ordered_bindings",
     }
+)
+CONFIG_FIELDS_WITH_MINIMUM_GPU_MEMORY = CONFIG_FIELDS | frozenset(
+    {"minimum_gpu_memory_mib"}
 )
 NODE_FIELDS = frozenset(
     {
@@ -97,6 +102,7 @@ class AcceptanceContract:
     runtime_image: str
     model_manifest_digest: str
     ordered_bindings: tuple[ExpectedBinding, ...]
+    minimum_gpu_memory_mib: int | None
 
     @property
     def world_size(self) -> int:
@@ -104,7 +110,28 @@ class AcceptanceContract:
 
     @classmethod
     def parse(cls, raw: object) -> "AcceptanceContract":
-        document = _exact_object(raw, CONFIG_FIELDS, "설정")
+        if type(raw) is not dict:
+            raise PrerequisiteMissing("CONTRACT_INVALID", "설정은 JSON 객체여야 합니다.")
+        if set(raw) == CONFIG_FIELDS:
+            document = _exact_object(raw, CONFIG_FIELDS, "설정")
+            minimum_gpu_memory_mib = None
+        elif set(raw) == CONFIG_FIELDS_WITH_MINIMUM_GPU_MEMORY:
+            document = _exact_object(
+                raw, CONFIG_FIELDS_WITH_MINIMUM_GPU_MEMORY, "설정"
+            )
+            minimum_gpu_memory_mib = document["minimum_gpu_memory_mib"]
+            if (
+                type(minimum_gpu_memory_mib) is not int
+                or minimum_gpu_memory_mib != THREE_BY_24G_MINIMUM_GPU_MEMORY_MIB
+            ):
+                raise PrerequisiteMissing(
+                    "CONTRACT_INVALID",
+                    "3×24GiB 수용 검사의 minimum_gpu_memory_mib는 정확히 24000이어야 합니다.",
+                )
+        else:
+            raise PrerequisiteMissing(
+                "CONTRACT_INVALID", "설정 필드가 폐쇄형 계약과 다릅니다."
+            )
         if type(document["schema_version"]) is not int or document["schema_version"] != 1:
             raise PrerequisiteMissing(
                 "CONTRACT_INVALID", "설정 schema_version은 정확히 1이어야 합니다."
@@ -147,6 +174,11 @@ class AcceptanceContract:
             raise PrerequisiteMissing(
                 "TOPOLOGY_UNSUPPORTED",
                 "수용 검사는 정확히 2대 또는 3대의 GPU 노드만 지원합니다.",
+            )
+        if minimum_gpu_memory_mib is not None and len(raw_bindings) != 3:
+            raise PrerequisiteMissing(
+                "TOPOLOGY_UNSUPPORTED",
+                "3×24GiB 수용 검사는 정확히 3대의 GPU 노드를 요구합니다.",
             )
         bindings: list[ExpectedBinding] = []
         for index, value in enumerate(raw_bindings):
@@ -196,6 +228,7 @@ class AcceptanceContract:
             runtime_image=runtime_image,
             model_manifest_digest=model_manifest_digest,
             ordered_bindings=tuple(bindings),
+            minimum_gpu_memory_mib=minimum_gpu_memory_mib,
         )
 
 
@@ -211,12 +244,58 @@ class RuntimeNode:
 class RuntimeResult:
     ordered_addresses: tuple[str, ...]
     generated_token_count: int
+    gpu_memory_mib: tuple[int, ...] | None = None
 
 
 class AcceptanceBackend(Protocol):
     def preflight(self, contract: AcceptanceContract) -> None: ...
 
     def run(self, contract: AcceptanceContract) -> RuntimeResult: ...
+
+
+def _visible_gpu_memory_mib() -> int:
+    """Return the one GPU made visible to a closed Ray acceptance task."""
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError("expected exactly one visible CUDA device")
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+    except Exception as exc:
+        raise RuntimeError("cannot inspect the assigned CUDA device") from exc
+    if type(total_memory) is not int or total_memory <= 0:
+        raise RuntimeError("assigned CUDA device has invalid memory")
+    return total_memory // MIB
+
+
+def _validate_minimum_gpu_memory(
+    contract: AcceptanceContract, observed: object
+) -> tuple[int, ...] | None:
+    """Bind the optional 3×24GiB profile to one measured GPU per node."""
+
+    minimum = contract.minimum_gpu_memory_mib
+    if minimum is None:
+        return None
+    if type(observed) not in (tuple, list) or len(observed) != contract.world_size:
+        raise AcceptanceFailure(
+            "GPU_MEMORY_ATTESTATION_INVALID",
+            "각 고정 Ray node의 GPU 메모리 측정값이 필요합니다.",
+        )
+    values: list[int] = []
+    for value in observed:
+        if type(value) is not int or value <= 0:
+            raise AcceptanceFailure(
+                "GPU_MEMORY_ATTESTATION_INVALID",
+                "GPU 메모리 측정값 형식이 유효하지 않습니다.",
+            )
+        if value < minimum:
+            raise AcceptanceFailure(
+                "GPU_MEMORY_INSUFFICIENT",
+                "3×24GiB 수용 검사의 GPU 메모리 조건을 충족하지 못했습니다.",
+            )
+        values.append(value)
+    return tuple(values)
 
 
 class RealVllmRayBackend:
@@ -310,6 +389,7 @@ class RealVllmRayBackend:
 
         runtime_nodes = _runtime_nodes_from_ray(ray.nodes())
         _validate_cluster_nodes(contract, runtime_nodes)
+        gpu_memory_mib = self._measure_gpu_memory_mib(ray, contract)
 
         try:
             from vllm import LLM, SamplingParams
@@ -388,7 +468,32 @@ class RealVllmRayBackend:
             raise AcceptanceFailure(
                 "INFERENCE_FAILED", "고정 최소 추론 검사가 실패했습니다."
             ) from exc
-        return RuntimeResult(ordered_addresses, token_count)
+        return RuntimeResult(ordered_addresses, token_count, gpu_memory_mib)
+
+    @staticmethod
+    def _measure_gpu_memory_mib(
+        ray: Any, contract: AcceptanceContract
+    ) -> tuple[int, ...] | None:
+        if contract.minimum_gpu_memory_mib is None:
+            return None
+        try:
+            references = []
+            for binding in contract.ordered_bindings:
+                resource_name = DURE_NODE_RESOURCE_PREFIX + binding.node_id.replace(
+                    "-", ""
+                )
+                task = ray.remote(
+                    num_gpus=1,
+                    resources={resource_name: 1.0},
+                )(_visible_gpu_memory_mib)
+                references.append(task.remote())
+            observed = ray.get(references, timeout=60)
+        except Exception as exc:
+            raise AcceptanceFailure(
+                "GPU_MEMORY_ATTESTATION_FAILED",
+                "각 고정 Ray node의 GPU 메모리를 측정하지 못했습니다.",
+            ) from exc
+        return _validate_minimum_gpu_memory(contract, observed)
 
 
 def _closed_json(value: str) -> object:
@@ -793,6 +898,7 @@ def _real_backend_child(connection, contract: AcceptanceContract) -> None:
                 "ok",
                 list(result.ordered_addresses),
                 result.generated_token_count,
+                None if result.gpu_memory_mib is None else list(result.gpu_memory_mib),
             )
         except AcceptanceFailure as exc:
             payload = ("failed", exc.code, exc.message)
@@ -852,13 +958,24 @@ def _run_real_backend_bounded(
 
     if (
         type(payload) in (tuple, list)
-        and len(payload) == 3
+        and len(payload) == 4
         and payload[0] == "ok"
         and type(payload[1]) is list
         and all(type(item) is str for item in payload[1])
         and type(payload[2]) is int
+        and (
+            payload[3] is None
+            or (
+                type(payload[3]) is list
+                and all(type(item) is int for item in payload[3])
+            )
+        )
     ):
-        return RuntimeResult(tuple(payload[1]), payload[2])
+        return RuntimeResult(
+            tuple(payload[1]),
+            payload[2],
+            None if payload[3] is None else tuple(payload[3]),
+        )
     if (
         type(payload) in (tuple, list)
         and len(payload) == 3
@@ -953,6 +1070,9 @@ def run_acceptance(
             raise AcceptanceFailure(
                 "INFERENCE_FAILED", "고정 최소 추론 결과가 유효하지 않습니다."
             )
+        measured_gpu_memory_mib = _validate_minimum_gpu_memory(
+            contract, result.gpu_memory_mib
+        )
     except AcceptanceFailure as exc:
         _emit(sys.stderr, "FAILED", code=exc.code, message=exc.message)
         return 1
@@ -977,6 +1097,10 @@ def run_acceptance(
         model_manifest_marker_verified=True,
         model_content_rehashed=False,
         rank_evidence_kind="VLLM_0_9_0_SOURCE_PINNED_ACTOR_ORDER",
+        minimum_gpu_memory_mib=contract.minimum_gpu_memory_mib,
+        gpu_memory_mib=(
+            None if measured_gpu_memory_mib is None else list(measured_gpu_memory_mib)
+        ),
         checks=[
             {
                 "name": "pipeline-rank-contract",

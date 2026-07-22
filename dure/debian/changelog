@@ -1,3 +1,12 @@
+dure (0.4.18) UNRELEASED; urgency=medium
+
+  * Add a closed 3x24GiB Ray pipeline acceptance profile with per-node GPU
+    memory measurement.
+  * Revalidate staged single-GPU activation ordering before final verify.
+  * Document reproducible single-GPU and multi-node release acceptance gates.
+
+ -- Dure Maintainers <maintainers@example.com>  Tue, 22 Jul 2026 12:30:00 +0900
+
 dure (0.4.16) UNRELEASED; urgency=medium
 
   * Repair tracked Git hooks for the nested Dure project layout.

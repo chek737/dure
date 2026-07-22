@@ -356,6 +356,23 @@ Ray 컨테이너는 계획의 `--node-ip-address`와 `VLLM_HOST_IP`를 사용하
 }
 ```
 
+### 3×24GiB 프로필
+
+72B `PP=3` 기준선을 검증할 때에는 위의 모든 필드에 아래 필드를 추가합니다. 이 opt-in은 정확히
+세 binding과 24000MiB 이상 GPU 하나씩을 요구하는 폐쇄형 프로필이며, 다른 값이나 2노드 topology는
+거부합니다.
+
+```json
+{
+  "minimum_gpu_memory_mib": 24000
+}
+```
+
+Ray cluster 결합 뒤 model load 전에 harness가 각 Dure UUID custom resource에 GPU 하나를 예약하고
+CUDA total memory를 측정합니다. `PASSED` 결과의 `gpu_memory_mib`는 rank 순서의 측정값입니다. 이는
+실제 image digest 또는 host 자체의 무결성 attestation은 아니므로, 아래의 digest-pinned wrapper 기록과
+함께 보관합니다.
+
 검사 환경은 `/models/model`에 같은 매니페스트의 검증된 `FULL_SNAPSHOT`을 읽기 전용으로 제공하고 vLLM 0.9.0과 Ray를 미리 설치해야 합니다. 다음 명령은 실제 이미지 digest와 고정 mount를 먼저 검증한 신뢰된 wrapper **안에서** 실행합니다. harness가 허용하는 opt-in은 하나뿐입니다.
 
 ```bash
